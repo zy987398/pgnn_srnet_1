@@ -5,7 +5,7 @@ import torch.nn as nn
 import numpy as np
 import pandas as pd
 import copy
-from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.model_selection import train_test_split, StratifiedKFold, KFold
 from sklearn.metrics import r2_score, mean_squared_error
 import warnings
 
@@ -196,8 +196,8 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
 
             optimizer.zero_grad()
 
-            pred1, unc1, _, _ = model(batch_materials, batch_raw)
-            pred2, unc2, _, _ = model(batch_materials, batch_raw)
+            pred1, unc1, _, _ = model(batch_materials, batch_features)
+            pred2, unc2, _, _ = model(batch_materials, batch_features)
             loss1, metrics = loss_fn(pred1, unc1, batch_target, model, batch_raw)
             loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
             kl = F.kl_div(pred1.log(), pred2, reduction='batchmean') + F.kl_div(pred2.log(), pred1, reduction='batchmean')
@@ -221,7 +221,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
         # 验证
         model.eval()
         with torch.no_grad():
-            val_pred, val_uncertainty, _, _ = model(val_materials, val_raw)
+            val_pred, val_uncertainty, _, _ = model(val_materials, val_features)
             val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
 
             val_pred_np = np.expm1(val_pred.cpu().squeeze().numpy())
@@ -258,7 +258,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
         # 再次计算R²
         model.eval()
         with torch.no_grad():
-            val_pred, _, _, _ = model(val_materials, val_raw)
+            val_pred, _, _, _ = model(val_materials, val_features)
             val_pred_np = np.expm1(val_pred.cpu().squeeze().numpy())
             val_target_np = np.expm1(val_target.cpu().squeeze().numpy())
             final_r2 = r2_score(val_target_np, val_pred_np)
@@ -351,196 +351,167 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials=10
 def retrain_with_best_params(
     study, data_path="3011916164精确材料性能数据.csv", seed=42
 ):
-    """使用最佳超参数重新训练并评估"""
+    """使用最佳超参数在5折交叉验证上训练模型并返回集成"""
 
-    # 读取数据
     df = pd.read_csv(data_path)
-    train_df, test_df = train_test_split(df, test_size=0.2, random_state=seed)
-
-    train_data = prepare_material_data(train_df)
-    test_data = prepare_material_data(
-        test_df,
-        scaler=train_data["scaler"],
-        le=train_data["label_encoder"],
-    )
-
-    # 创建模型
+    kf = KFold(n_splits=5, shuffle=True, random_state=seed)
     best_params = study.best_params
-    model = MaterialCrackPGNN(
-        num_materials=train_data["num_materials"],
-        material_embed_dim=best_params["material_embed_dim"],
-        latent_dim=best_params["latent_dim"],
-        dropout_rate=best_params["dropout_rate"],
-    )
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = model.to(device)
 
-    # 使用最佳参数准备增强数据
-    use_augmentation = best_params.get("augmentation", False)
-    train_df_aug = train_df.copy()
-    if use_augmentation:
-        train_df_aug = augment_dataset(train_df_aug)
-    augmented_train_data = prepare_material_data(
-        train_df_aug,
-        scaler=train_data["scaler"],
-        le=train_data["label_encoder"],
-        augment=False,
-    )
+    ensemble_models = []
+    fold = 0
+    for train_idx, val_idx in kf.split(df):
+        fold += 1
+        train_df = df.iloc[train_idx]
+        val_df = df.iloc[val_idx]
 
-    # 创建DataLoader
-    batch_size = best_params.get("batch_size", 32)
-    train_dataset = TensorDataset(
-        torch.LongTensor(augmented_train_data["material_ids"]),
-        torch.FloatTensor(augmented_train_data["numeric_features"]),
-        torch.FloatTensor(augmented_train_data["numeric_raw"]),
-        torch.FloatTensor(augmented_train_data["target"]).unsqueeze(1),
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=False,
-        pin_memory=True,
-    )
-
-    test_materials = torch.LongTensor(test_data["material_ids"]).to(device)
-    test_features = torch.FloatTensor(test_data["numeric_features"]).to(device)
-    test_raw = torch.FloatTensor(test_data["numeric_raw"]).to(device)
-    test_target = torch.FloatTensor(test_data["target"]).unsqueeze(1).to(device)
-
-    # 优化器
-    lr = best_params["lr"]
-    if best_params.get("optimizer", "AdamW") == "AdamW":
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=lr, weight_decay=best_params.get("weight_decay", 0)
+        train_data = prepare_material_data(train_df)
+        val_data = prepare_material_data(
+            val_df,
+            scaler=train_data["scaler"],
+            le=train_data["label_encoder"],
         )
-    else:
-        optimizer = torch.optim.RMSprop(model.parameters(), lr=lr)
 
-    # 学习率调度
-    epochs = best_params["epochs"]
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=lr,
-        epochs=epochs,
-        steps_per_epoch=len(train_loader),
-        pct_start=0.3,
-    )
+        use_augmentation = best_params.get("augmentation", False)
+        train_df_aug = train_df.copy()
+        if use_augmentation:
+            train_df_aug = augment_dataset(train_df_aug)
+        augmented_train_data = prepare_material_data(
+            train_df_aug,
+            scaler=train_data["scaler"],
+            le=train_data["label_encoder"],
+            augment=False,
+        )
 
-    # 损失函数
-    loss_fn = PhysicsInformedLoss(
-        lambda_complexity=best_params["lambda_complexity"],
-        lambda_physics=best_params["lambda_physics"],
-        weight_decay=0.0,
-    )
-    loss_fn.total_epochs = epochs
+        batch_size = best_params.get("batch_size", 32)
+        train_dataset = TensorDataset(
+            torch.LongTensor(augmented_train_data["material_ids"]),
+            torch.FloatTensor(augmented_train_data["numeric_features"]),
+            torch.FloatTensor(augmented_train_data["numeric_raw"]),
+            torch.FloatTensor(augmented_train_data["target"]).unsqueeze(1),
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=False,
+            pin_memory=True,
+        )
 
-    # 训练
-    print("\n使用最佳超参数重新训练...")
-    train_losses = []
-    test_r2_history = []
-    best_model_wts, best_test_r2, patience_ctr = None, -1e9, 0
-    best_epoch = 0
+        val_materials = torch.LongTensor(val_data["material_ids"]).to(device)
+        val_features = torch.FloatTensor(val_data["numeric_features"]).to(device)
+        val_raw = torch.FloatTensor(val_data["numeric_raw"]).to(device)
+        val_target = torch.FloatTensor(val_data["target"]).unsqueeze(1).to(device)
 
-    for epoch in range(epochs):
-        loss_fn.update_epoch(epoch, epochs)
-        model.set_epoch(epoch, epochs)
+        model = MaterialCrackPGNN(
+            num_materials=train_data["num_materials"],
+            material_embed_dim=best_params["material_embed_dim"],
+            latent_dim=best_params["latent_dim"],
+            dropout_rate=best_params["dropout_rate"],
+            num_mean=train_data["num_mean"],
+            num_std=train_data["num_std"],
+        ).to(device)
 
-        # 训练
-        model.train()
-        epoch_loss = 0
-
-        for batch_materials, batch_features, batch_raw, batch_target in train_loader:
-            batch_materials = batch_materials.to(device, non_blocking=True)
-            batch_features = batch_features.to(device, non_blocking=True)
-            batch_raw = batch_raw.to(device, non_blocking=True)
-            batch_target = batch_target.to(device, non_blocking=True)
-
-            optimizer.zero_grad()
-
-            pred1, unc1, _, _ = model(batch_materials, batch_raw)
-            pred2, unc2, _, _ = model(batch_materials, batch_raw)
-            loss1, metrics = loss_fn(pred1, unc1, batch_target, model, batch_raw)
-            loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
-            kl = F.kl_div(pred1.log(), pred2, reduction='batchmean') + F.kl_div(pred2.log(), pred1, reduction='batchmean')
-            loss = (loss1 + loss2) / 2 + 0.5 * kl
-
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-            optimizer.step()
-            scheduler.step()
-
-            epoch_loss += loss.item() * batch_target.size(0)
-
-        epoch_loss /= len(train_dataset)
-        train_losses.append(epoch_loss)
-        current_lr = scheduler.get_last_lr()[0]
-
-        # 评估
-        model.eval()
-        with torch.no_grad():
-            test_pred, test_uncertainty, _, _ = model(test_materials, test_raw)
-            test_pred_np = np.expm1(test_pred.cpu().squeeze().numpy())
-            test_target_np = np.expm1(test_target.cpu().squeeze().numpy())
-
-            test_r2 = r2_score(test_target_np, test_pred_np)
-            test_rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
-            test_r2_history.append(test_r2)
-
-        if (epoch + 1) % 20 == 0:
-            print(
-                f"Epoch {epoch+1}: LR={current_lr:.6f}, Test R²={test_r2:.4f}, RMSE={test_rmse:.4f}"
+        lr = best_params["lr"]
+        if best_params.get("optimizer", "AdamW") == "AdamW":
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=lr, weight_decay=best_params.get("weight_decay", 0)
             )
-
-        if test_r2 > best_test_r2:
-            best_test_r2 = test_r2
-            best_model_wts = copy.deepcopy(model.state_dict())
-            best_epoch = epoch + 1
-            patience_ctr = 0
         else:
-            patience_ctr += 1
+            optimizer = torch.optim.RMSprop(model.parameters(), lr=lr)
 
-        if patience_ctr >= 25:
-            print("Early-stop triggered.")
-            break
+        epochs = best_params["epochs"]
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=lr,
+            epochs=epochs,
+            steps_per_epoch=len(train_loader),
+            pct_start=0.3,
+        )
 
-    if best_model_wts is not None:
-        model.load_state_dict(best_model_wts)
+        loss_fn = PhysicsInformedLoss(
+            lambda_complexity=best_params["lambda_complexity"],
+            lambda_physics=best_params["lambda_physics"],
+            weight_decay=0.0,
+        )
+        loss_fn.total_epochs = epochs
 
-    # 最终评估 (标准和MC Dropout)
-    model.eval()
+        best_r2, patience_ctr = -1e9, 0
+        best_wts = None
 
-    # 标准预测
-    with torch.no_grad():
-        test_pred, test_uncertainty, _, _ = model(test_materials, test_raw)
-        test_pred_np = np.expm1(test_pred.cpu().squeeze().numpy())
-        test_target_np = np.expm1(test_target.cpu().squeeze().numpy())
+        for epoch in range(epochs):
+            loss_fn.update_epoch(epoch, epochs)
+            model.set_epoch(epoch, epochs)
+            model.train()
+            epoch_loss = 0
 
-        final_r2 = r2_score(test_target_np, test_pred_np)
-        final_rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
+            for batch_materials, batch_features, batch_raw, batch_target in train_loader:
+                batch_materials = batch_materials.to(device, non_blocking=True)
+                batch_features = batch_features.to(device, non_blocking=True)
+                batch_raw = batch_raw.to(device, non_blocking=True)
+                batch_target = batch_target.to(device, non_blocking=True)
 
-    # MC Dropout预测
-    mc_pred, mc_unc, alea_unc, epis_unc = model.predict_with_uncertainty(
-        test_materials, test_raw, n_samples=20
-    )
-    mc_pred_np = np.expm1(mc_pred.cpu().squeeze().numpy())
-    mc_r2 = r2_score(test_target_np, mc_pred_np)
-    mc_rmse = np.sqrt(mean_squared_error(test_target_np, mc_pred_np))
+                optimizer.zero_grad()
 
-    print(f"\n最终测试集性能:")
-    print(f"  标准预测 R²: {final_r2:.4f}, RMSE: {final_rmse:.4f}")
-    print(f"  MC预测 R²: {mc_r2:.4f}, RMSE: {mc_rmse:.4f}")
-    print(f"  最佳周期: {best_epoch}")
+                pred1, unc1, _, _ = model(batch_materials, batch_features)
+                pred2, unc2, _, _ = model(batch_materials, batch_features)
+                loss1, _ = loss_fn(pred1, unc1, batch_target, model, batch_raw)
+                loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
+                kl = F.kl_div(pred1.log(), pred2, reduction="batchmean") + F.kl_div(
+                    pred2.log(), pred1, reduction="batchmean"
+                )
+                loss = (loss1 + loss2) / 2 + 0.5 * kl
 
-    # 返回模型和训练历史
-    return model, train_losses, test_r2_history
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                optimizer.step()
+                scheduler.step()
+
+                epoch_loss += loss.item() * batch_target.size(0)
+
+            epoch_loss /= len(train_dataset)
+
+            model.eval()
+            with torch.no_grad():
+                val_pred, _, _, _ = model(val_materials, val_features)
+                val_pred_np = np.expm1(val_pred.cpu().squeeze().numpy())
+                val_target_np = np.expm1(val_target.cpu().squeeze().numpy())
+                val_r2 = r2_score(val_target_np, val_pred_np)
+
+            if val_r2 > best_r2:
+                best_r2 = val_r2
+                best_wts = copy.deepcopy(model.state_dict())
+                patience_ctr = 0
+            else:
+                patience_ctr += 1
+
+            if patience_ctr >= 25:
+                break
+
+        if best_wts is not None:
+            model.load_state_dict(best_wts)
+
+        ensemble_models.append(copy.deepcopy(model))
+
+    return ensemble_models, None, None
 
 
 def evaluate_model_detailed(model, test_data, device="cuda"):
-    """详细评估模型性能，包括不确定性分析"""
-    model = model.to(device)
-    model.eval()
+    """详细评估模型性能，包括不确定性分析
+
+    Args:
+        model: 单个模型或模型列表(用于集成)
+        test_data: 预处理后的测试数据
+    """
+
+    is_ensemble = isinstance(model, list)
+    if is_ensemble:
+        models = [m.to(device) for m in model]
+        for m in models:
+            m.eval()
+    else:
+        model = model.to(device)
+        model.eval()
 
     # 准备数据
     test_materials = torch.LongTensor(test_data["material_ids"]).to(device)
@@ -550,9 +521,25 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
 
     # 标准预测
     with torch.no_grad():
-        test_pred, test_uncertainty, symbolic_out, residual_out = model(
-            test_materials, test_raw
-        )
+        if is_ensemble:
+            preds = []
+            uncs = []
+            syms = []
+            ress = []
+            for m in models:
+                p, u, s, r = m(test_materials, test_features)
+                preds.append(p)
+                uncs.append(u)
+                syms.append(s)
+                ress.append(r)
+            test_pred = torch.stack(preds).mean(0)
+            test_uncertainty = torch.stack(uncs).mean(0)
+            symbolic_out = torch.stack(syms).mean(0)
+            residual_out = torch.stack(ress).mean(0)
+        else:
+            test_pred, test_uncertainty, symbolic_out, residual_out = model(
+                test_materials, test_features
+            )
 
         # 转换为NumPy
         test_pred_np = np.expm1(test_pred.cpu().squeeze().numpy())
@@ -575,9 +562,27 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
         uncertainty_error_corr = np.corrcoef(errors, test_uncertainty_np)[0, 1]
 
     # MC Dropout预测
-    mc_pred, mc_unc, aleatoric_unc, epistemic_unc = model.predict_with_uncertainty(
-        test_materials, test_raw, n_samples=30
-    )
+    if is_ensemble:
+        mc_preds = []
+        mc_uncs = []
+        ale_uncs = []
+        epi_uncs = []
+        for m in models:
+            p, u, a, e = m.predict_with_uncertainty(
+                test_materials, test_features, n_samples=30
+            )
+            mc_preds.append(p)
+            mc_uncs.append(u)
+            ale_uncs.append(a)
+            epi_uncs.append(e)
+        mc_pred = torch.stack(mc_preds).mean(0)
+        mc_unc = torch.stack(mc_uncs).mean(0)
+        aleatoric_unc = torch.stack(ale_uncs).mean(0)
+        epistemic_unc = torch.stack(epi_uncs).mean(0)
+    else:
+        mc_pred, mc_unc, aleatoric_unc, epistemic_unc = model.predict_with_uncertainty(
+            test_materials, test_features, n_samples=30
+        )
     mc_pred_np = np.expm1(mc_pred.cpu().squeeze().numpy())
     mc_unc_np = mc_unc.cpu().squeeze().numpy()
     aleatoric_np = aleatoric_unc.cpu().squeeze().numpy()
@@ -642,7 +647,8 @@ if __name__ == "__main__":
     study = run_hyperopt(n_trials=50)  # 可以增加trials获得更好结果
 
     # 使用最佳参数重新训练
-    model, train_losses, test_r2_history = retrain_with_best_params(study)
+    ensemble_models, train_losses, test_r2_history = retrain_with_best_params(study)
+    train_losses = train_losses or []
 
     # 详细评估
     df = pd.read_csv("3011916164精确材料性能数据.csv")
@@ -654,7 +660,7 @@ if __name__ == "__main__":
         le=train_data["label_encoder"],
     )
 
-    results = evaluate_model_detailed(model, test_data)
+    results = evaluate_model_detailed(ensemble_models, test_data)
 
     # 可视化优化历史
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
