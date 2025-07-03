@@ -326,14 +326,17 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials=10
     print("优化完成!")
     print("=" * 50)
 
+    completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
+    print(f"\n完成的trials: {len(completed_trials)}/{n_trials}")
+
+    if not completed_trials:
+        print("\n超参数搜索未产生有效结果，请检查配置。")
+        return study
+
     print(f"\n最佳验证R²: {study.best_value:.4f}")
     print("\n最佳超参数:")
     for key, value in study.best_params.items():
         print(f"  {key}: {value}")
-
-    # 统计信息
-    completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
-    print(f"\n完成的trials: {len(completed_trials)}/{n_trials}")
 
     # 超参数重要性
     try:
