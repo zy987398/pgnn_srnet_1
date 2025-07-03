@@ -148,10 +148,15 @@ class ImprovedSymbolicLayer(nn.Module):
         batch_size = z.shape[0]
 
         # 选择变量
-        var_weights = F.softmax(self.variable_selector(z), dim=-1)
+        tau = max(0.5, 5 * (1 - getattr(self, "progress", 0.0)))
+        var_weights = F.gumbel_softmax(
+            self.variable_selector(z), tau=tau, hard=False
+        )
 
         # 选择操作符
-        op_weights = F.softmax(self.operator_selector(z), dim=-1)
+        op_weights = F.gumbel_softmax(
+            self.operator_selector(z), tau=tau, hard=False
+        )
 
         # 预测系数
         coeffs = self.coefficient_net(z)
@@ -222,9 +227,12 @@ class MaterialCrackPGNN(nn.Module):
         # 符号表达式层
         self.symbolic_layer = ImprovedSymbolicLayer(latent_dim)
 
+        # FiLM 条件化参数
+        self.film = nn.Linear(material_embed_dim, 64 * 2)
+
         # 残差网络（捕获非线性效应）
+        self.res_fc1 = nn.Linear(latent_dim + 1, 64)
         self.residual_net = nn.Sequential(
-            nn.Linear(latent_dim + 1, 64),
             nn.GELU(),
             nn.LayerNorm(64),
             nn.Dropout(dropout_rate),
@@ -245,6 +253,9 @@ class MaterialCrackPGNN(nn.Module):
 
         # MC Dropout的开关
         self.mc_dropout_enabled = False
+
+        # 训练进度 0-1
+        self.progress = 0.0
 
     def enable_mc_dropout(self, enable=True):
         """启用/禁用MC Dropout"""
@@ -276,12 +287,16 @@ class MaterialCrackPGNN(nn.Module):
                 z = F.dropout(z, p=0.1, training=True)
 
         # 符号表达式输出
+        self.symbolic_layer.progress = self.progress
         symbolic_output = self.symbolic_layer(z, physics_features)
 
         # 残差网络输入：符号层输出与潜在表示，切断梯度
         sym_detached = symbolic_output.detach()
         residual_input = torch.cat([z, sym_detached], dim=-1)
-        residual_output = self.residual_net(residual_input)
+        h = self.res_fc1(residual_input)
+        gamma, beta = self.film(material_embed).chunk(2, dim=-1)
+        h = gamma * h + beta
+        residual_output = self.residual_net(h)
 
         # 组合预测（非负）
         prediction = F.softplus(symbolic_output + residual_output, beta=5) + 1e-3
@@ -380,6 +395,11 @@ class PhysicsInformedLoss(nn.Module):
             + physics_weight * physics_loss
         )
 
+        calib = torch.mean(
+            torch.abs((target - pred).detach()) - torch.sqrt(uncertainty)
+        )
+        total_loss += 0.01 * calib
+
         return total_loss, {
             "nll": nll_loss.item(),
             "complexity": (
@@ -397,15 +417,13 @@ class PhysicsInformedLoss(nn.Module):
         # 约束1：裂纹深度应该与晶粒尺寸有关（不能超过某个比例）
         # 改进：使用更合理的上限系数
         grain_size = features[:, 3]
-        constraint1 = F.relu(
-            pred.squeeze() - 3 * grain_size
-        )  # 从5降低到3，更严格的约束
+        constraint1 = F.relu(pred.squeeze() - 2.5 * grain_size)
 
         # 约束2：零压力应该产生很小的裂纹
         # 改进：使用更平滑的过渡函数
         pressure = features[:, 4]
         # 使用sigmoid在低压力区域逐渐增加惩罚
-        pressure_factor = torch.sigmoid(-(pressure - 0.2) * 10)  # 在0.2附近快速过渡
+        pressure_factor = torch.sigmoid(-(pressure - 0.15) * 10)
         constraint2 = pressure_factor * pred.squeeze()
 
         # 约束3：高硬度材料的裂纹应该更小（新增）
@@ -447,7 +465,8 @@ def prepare_material_data(
     numeric_raw = df[numeric_cols].values.astype(np.float32)
 
     # 目标变量
-    target = df["亚表面裂纹深度"].values
+    target_raw = df["亚表面裂纹深度"].values.astype(np.float32)
+    target = np.log1p(target_raw)
 
     # 使用StandardScaler
     if scaler is None:
@@ -490,6 +509,7 @@ def prepare_material_data(
         "numeric_features": numeric_scaled,
         "numeric_raw": numeric_raw,
         "target": target,
+        "target_raw": target_raw,
         "label_encoder": le,
         "scaler": scaler,
         "num_materials": len(le.classes_),
@@ -503,22 +523,16 @@ def train_material_model(
     """训练材料裂纹预测模型"""
     model = model.to(device)
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=lr, weight_decay=0
-    )  # 不使用AdamW的weight_decay
+        model.parameters(), lr=lr, weight_decay=weight_decay
+    )
 
-    # 改进：使用带预热的学习率调度器
-    warmup_epochs = 10
-
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            # 线性预热
-            return epoch / warmup_epochs
-        else:
-            # 余弦退火
-            progress = (epoch - warmup_epochs) / (epochs - warmup_epochs)
-            return 0.5 * (1 + np.cos(np.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        epochs=epochs,
+        steps_per_epoch=1,
+        pct_start=0.3,
+    )
 
     # 改进：使用自定义物理损失函数
     loss_fn = PhysicsInformedLoss(weight_decay=weight_decay)
@@ -543,13 +557,23 @@ def train_material_model(
     for epoch in range(epochs):
         # 更新当前epoch
         loss_fn.update_epoch(epoch, epochs)
+        model.progress = epoch / epochs
 
         # 训练
         model.train()
         optimizer.zero_grad()
 
-        pred, uncertainty, symbolic, residual = model(train_materials, train_features)
-        loss, metrics = loss_fn(pred, uncertainty, train_target, model, train_raw)
+        def forward_once():
+            return model(train_materials, train_features)
+
+        pred1, unc1, _, _ = forward_once()
+        pred2, unc2, _, _ = forward_once()
+        loss1, metrics = loss_fn(pred1, unc1, train_target, model, train_raw)
+        loss2, _ = loss_fn(pred2, unc2, train_target, model, train_raw)
+        kl = F.kl_div(pred1.log(), pred2, reduction="batchmean") + F.kl_div(
+            pred2.log(), pred1, reduction="batchmean"
+        )
+        loss = (loss1 + loss2) / 2 + 0.5 * kl
 
         loss.backward()
         # 更严格的梯度裁剪

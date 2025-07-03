@@ -33,7 +33,7 @@ def reconstruct_df(data_dict):
             "晶粒粒径": raw[:, 3],
             "压溃压力": raw[:, 4],
             "磨粒速度": raw[:, 5],
-            "亚表面裂纹深度": data_dict["target"],
+            "亚表面裂纹深度": np.expm1(data_dict["target"]),
         }
     )
     return df
@@ -68,7 +68,7 @@ def create_model(trial, num_materials):
     material_embed_dim = trial.suggest_int(
         "material_embed_dim", 8, 32, step=8
     )  # 缩小范围
-    latent_dim = trial.suggest_int("latent_dim", 16, 64, step=16)  # 缩小范围
+    latent_dim = trial.suggest_int("latent_dim", 16, 128, step=16)
 
     # 创建模型并修改部分架构
     model = MaterialCrackPGNN(
@@ -123,19 +123,13 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
     else:
         optimizer = torch.optim.RMSprop(model.parameters(), lr=lr)
 
-    # 学习率预热与调度
-    warmup_epochs = 10
-
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            # 线性预热
-            return epoch / warmup_epochs
-        else:
-            # 余弦退火
-            progress = (epoch - warmup_epochs) / (epochs - warmup_epochs)
-            return 0.5 * (1 + np.cos(np.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        epochs=epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.3,
+    )
 
     # 损失函数
     loss_fn = PhysicsInformedLoss(
@@ -177,6 +171,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
     val_features = torch.FloatTensor(val_data["numeric_features"]).to(device)
     val_raw = torch.FloatTensor(val_data["numeric_raw"]).to(device)
     val_target = torch.FloatTensor(val_data["target"]).unsqueeze(1).to(device)
+    val_target_raw = torch.FloatTensor(val_data["target_raw"]).unsqueeze(1).to(device)
 
     # 训练循环
     best_val_r2 = -float("inf")
@@ -186,6 +181,8 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
     for epoch in range(epochs):
         # 更新当前epoch
         loss_fn.update_epoch(epoch, epochs)
+        model.progress = epoch / epochs
+        model.progress = epoch / epochs
 
         # 训练
         model.train()
@@ -199,8 +196,16 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
 
             optimizer.zero_grad()
 
-            pred, uncertainty, symbolic, residual = model(batch_materials, batch_raw)
-            loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
+            def forward_once():
+                return model(batch_materials, batch_raw)
+
+            pred1, unc1, _, _ = forward_once()
+            pred2, unc2, _, _ = forward_once()
+            loss1, _ = loss_fn(pred1, unc1, batch_target, model, batch_raw)
+            loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
+            kl = F.kl_div(pred1.log(), pred2, reduction='batchmean') + \
+                 F.kl_div(pred2.log(), pred1, reduction='batchmean')
+            loss = (loss1 + loss2) / 2 + 0.5 * kl
 
             # 检查NaN
             if torch.isnan(loss) or torch.isinf(loss):
@@ -211,6 +216,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
             # 更严格的梯度裁剪
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
+            scheduler.step()
 
             epoch_loss += loss.item() * batch_target.size(0)
 
@@ -223,14 +229,13 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
             val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
 
             val_pred_np = val_pred.cpu().squeeze().numpy()
-            val_target_np = val_target.cpu().squeeze().numpy()
+            val_target_np = val_target_raw.cpu().squeeze().numpy()
+            val_pred_np_raw = np.expm1(val_pred_np)
 
-            val_r2 = r2_score(val_target_np, val_pred_np)
-            val_rmse = np.sqrt(mean_squared_error(val_target_np, val_pred_np))
+            val_r2 = r2_score(val_target_np, val_pred_np_raw)
+            val_rmse = np.sqrt(mean_squared_error(val_target_np, val_pred_np_raw))
 
         # 更新学习率
-        scheduler.step()
-
         # 早停检查
         if val_r2 > best_val_r2:
             best_val_r2 = val_r2
@@ -260,7 +265,8 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
         with torch.no_grad():
             val_pred, _, _, _ = model(val_materials, val_raw)
             val_pred_np = val_pred.cpu().squeeze().numpy()
-            final_r2 = r2_score(val_target_np, val_pred_np)
+            val_pred_np_raw = np.expm1(val_pred_np)
+            final_r2 = r2_score(val_target_np, val_pred_np_raw)
 
         return final_r2
 
@@ -289,7 +295,7 @@ def objective(trial, df, device, seed):
     return float(np.mean(fold_scores))
 
 
-def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials=100, seed=42):
+def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials=150, seed=42):
     """运行超参数优化"""
 
     # 设置随机种子
@@ -407,6 +413,7 @@ def retrain_with_best_params(
     test_features = torch.FloatTensor(test_data["numeric_features"]).to(device)
     test_raw = torch.FloatTensor(test_data["numeric_raw"]).to(device)
     test_target = torch.FloatTensor(test_data["target"]).unsqueeze(1).to(device)
+    test_target_raw = torch.FloatTensor(test_data["target_raw"]).unsqueeze(1).to(device)
 
     # 优化器
     lr = best_params["lr"]
@@ -419,16 +426,13 @@ def retrain_with_best_params(
 
     # 学习率调度
     epochs = best_params["epochs"]
-    warmup_epochs = 10
-
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return epoch / warmup_epochs
-        else:
-            progress = (epoch - warmup_epochs) / (epochs - warmup_epochs)
-            return 0.5 * (1 + np.cos(np.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        epochs=epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.3,
+    )
 
     # 损失函数
     loss_fn = PhysicsInformedLoss(
@@ -461,20 +465,27 @@ def retrain_with_best_params(
 
             optimizer.zero_grad()
 
-            pred, uncertainty, _, _ = model(batch_materials, batch_raw)
-            loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
+            def forward_once():
+                return model(batch_materials, batch_raw)
+
+            pred1, unc1, _, _ = forward_once()
+            pred2, unc2, _, _ = forward_once()
+            loss1, _ = loss_fn(pred1, unc1, batch_target, model, batch_raw)
+            loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
+            kl = F.kl_div(pred1.log(), pred2, reduction='batchmean') + \
+                 F.kl_div(pred2.log(), pred1, reduction='batchmean')
+            loss = (loss1 + loss2) / 2 + 0.5 * kl
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
+            scheduler.step()
 
             epoch_loss += loss.item() * batch_target.size(0)
 
         epoch_loss /= len(train_dataset)
         train_losses.append(epoch_loss)
 
-        # 更新学习率
-        scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
         # 评估
@@ -482,10 +493,11 @@ def retrain_with_best_params(
         with torch.no_grad():
             test_pred, test_uncertainty, _, _ = model(test_materials, test_raw)
             test_pred_np = test_pred.cpu().squeeze().numpy()
-            test_target_np = test_target.cpu().squeeze().numpy()
+            test_target_np = test_target_raw.cpu().squeeze().numpy()
+            test_pred_np_raw = np.expm1(test_pred_np)
 
-            test_r2 = r2_score(test_target_np, test_pred_np)
-            test_rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
+            test_r2 = r2_score(test_target_np, test_pred_np_raw)
+            test_rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np_raw))
             test_r2_history.append(test_r2)
 
         if (epoch + 1) % 20 == 0:
@@ -515,18 +527,20 @@ def retrain_with_best_params(
     with torch.no_grad():
         test_pred, test_uncertainty, _, _ = model(test_materials, test_raw)
         test_pred_np = test_pred.cpu().squeeze().numpy()
-        test_target_np = test_target.cpu().squeeze().numpy()
+        test_target_np = test_target_raw.cpu().squeeze().numpy()
+        test_pred_np_raw = np.expm1(test_pred_np)
 
-        final_r2 = r2_score(test_target_np, test_pred_np)
-        final_rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
+        final_r2 = r2_score(test_target_np, test_pred_np_raw)
+        final_rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np_raw))
 
     # MC Dropout预测
     mc_pred, mc_unc, alea_unc, epis_unc = model.predict_with_uncertainty(
         test_materials, test_raw, n_samples=20
     )
     mc_pred_np = mc_pred.cpu().squeeze().numpy()
-    mc_r2 = r2_score(test_target_np, mc_pred_np)
-    mc_rmse = np.sqrt(mean_squared_error(test_target_np, mc_pred_np))
+    mc_pred_np_raw = np.expm1(mc_pred_np)
+    mc_r2 = r2_score(test_target_np, mc_pred_np_raw)
+    mc_rmse = np.sqrt(mean_squared_error(test_target_np, mc_pred_np_raw))
 
     print(f"\n最终测试集性能:")
     print(f"  标准预测 R²: {final_r2:.4f}, RMSE: {final_rmse:.4f}")
@@ -556,14 +570,15 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
 
         # 转换为NumPy
         test_pred_np = test_pred.cpu().squeeze().numpy()
-        test_target_np = test_target.cpu().squeeze().numpy()
+        test_target_np = test_target_raw.cpu().squeeze().numpy()
+        test_pred_np_raw = np.expm1(test_pred_np)
         test_uncertainty_np = test_uncertainty.cpu().squeeze().numpy()
         symbolic_np = symbolic_out.cpu().squeeze().numpy()
         residual_np = residual_out.cpu().squeeze().numpy()
 
         # 计算指标
-        r2 = r2_score(test_target_np, test_pred_np)
-        rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
+        r2 = r2_score(test_target_np, test_pred_np_raw)
+        rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np_raw))
 
         # 计算符号表达式和残差网络的贡献
         symbolic_contrib = np.mean(
@@ -571,7 +586,7 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
         )
 
         # 计算不确定性与误差的相关性
-        errors = np.abs(test_pred_np - test_target_np)
+        errors = np.abs(test_pred_np_raw - test_target_np)
         uncertainty_error_corr = np.corrcoef(errors, test_uncertainty_np)[0, 1]
 
     # MC Dropout预测
@@ -579,12 +594,13 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
         test_materials, test_raw, n_samples=30
     )
     mc_pred_np = mc_pred.cpu().squeeze().numpy()
+    mc_pred_np_raw = np.expm1(mc_pred_np)
     mc_unc_np = mc_unc.cpu().squeeze().numpy()
     aleatoric_np = aleatoric_unc.cpu().squeeze().numpy()
     epistemic_np = epistemic_unc.cpu().squeeze().numpy()
 
-    mc_r2 = r2_score(test_target_np, mc_pred_np)
-    mc_rmse = np.sqrt(mean_squared_error(test_target_np, mc_pred_np))
+    mc_r2 = r2_score(test_target_np, mc_pred_np_raw)
+    mc_rmse = np.sqrt(mean_squared_error(test_target_np, mc_pred_np_raw))
 
     # 不确定性指标
     mean_epistemic = np.mean(epistemic_np)
@@ -605,7 +621,7 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
     print(f"  不确定性比例 (Epistemic/Aleatoric): {ratio:.4f}")
 
     # 计算每个样本的可靠度 (不确定性校准)
-    errors = np.abs(mc_pred_np - test_target_np)
+    errors = np.abs(mc_pred_np_raw - test_target_np)
     calibration_scores = errors / (np.sqrt(mc_unc_np) + 1e-6)
     well_calibrated = np.mean((calibration_scores <= 2.0))
 
@@ -623,8 +639,8 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
         },
         "predictions": {
             "y_true": test_target_np,
-            "y_pred": test_pred_np,
-            "y_mc_pred": mc_pred_np,
+            "y_pred": test_pred_np_raw,
+            "y_mc_pred": mc_pred_np_raw,
             "uncertainty": test_uncertainty_np,
             "mc_uncertainty": mc_unc_np,
             "epistemic": epistemic_np,
@@ -639,7 +655,7 @@ if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
     # 运行超参数优化
-    study = run_hyperopt(n_trials=50)  # 可以增加trials获得更好结果
+    study = run_hyperopt(n_trials=150)
 
     # 使用最佳参数重新训练
     model, train_losses, test_r2_history = retrain_with_best_params(study)
