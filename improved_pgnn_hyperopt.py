@@ -2,6 +2,7 @@ import optuna
 from optuna.trial import TrialState
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 import copy
@@ -125,15 +126,6 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
     else:
         optimizer = torch.optim.RMSprop(model.parameters(), lr=lr)
 
-    # 学习率预热与调度
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=lr,
-        epochs=epochs,
-        steps_per_epoch=len(train_loader),
-        pct_start=0.3,
-    )
-
     # 损失函数
     loss_fn = PhysicsInformedLoss(
         lambda_complexity=lambda_complexity,
@@ -168,6 +160,15 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
         drop_last=False,  # 改为False以使用所有数据
         pin_memory=True,  # 加速数据传输
         num_workers=0,  # 单进程加载避免额外开销
+    )
+
+    # 学习率预热与调度 (在DataLoader创建后确定steps_per_epoch)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        epochs=epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.3,
     )
 
     val_materials = torch.LongTensor(val_data["material_ids"]).to(device)
