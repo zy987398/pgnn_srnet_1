@@ -185,7 +185,7 @@ class ImprovedSymbolicLayer(nn.Module):
         symbolic_output = sum(expressions)
 
         # 计算复杂度（用于正则化）
-        self.complexity = torch.sum(
+        self.complexity = -torch.sum(
             var_weights * torch.log(var_weights + 1e-8), dim=-1
         ).mean()
 
@@ -284,7 +284,7 @@ class MaterialCrackPGNN(nn.Module):
         residual_output = self.residual_net(residual_input)
 
         # 组合预测（非负）
-        prediction = F.relu(symbolic_output + residual_output) + 1e-3
+        prediction = F.softplus(symbolic_output + residual_output, beta=5) + 1e-3
 
         # 不确定性估计 - 随机不确定性
         log_var = self.aleatoric_net(z).clamp(-10, 6)
