@@ -62,7 +62,7 @@ def augment_dataset(orig_df, noise_scale=0.05):
     return pd.concat([orig_df, aug_df], ignore_index=True)
 
 
-def create_model(trial, num_materials):
+def create_model(trial, num_materials, num_mean, num_std):
     """根据trial创建模型"""
     # 模型架构超参数
     material_embed_dim = trial.suggest_int(
@@ -75,6 +75,8 @@ def create_model(trial, num_materials):
         num_materials=num_materials,
         material_embed_dim=material_embed_dim,
         latent_dim=latent_dim,
+        num_mean=num_mean,
+        num_std=num_std,
     )
 
     # 动态调整dropout率
@@ -113,7 +115,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
     optimizer_name = trial.suggest_categorical("optimizer", ["AdamW", "RMSprop"])
 
     # 创建模型
-    model = create_model(trial, num_materials).to(device)
+    model = create_model(trial, num_materials, train_data["num_mean"], train_data["num_std"]).to(device)
 
     # 创建优化器
     if optimizer_name == "AdamW":
@@ -122,20 +124,6 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
         )
     else:
         optimizer = torch.optim.RMSprop(model.parameters(), lr=lr)
-
-    # 学习率预热与调度
-    warmup_epochs = 10
-
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            # 线性预热
-            return epoch / warmup_epochs
-        else:
-            # 余弦退火
-            progress = (epoch - warmup_epochs) / (epochs - warmup_epochs)
-            return 0.5 * (1 + np.cos(np.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # 损失函数
     loss_fn = PhysicsInformedLoss(
@@ -173,6 +161,15 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
         num_workers=0,  # 单进程加载避免额外开销
     )
 
+    # 学习率预热与调度 (在获得train_loader之后)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        epochs=epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.3,
+    )
+
     val_materials = torch.LongTensor(val_data["material_ids"]).to(device)
     val_features = torch.FloatTensor(val_data["numeric_features"]).to(device)
     val_raw = torch.FloatTensor(val_data["numeric_raw"]).to(device)
@@ -184,8 +181,8 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
     best_model_wts = None
 
     for epoch in range(epochs):
-        # 更新当前epoch
         loss_fn.update_epoch(epoch, epochs)
+        model.set_epoch(epoch, epochs)
 
         # 训练
         model.train()
@@ -199,8 +196,12 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
 
             optimizer.zero_grad()
 
-            pred, uncertainty, symbolic, residual = model(batch_materials, batch_raw)
-            loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
+            pred1, unc1, _, _ = model(batch_materials, batch_raw)
+            pred2, unc2, _, _ = model(batch_materials, batch_raw)
+            loss1, metrics = loss_fn(pred1, unc1, batch_target, model, batch_raw)
+            loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
+            kl = F.kl_div(pred1.log(), pred2, reduction='batchmean') + F.kl_div(pred2.log(), pred1, reduction='batchmean')
+            loss = (loss1 + loss2) / 2 + 0.5 * kl
 
             # 检查NaN
             if torch.isnan(loss) or torch.isinf(loss):
@@ -211,6 +212,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
             # 更严格的梯度裁剪
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
+            scheduler.step()
 
             epoch_loss += loss.item() * batch_target.size(0)
 
@@ -222,14 +224,12 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
             val_pred, val_uncertainty, _, _ = model(val_materials, val_raw)
             val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
 
-            val_pred_np = val_pred.cpu().squeeze().numpy()
-            val_target_np = val_target.cpu().squeeze().numpy()
+            val_pred_np = np.expm1(val_pred.cpu().squeeze().numpy())
+            val_target_np = np.expm1(val_target.cpu().squeeze().numpy())
 
             val_r2 = r2_score(val_target_np, val_pred_np)
             val_rmse = np.sqrt(mean_squared_error(val_target_np, val_pred_np))
 
-        # 更新学习率
-        scheduler.step()
 
         # 早停检查
         if val_r2 > best_val_r2:
@@ -259,7 +259,8 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
         model.eval()
         with torch.no_grad():
             val_pred, _, _, _ = model(val_materials, val_raw)
-            val_pred_np = val_pred.cpu().squeeze().numpy()
+            val_pred_np = np.expm1(val_pred.cpu().squeeze().numpy())
+            val_target_np = np.expm1(val_target.cpu().squeeze().numpy())
             final_r2 = r2_score(val_target_np, val_pred_np)
 
         return final_r2
@@ -325,14 +326,17 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials=10
     print("优化完成!")
     print("=" * 50)
 
+    completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
+    print(f"\n完成的trials: {len(completed_trials)}/{n_trials}")
+
+    if not completed_trials:
+        print("\n超参数搜索未产生有效结果，请检查配置。")
+        return study
+
     print(f"\n最佳验证R²: {study.best_value:.4f}")
     print("\n最佳超参数:")
     for key, value in study.best_params.items():
         print(f"  {key}: {value}")
-
-    # 统计信息
-    completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
-    print(f"\n完成的trials: {len(completed_trials)}/{n_trials}")
 
     # 超参数重要性
     try:
@@ -419,16 +423,13 @@ def retrain_with_best_params(
 
     # 学习率调度
     epochs = best_params["epochs"]
-    warmup_epochs = 10
-
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return epoch / warmup_epochs
-        else:
-            progress = (epoch - warmup_epochs) / (epochs - warmup_epochs)
-            return 0.5 * (1 + np.cos(np.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        epochs=epochs,
+        steps_per_epoch=len(train_loader),
+        pct_start=0.3,
+    )
 
     # 损失函数
     loss_fn = PhysicsInformedLoss(
@@ -446,8 +447,8 @@ def retrain_with_best_params(
     best_epoch = 0
 
     for epoch in range(epochs):
-        # 更新当前epoch
         loss_fn.update_epoch(epoch, epochs)
+        model.set_epoch(epoch, epochs)
 
         # 训练
         model.train()
@@ -461,28 +462,30 @@ def retrain_with_best_params(
 
             optimizer.zero_grad()
 
-            pred, uncertainty, _, _ = model(batch_materials, batch_raw)
-            loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
+            pred1, unc1, _, _ = model(batch_materials, batch_raw)
+            pred2, unc2, _, _ = model(batch_materials, batch_raw)
+            loss1, metrics = loss_fn(pred1, unc1, batch_target, model, batch_raw)
+            loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
+            kl = F.kl_div(pred1.log(), pred2, reduction='batchmean') + F.kl_div(pred2.log(), pred1, reduction='batchmean')
+            loss = (loss1 + loss2) / 2 + 0.5 * kl
 
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
+            scheduler.step()
 
             epoch_loss += loss.item() * batch_target.size(0)
 
         epoch_loss /= len(train_dataset)
         train_losses.append(epoch_loss)
-
-        # 更新学习率
-        scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
         # 评估
         model.eval()
         with torch.no_grad():
             test_pred, test_uncertainty, _, _ = model(test_materials, test_raw)
-            test_pred_np = test_pred.cpu().squeeze().numpy()
-            test_target_np = test_target.cpu().squeeze().numpy()
+            test_pred_np = np.expm1(test_pred.cpu().squeeze().numpy())
+            test_target_np = np.expm1(test_target.cpu().squeeze().numpy())
 
             test_r2 = r2_score(test_target_np, test_pred_np)
             test_rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
@@ -514,8 +517,8 @@ def retrain_with_best_params(
     # 标准预测
     with torch.no_grad():
         test_pred, test_uncertainty, _, _ = model(test_materials, test_raw)
-        test_pred_np = test_pred.cpu().squeeze().numpy()
-        test_target_np = test_target.cpu().squeeze().numpy()
+        test_pred_np = np.expm1(test_pred.cpu().squeeze().numpy())
+        test_target_np = np.expm1(test_target.cpu().squeeze().numpy())
 
         final_r2 = r2_score(test_target_np, test_pred_np)
         final_rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
@@ -524,7 +527,7 @@ def retrain_with_best_params(
     mc_pred, mc_unc, alea_unc, epis_unc = model.predict_with_uncertainty(
         test_materials, test_raw, n_samples=20
     )
-    mc_pred_np = mc_pred.cpu().squeeze().numpy()
+    mc_pred_np = np.expm1(mc_pred.cpu().squeeze().numpy())
     mc_r2 = r2_score(test_target_np, mc_pred_np)
     mc_rmse = np.sqrt(mean_squared_error(test_target_np, mc_pred_np))
 
@@ -555,8 +558,8 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
         )
 
         # 转换为NumPy
-        test_pred_np = test_pred.cpu().squeeze().numpy()
-        test_target_np = test_target.cpu().squeeze().numpy()
+        test_pred_np = np.expm1(test_pred.cpu().squeeze().numpy())
+        test_target_np = np.expm1(test_target.cpu().squeeze().numpy())
         test_uncertainty_np = test_uncertainty.cpu().squeeze().numpy()
         symbolic_np = symbolic_out.cpu().squeeze().numpy()
         residual_np = residual_out.cpu().squeeze().numpy()
@@ -578,7 +581,7 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
     mc_pred, mc_unc, aleatoric_unc, epistemic_unc = model.predict_with_uncertainty(
         test_materials, test_raw, n_samples=30
     )
-    mc_pred_np = mc_pred.cpu().squeeze().numpy()
+    mc_pred_np = np.expm1(mc_pred.cpu().squeeze().numpy())
     mc_unc_np = mc_unc.cpu().squeeze().numpy()
     aleatoric_np = aleatoric_unc.cpu().squeeze().numpy()
     epistemic_np = epistemic_unc.cpu().squeeze().numpy()
