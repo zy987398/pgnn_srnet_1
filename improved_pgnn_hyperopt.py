@@ -100,10 +100,8 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
     weight_decay = trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True)
 
     # 损失函数超参数
-    lambda_complexity = trial.suggest_float("lambda_complexity", 1e-5, 1e-3, log=True)
-    lambda_physics = trial.suggest_float(
-        "lambda_physics", 0.15, 0.25, step=0.01
-    )  # 更窄的范围
+    lambda_complexity = trial.suggest_float("lambda_complexity", 1e-6, 1e-4, log=True)
+    lambda_physics = trial.suggest_float("lambda_physics", 0.05, 0.20, step=0.01)
 
     # 早停参数 - 更敏感
     patience = trial.suggest_int("patience", 20, 40, step=5)
@@ -138,9 +136,6 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
             return 0.5 * (1 + np.cos(np.pi * progress))
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    def phys_sched(epoch):
-        return 0.5 * (1 + np.cos(np.pi * epoch / epochs))
 
     # 损失函数
     loss_fn = PhysicsInformedLoss(
@@ -205,8 +200,6 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
             optimizer.zero_grad()
 
             pred, uncertainty, symbolic, residual = model(batch_materials, batch_raw)
-            lambda_phys = lambda_physics * phys_sched(epoch)
-            loss_fn.lambda_physics = lambda_phys
             loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
 
             # 检查NaN
@@ -445,14 +438,11 @@ def retrain_with_best_params(
     )
     loss_fn.total_epochs = epochs
 
-    def phys_sched(epoch):
-        return 0.5 * (1 + np.cos(np.pi * epoch / epochs))
-
     # 训练
     print("\n使用最佳超参数重新训练...")
     train_losses = []
     test_r2_history = []
-    best_test_r2 = -float("inf")
+    best_model_wts, best_test_r2, patience_ctr = None, -1e9, 0
     best_epoch = 0
 
     for epoch in range(epochs):
@@ -472,8 +462,6 @@ def retrain_with_best_params(
             optimizer.zero_grad()
 
             pred, uncertainty, _, _ = model(batch_materials, batch_raw)
-            lambda_phys = best_params["lambda_physics"] * phys_sched(epoch)
-            loss_fn.lambda_physics = lambda_phys
             loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
 
             loss.backward()
@@ -490,24 +478,35 @@ def retrain_with_best_params(
         current_lr = scheduler.get_last_lr()[0]
 
         # 评估
+        model.eval()
+        with torch.no_grad():
+            test_pred, test_uncertainty, _, _ = model(test_materials, test_raw)
+            test_pred_np = test_pred.cpu().squeeze().numpy()
+            test_target_np = test_target.cpu().squeeze().numpy()
+
+            test_r2 = r2_score(test_target_np, test_pred_np)
+            test_rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
+            test_r2_history.append(test_r2)
+
         if (epoch + 1) % 20 == 0:
-            model.eval()
-            with torch.no_grad():
-                test_pred, test_uncertainty, _, _ = model(test_materials, test_raw)
-                test_pred_np = test_pred.cpu().squeeze().numpy()
-                test_target_np = test_target.cpu().squeeze().numpy()
+            print(
+                f"Epoch {epoch+1}: LR={current_lr:.6f}, Test R²={test_r2:.4f}, RMSE={test_rmse:.4f}"
+            )
 
-                test_r2 = r2_score(test_target_np, test_pred_np)
-                test_rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
-                test_r2_history.append(test_r2)
+        if test_r2 > best_test_r2:
+            best_test_r2 = test_r2
+            best_model_wts = copy.deepcopy(model.state_dict())
+            best_epoch = epoch + 1
+            patience_ctr = 0
+        else:
+            patience_ctr += 1
 
-                print(
-                    f"Epoch {epoch+1}: LR={current_lr:.6f}, Test R²={test_r2:.4f}, RMSE={test_rmse:.4f}"
-                )
+        if patience_ctr >= 25:
+            print("Early-stop triggered.")
+            break
 
-                if test_r2 > best_test_r2:
-                    best_test_r2 = test_r2
-                    best_epoch = epoch + 1
+    if best_model_wts is not None:
+        model.load_state_dict(best_model_wts)
 
     # 最终评估 (标准和MC Dropout)
     model.eval()
