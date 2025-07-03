@@ -2,14 +2,13 @@ import optuna
 from optuna.trial import TrialState
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import numpy as np
 import pandas as pd
-from sklearn.model_selection import train_test_split
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import r2_score, mean_squared_error
 import warnings
-import os
 warnings.filterwarnings("ignore")
+from torch.utils.data import TensorDataset, DataLoader
 
 from material_crack_pgnn import (
     MaterialCrackPGNN,
@@ -30,8 +29,8 @@ def create_model(trial, num_materials):
         latent_dim=latent_dim
     )
     
-    # 动态调整dropout率
-    dropout_rate = trial.suggest_float("dropout_rate", 0.0, 0.5, step=0.1)
+    # 动态调整dropout率 - 修复B-1：降低dropout范围
+    dropout_rate = trial.suggest_float("dropout_rate", 0.0, 0.25, step=0.05)  # 从0.5降到0.25
     for module in model.modules():
         if isinstance(module, nn.Dropout):
             module.p = dropout_rate
@@ -47,7 +46,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device='cuda'):
     
     # 损失函数超参数
     lambda_complexity = trial.suggest_float("lambda_complexity", 1e-5, 1e-2, log=True)
-    lambda_phys_base = trial.suggest_float("lambda_physics", 0.05, 0.5, step=0.025)  # {{ 调整搜索范围符合文献推荐值 }}
+    lambda_physics = trial.suggest_float("lambda_physics", 0, 0.5, step=0.05)
     
     # 优化器选择
     optimizer_name = trial.suggest_categorical("optimizer", ["Adam", "AdamW", "RMSprop"])
@@ -78,71 +77,75 @@ def train_with_trial(trial, train_data, val_data, num_materials, device='cuda'):
     # 损失函数
     loss_fn = PhysicsInformedLoss(
         lambda_complexity=lambda_complexity,
-        lambda_physics=lambda_phys_base  # 使用基础值初始化
+        lambda_physics=lambda_physics
     )
     
     # 准备数据
-    train_materials = torch.LongTensor(train_data['material_ids']).to(device)
-    train_features = torch.FloatTensor(train_data['numeric_features']).to(device)
-    train_target = torch.FloatTensor(train_data['target']).unsqueeze(1).to(device)
+    train_dataset = TensorDataset(
+        torch.LongTensor(train_data['material_ids']),
+        torch.FloatTensor(train_data['numeric_features']),
+        torch.FloatTensor(train_data['numeric_raw']),
+        torch.FloatTensor(train_data['target']).unsqueeze(1)
+    )
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=32, 
+        shuffle=True, 
+        drop_last=True
+    )
     
     val_materials = torch.LongTensor(val_data['material_ids']).to(device)
     val_features = torch.FloatTensor(val_data['numeric_features']).to(device)
+    val_raw = torch.FloatTensor(val_data['numeric_raw']).to(device)
     val_target = torch.FloatTensor(val_data['target']).unsqueeze(1).to(device)
     
     # 训练循环
     best_val_r2 = -float('inf')
-    patience = 40  # {{ 修改早停机制的patience为40 }}
+    patience = 50
     patience_counter = 0
     
-    train_losses = []
-    val_losses = []  # 添加验证损失列表
-    val_r2_history = []
-    
     for epoch in range(epochs):
-        # 动态调整lambda_physics
-        lambda_phys = lambda_phys_base * min(1, epoch / 100)  # {{ 动态调整lambda_physics }}
-        
         # 训练
         model.train()
-        optimizer.zero_grad()
+        epoch_loss = 0
         
-        pred, uncertainty, symbolic, residual = model(train_materials, train_features)
-        loss, metrics = loss_fn(pred, uncertainty, train_target, model, train_features)
-        
-        # 动态更新lambda_physics
-        loss_fn.lambda_physics = lambda_phys  # {{ 动态更新lambda_physics }}
-        
-        # 检查NaN
-        if torch.isnan(loss):
-            return float('inf')
-        
-        loss.backward()
-        
-        # 梯度裁剪（降低阈值至0.5）
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-        
-        optimizer.step()
-        
-        # 记录训练损失
-        train_losses.append(loss.item())
+        for batch_materials, batch_features, batch_raw, batch_target in train_loader:
+            batch_materials = batch_materials.to(device)
+            batch_features = batch_features.to(device)
+            batch_raw = batch_raw.to(device)
+            batch_target = batch_target.to(device)
+            
+            optimizer.zero_grad()
+            
+            # 更新lambda_physics - 修复：先更新再计算损失
+            lambda_phys_eff = lambda_physics * min(1.0, epoch / 100)
+            loss_fn.lambda_physics = lambda_phys_eff
+            
+            pred, uncertainty, symbolic, residual = model(batch_materials, batch_features)
+            loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
+            
+            # 检查NaN
+            if torch.isnan(loss) or torch.isinf(loss):
+                return float('-inf')
+                
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            epoch_loss += loss.item()
         
         # 验证
         model.eval()
         with torch.no_grad():
             val_pred, val_uncertainty, _, _ = model(val_materials, val_features)
-            val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_features)
-            val_losses.append(val_loss.item())
+            val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
             
             val_pred_np = val_pred.cpu().squeeze().numpy()
             val_target_np = val_target.cpu().squeeze().numpy()
             
             val_r2 = r2_score(val_target_np, val_pred_np)
-            val_r2_history.append(val_r2)  # 记录每个epoch的val_r2
-            
-            # 定义val_rmse用于学习率调度
             val_rmse = np.sqrt(mean_squared_error(val_target_np, val_pred_np))
-
+        
         # 更新学习率
         if scheduler:
             if scheduler_type == "plateau":
@@ -154,9 +157,6 @@ def train_with_trial(trial, train_data, val_data, num_materials, device='cuda'):
         if val_r2 > best_val_r2:
             best_val_r2 = val_r2
             patience_counter = 0
-            # 保存最佳模型（在100~150个epoch之间）
-            if 100 <= epoch <= 150:  # {{ 保存最佳模型（在100~150个epoch之间） }}
-                torch.save(model.state_dict(), 'best_model.pth')
         else:
             patience_counter += 1
         
@@ -170,13 +170,12 @@ def train_with_trial(trial, train_data, val_data, num_materials, device='cuda'):
         if trial.should_prune():
             raise optuna.TrialPruned()
     
-    return best_val_r2, train_losses, val_r2_history  # 返回训练损失和验证R²历史
+    return best_val_r2
 
 def objective(trial, train_data, val_data, num_materials, device):
     """Optuna目标函数"""
     try:
-        # 仅获取val_r2作为返回值
-        val_r2, _, _ = train_with_trial(trial, train_data, val_data, num_materials, device)
+        val_r2 = train_with_trial(trial, train_data, val_data, num_materials, device)
         return val_r2
     except Exception as e:
         print(f"Trial failed with error: {e}")
@@ -197,7 +196,11 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials=10
     
     # 准备数据
     train_data = prepare_material_data(train_df)
-    val_data = prepare_material_data(val_df)
+    val_data   = prepare_material_data(
+        val_df,
+        scaler=train_data["scaler"],
+        le=train_data["label_encoder"],
+    )
     num_materials = train_data['num_materials']
     
     # 设备
@@ -254,7 +257,11 @@ def retrain_with_best_params(study, data_path="3011916164精确材料性能数�
     train_df, test_df = train_test_split(df, test_size=0.2, random_state=seed)
     
     train_data = prepare_material_data(train_df)
-    test_data = prepare_material_data(test_df)
+    test_data  = prepare_material_data(
+        test_df,
+        scaler=train_data["scaler"],
+        le=train_data["label_encoder"],
+    )
     
     # 创建模型
     best_params = study.best_params
@@ -291,48 +298,64 @@ def retrain_with_best_params(study, data_path="3011916164精确材料性能数�
     )
     
     # 准备数据
-    train_materials = torch.LongTensor(train_data['material_ids']).to(device)
-    train_features = torch.FloatTensor(train_data['numeric_features']).to(device)
-    train_target = torch.FloatTensor(train_data['target']).unsqueeze(1).to(device)
+    train_dataset = TensorDataset(
+        torch.LongTensor(train_data['material_ids']),
+        torch.FloatTensor(train_data['numeric_features']),
+        torch.FloatTensor(train_data['numeric_raw']),
+        torch.FloatTensor(train_data['target']).unsqueeze(1)
+    )
+    train_loader = DataLoader(
+        train_dataset, 
+        batch_size=32, 
+        shuffle=True, 
+        drop_last=True
+    )
     
     test_materials = torch.LongTensor(test_data['material_ids']).to(device)
     test_features = torch.FloatTensor(test_data['numeric_features']).to(device)
+    test_raw = torch.FloatTensor(test_data['numeric_raw']).to(device)
     test_target = torch.FloatTensor(test_data['target']).unsqueeze(1).to(device)
-    
-    # 添加早停参数
-    best_test_r2 = -float('inf')
-    patience = 50
-    patience_counter = 0
     
     # 训练
     print("\n使用最佳超参数重新训练...")
     train_losses = []
     test_r2_history = []
     
-    # 创建保存模型的目录
-    os.makedirs('best_model', exist_ok=True)
-
     for epoch in range(best_params['epochs']):
         model.train()
-        optimizer.zero_grad()
+        epoch_loss = 0
         
-        pred, uncertainty, _, _ = model(train_materials, train_features)
-        loss, _ = loss_fn(pred, uncertainty, train_target, model, train_features)
-        
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        for batch_materials, batch_features, batch_raw, batch_target in train_loader:
+            batch_materials = batch_materials.to(device)
+            batch_features = batch_features.to(device)
+            batch_raw = batch_raw.to(device)
+            batch_target = batch_target.to(device)
+            
+            optimizer.zero_grad()
+            
+            # 更新lambda_physics - 修复：先更新再计算损失
+            lambda_phys_eff = best_params['lambda_physics'] * min(1.0, epoch / 100)
+            loss_fn.lambda_physics = lambda_phys_eff
+            
+            pred, uncertainty, _, _ = model(batch_materials, batch_features)
+            loss, _ = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
+            
+            if torch.isnan(loss) or torch.isinf(loss):
+                return float('-inf')
+                
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            
+            epoch_loss += loss.item()
+            
+        train_losses.append(epoch_loss / len(train_loader))
         
         # 评估
         if (epoch + 1) % 50 == 0:
             model.eval()
             with torch.no_grad():
-                # 修正模型输出解包，接收全部四个返回值
                 test_pred, _, _, _ = model(test_materials, test_features)
-                
-                # 添加NaN检测与替换
-                test_pred = torch.nan_to_num(test_pred, nan=0.0, posinf=1e5, neginf=-1e5)
-                
                 test_pred_np = test_pred.cpu().squeeze().numpy()
                 test_target_np = test_target.cpu().squeeze().numpy()
                 
@@ -341,23 +364,6 @@ def retrain_with_best_params(study, data_path="3011916164精确材料性能数�
                 test_r2_history.append(test_r2)
                 
                 print(f"Epoch {epoch+1}: Test R²={test_r2:.4f}, RMSE={test_rmse:.4f}")
-
-            # 早停检查
-            if test_r2 > best_test_r2:
-                best_test_r2 = test_r2
-                patience_counter = 0
-                # 保存最佳模型
-                torch.save(model.state_dict(), 'best_model/best_model.pth')
-            else:
-                patience_counter += 1
-                
-            if patience_counter >= patience:
-                print(f"Early stopping at epoch {epoch+1}")
-                break
-    
-    # 加载最佳模型
-    model.load_state_dict(torch.load('best_model/best_model.pth'))
-    os.remove('best_model/best_model.pth')
     
     # 最终评估
     model.eval()
@@ -380,12 +386,6 @@ if __name__ == "__main__":
     study = run_hyperopt(n_trials=50)  # 可以增加trials获得更好结果
     
     # 使用最佳参数重新训练
-    # 重新加载数据
-    df = pd.read_csv("3011916164精确材料性能数据.csv")
-    train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
-    train_data = prepare_material_data(train_df)
-    val_data = prepare_material_data(test_df)  # 定义val_data
-    
     model, train_losses, test_r2_history = retrain_with_best_params(study)
     
     # 可视化优化历史
@@ -400,7 +400,7 @@ if __name__ == "__main__":
     ax1.set_title('Hyperparameter Optimization History')
     ax1.grid(True, alpha=0.3)
     
-    # 训练损失（使用重新训练时的损失）
+    # 训练损失
     ax2.plot(train_losses)
     ax2.set_xlabel('Epoch')
     ax2.set_ylabel('Loss')

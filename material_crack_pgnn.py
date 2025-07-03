@@ -36,24 +36,30 @@ class PhysicsInformedFeatureExtractor(nn.Module):
         velocity = x[:, 5:6]
         
         # 1. Griffith能量释放率相关特征
-        # G = σ²πa/E (简化形式)
-        energy_release_rate = (pressure ** 2) * torch.sqrt(grain_size) / (elastic_modulus + 1e-6)
+        # Griffith G = (P² √a)/E
+        sqrt_g = torch.sqrt(torch.abs(grain_size) + 1e-6)
+        energy_release_rate = (pressure ** 2) * sqrt_g / (elastic_modulus.abs() + 1e-6)
         features.append(energy_release_rate)
-        
-        # 2. 临界应力强度因子比
-        # K_ratio = K_applied / K_IC ≈ σ√(πa) / K_IC
-        k_ratio = pressure * torch.sqrt(grain_size) / (fracture_toughness + 1e-6)
+
+        # K_ratio   = P √a / K_IC
+        k_ratio = pressure * sqrt_g / (fracture_toughness.abs() + 1e-6)
         features.append(k_ratio)
+
+        # Hertz contact stress ∝ (P·E²/a²)^{1/3}
+        expr = pressure * elastic_modulus ** 2 / (grain_size ** 2 + 1e-6)
+        contact_stress = torch.sign(expr) * torch.pow(expr.abs() + 1e-6, 1/3)
+        features.append(contact_stress)
+
+        # Hall-Petch
+        hall_petch = 1 / torch.sqrt(torch.abs(grain_size) + 1e-6)
+        features.append(hall_petch)
+
         
         # 3. 材料脆性指数
         # B = H/K_IC (Lawn's brittleness index)
         brittleness = hardness / (fracture_toughness + 1e-6)
         features.append(brittleness)
         
-        # 4. 接触应力相关
-        # Hertzian contact stress ∝ (P*E²/R²)^(1/3)
-        contact_stress = torch.pow(pressure * elastic_modulus ** 2 / (grain_size ** 2 + 1e-6), 1/3)
-        features.append(contact_stress)
         
         # 5. 能量输入
         energy_input = pressure * velocity
@@ -63,9 +69,6 @@ class PhysicsInformedFeatureExtractor(nn.Module):
         toughness_modulus_ratio = fracture_toughness / (elastic_modulus + 1e-6)
         features.append(toughness_modulus_ratio)
         
-        # 7. Hall-Petch关系特征
-        hall_petch = 1 / torch.sqrt(grain_size + 1e-6)
-        features.append(hall_petch)
         
         return torch.cat(features, dim=1)
 
@@ -141,8 +144,8 @@ class ImprovedSymbolicLayer(nn.Module):
         # 组合所有项
         symbolic_output = sum(expressions)
         
-        # 计算复杂度（用于正则化）
-        self.complexity = -torch.sum(var_weights * torch.log(var_weights + 1e-8), dim=-1).mean()
+        # 计算复杂度（用于正则化）- 修复：移除负号
+        self.complexity = torch.sum(var_weights * torch.log(var_weights + 1e-8), dim=-1).mean()
         
         return symbolic_output
 
@@ -160,14 +163,14 @@ class MaterialCrackPGNN(nn.Module):
         # 编码器（处理材料嵌入 + 数值特征 + 物理特征）
         # 输入维度：16(材料) + 6(原始) + 7(物理) = 29
         self.encoder = nn.Sequential(
-            nn.Linear(material_embed_dim + 13, 64),
+            nn.Linear(material_embed_dim + 13, 128),
+            nn.ReLU(),
+            nn.BatchNorm1d(128),
+            nn.Dropout(0.2),
+            nn.Linear(128, 64),
             nn.ReLU(),
             nn.BatchNorm1d(64),
-            nn.Dropout(0.2),
-            nn.Linear(64, 32),
-            nn.ReLU(),
-            nn.BatchNorm1d(32),
-            nn.Linear(32, latent_dim)
+            nn.Linear(64, latent_dim)
         )
         
         # 符号表达式层
@@ -184,12 +187,11 @@ class MaterialCrackPGNN(nn.Module):
             nn.Linear(32, 1)
         )
         
-        # 不确定性预测
+        # 不确定性预测 - 修改：输出log_var而不是直接使用Softplus
         self.uncertainty_net = nn.Sequential(
             nn.Linear(latent_dim, 32),
             nn.ReLU(),
-            nn.Linear(32, 1),
-            nn.Softplus()
+            nn.Linear(32, 1)  # 输出log_var
         )
         
         # 输出层（确保正值）
@@ -221,8 +223,9 @@ class MaterialCrackPGNN(nn.Module):
         # 组合预测（确保正值）
         prediction = self.output_activation(symbolic_output + residual_output)
         
-        # 不确定性估计
-        uncertainty = self.uncertainty_net(z)
+        # 不确定性估计 - 修改：转换log_var为方差
+        log_var = self.uncertainty_net(z)
+        uncertainty = torch.exp(log_var)
         
         return prediction, uncertainty, symbolic_output, residual_output
 
@@ -271,31 +274,39 @@ class PhysicsInformedLoss(nn.Module):
         return constraint1.mean() + constraint2.mean()
 
 # 数据预处理函数
-def prepare_material_data(df):
+def prepare_material_data(df,
+                          scaler: Optional[StandardScaler] = None,
+                          le: Optional[LabelEncoder] = None):
     """准备材料数据"""
     # 编码材料种类
-    le = LabelEncoder()
-    material_ids = le.fit_transform(df['材料种类'])
+    if le is None:
+        le = LabelEncoder()
+        material_ids = le.fit_transform(df['材料种类'])
+    else:                       # 复用已有编码器
+        material_ids = le.transform(df['材料种类'])
     
     # 提取数值特征
     numeric_cols = ['莫氏硬度', '弹性模量', '断裂韧性', '晶粒粒径', '压溃压力', '磨粒速度']
-    numeric_features = df[numeric_cols].values
+    numeric_raw = df[numeric_cols].values.astype(np.float32)
     
     # 目标变量
     target = df['亚表面裂纹深度'].values
     
     # 使用MinMaxScaler避免负值
-    from sklearn.preprocessing import MinMaxScaler
-    scaler = MinMaxScaler(feature_range=(0.1, 1.0))  # 归一化到[0.1, 1.0]避免0值
-    numeric_features = scaler.fit_transform(numeric_features)
+    if scaler is None:
+        scaler = StandardScaler().fit(numeric_raw)
+    numeric_scaled = scaler.transform(numeric_raw)
     
     return {
         'material_ids': material_ids,
-        'numeric_features': numeric_features,
+        'numeric_features': numeric_scaled,   # 喂给网络
+        'numeric_raw':      numeric_raw,      # 喂给 PhysicsLos
         'target': target,
         'label_encoder': le,
         'scaler': scaler,
-        'num_materials': len(le.classes_)
+        'num_materials': len(le.classes_),
+        'scaler': scaler,
+        'label_encoder': le,
     }
 
 # 训练函数
@@ -309,10 +320,12 @@ def train_material_model(model, train_data, val_data, epochs=200, lr=1e-3, devic
     # 准备数据
     train_materials = torch.LongTensor(train_data['material_ids']).to(device)
     train_features = torch.FloatTensor(train_data['numeric_features']).to(device)
+    train_raw      = torch.FloatTensor(train_data['numeric_raw']).to(device)
     train_target = torch.FloatTensor(train_data['target']).unsqueeze(1).to(device)
     
     val_materials = torch.LongTensor(val_data['material_ids']).to(device)
-    val_features = torch.FloatTensor(val_data['numeric_features']).to(device)
+    val_features   = torch.FloatTensor(val_data['numeric_features']).to(device)
+    val_raw        = torch.FloatTensor(val_data['numeric_raw']).to(device)
     val_target = torch.FloatTensor(val_data['target']).unsqueeze(1).to(device)
     
     train_losses = []
@@ -324,7 +337,7 @@ def train_material_model(model, train_data, val_data, epochs=200, lr=1e-3, devic
         optimizer.zero_grad()
         
         pred, uncertainty, symbolic, residual = model(train_materials, train_features)
-        loss, metrics = loss_fn(pred, uncertainty, train_target, model, train_features)
+        loss, metrics = loss_fn(pred, uncertainty, train_target, model, train_raw)  # 使用train_raw
         
         loss.backward()
         optimizer.step()
@@ -335,7 +348,7 @@ def train_material_model(model, train_data, val_data, epochs=200, lr=1e-3, devic
         model.eval()
         with torch.no_grad():
             val_pred, val_uncertainty, _, _ = model(val_materials, val_features)
-            val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_features)
+            val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)  # 使用val_raw
             val_losses.append(val_loss.item())
         
         scheduler.step(val_loss)

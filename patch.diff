@@ -1,0 +1,132 @@
+*** Begin Patch for material_crack_pgnn.py ***
+@@
+-from sklearn.preprocessing import StandardScaler, LabelEncoder, MinMaxScaler
++from sklearn.preprocessing import StandardScaler, LabelEncoder
+
+@@
+-def prepare_material_data(df):
++def prepare_material_data(df,
++                          scaler: Optional[StandardScaler] = None,
++                          le: Optional[LabelEncoder] = None):
+@@
+-    le = LabelEncoder()
+-    material_ids = le.fit_transform(df['材料种类'])
++    if le is None:
++        le = LabelEncoder()
++        material_ids = le.fit_transform(df['材料种类'])
++    else:
++        material_ids = le.transform(df['材料种类'])
+@@
+-    numeric_features = df[numeric_cols].values
+-    scaler = MinMaxScaler(feature_range=(0.1, 1.0))
+-    numeric_features = scaler.fit_transform(numeric_features)
++    numeric_raw = df[numeric_cols].values.astype(np.float32)
++    if scaler is None:
++        scaler = StandardScaler().fit(numeric_raw)
++    numeric_scaled = scaler.transform(numeric_raw)
+@@
+-        'numeric_features': numeric_features,
++        'numeric_features': numeric_scaled,
++        'numeric_raw':      numeric_raw,
+@@
+-        'num_materials': len(le.classes_)
++        'num_materials': len(le.classes_),
++        'scaler': scaler,
++        'label_encoder': le,
+*** End Patch ***
+
+*** Begin Patch for material_crack_pgnn.py (PhysicsInformedFeatureExtractor) ***
+@@ class PhysicsInformedFeatureExtractor(nn.Module):
+-        sqrt_g = torch.sqrt(grain_size)
+-        energy_release_rate = (pressure ** 2) * sqrt_g / elastic_modulus
++        sqrt_g = torch.sqrt(torch.abs(grain_size) + 1e-6)
++        energy_release_rate = (pressure ** 2) * sqrt_g / (elastic_modulus.abs() + 1e-6)
+@@
+-        contact_stress = torch.pow(pressure * elastic_modulus ** 2 / (grain_size ** 2 + 1e-6), 1/3)
++        expr = pressure * elastic_modulus ** 2 / (grain_size ** 2 + 1e-6)
++        contact_stress = torch.sign(expr) * torch.pow(expr.abs() + 1e-6, 1/3)
+@@
+-        hall_petch = 1 / torch.sqrt(grain_size + 1e-6)
++        hall_petch = 1 / torch.sqrt(torch.abs(grain_size) + 1e-6)
+*** End Patch ***
+
+*** Begin Patch for material_crack_pgnn.py (Encoder) ***
+@@ class MaterialCrackPGNN(nn.Module):
+-        self.encoder = nn.Sequential(
+-            nn.Linear(material_embed_dim + len(numeric_cols), 64),
++        self.encoder = nn.Sequential(
++            nn.Linear(material_embed_dim + len(numeric_cols), 128),
+             nn.ReLU(),
+-            nn.BatchNorm1d(64),
+-            nn.Dropout(dropout_rate),
+-            nn.Linear(64, latent_dim),
++            nn.BatchNorm1d(128),
++            nn.Dropout(dropout_rate),
++            nn.Linear(128, 64),
++            nn.ReLU(),
++            nn.BatchNorm1d(64),
++            nn.Linear(64, latent_dim),
+         )
+*** End Patch ***
+
+*** Begin Patch for pgnn_hyperopt.py ***
+@@ def run_hyperopt(...):
+-    train_data = prepare_material_data(train_df)
+-    val_data   = prepare_material_data(val_df)
++    train_data = prepare_material_data(train_df)
++    val_data   = prepare_material_data(
++                    val_df,
++                    scaler=train_data['scaler'],
++                    le=train_data['label_encoder'],
++                )
+
+@@
+-    train_features = torch.FloatTensor(train_data['numeric_features']).to(device)
++    train_features = torch.FloatTensor(train_data['numeric_features']).to(device)
++    train_raw      = torch.FloatTensor(train_data['numeric_raw']).to(device)
+
+@@
+-    val_features   = torch.FloatTensor(val_data['numeric_features']).to(device)
++    val_features   = torch.FloatTensor(val_data['numeric_features']).to(device)
++    val_raw        = torch.FloatTensor(val_data['numeric_raw']).to(device)
+
+@@ for epoch in range(epochs):
+-        pred, uncertainty, _, _ = model(train_materials, train_features)
+-        loss, metrics = loss_fn(pred, uncertainty, train_target, model, train_features)
+-        lambda_phys_eff = lambda_physics * min(1.0, epoch / 100)
+-        loss_fn.lambda_physics = lambda_phys_eff
++        pred, uncertainty, _, _ = model(train_materials, train_features)
++        lambda_phys_eff = lambda_physics * min(1.0, epoch / 100)
++        loss_fn.lambda_physics = lambda_phys_eff
++        loss, metrics = loss_fn(pred, uncertainty, train_target, model, train_raw)
+
+@@ def retrain_with_best_params(...):
+-    train_data = prepare_material_data(train_df)
+-    test_data  = prepare_material_data(test_df)
++    train_data = prepare_material_data(train_df)
++    test_data  = prepare_material_data(
++                    test_df,
++                    scaler=train_data['scaler'],
++                    le=train_data['label_encoder'],
++                )
+
+@@
+-    train_features = torch.FloatTensor(train_data['numeric_features']).to(device)
+-    test_features  = torch.FloatTensor(test_data['numeric_features']).to(device)
++    train_features = torch.FloatTensor(train_data['numeric_features']).to(device)
++    test_features  = torch.FloatTensor(test_data['numeric_features']).to(device)
++    train_raw      = torch.FloatTensor(train_data['numeric_raw']).to(device)
++    test_raw       = torch.FloatTensor(test_data['numeric_raw']).to(device)
+
+@@ for epoch in range(best_params['epochs']):
+-        pred, unc, _, _ = model(train_materials, train_features)
+-        loss, _ = loss_fn(pred, unc, train_target, model, train_features)
++        pred, unc, _, _ = model(train_materials, train_features)
++        lambda_phys_eff = best_params['lambda_physics'] * min(1.0, epoch/100)
++        loss_fn.lambda_physics = lambda_phys_eff
++        loss, _ = loss_fn(pred, unc, train_target, model, train_raw)
+
+@@ def objective(trial):
+-    lr = trial.suggest_float('lr', 1e-5, 1e-2, log=True)
++    lr = trial.suggest_float('lr', 1e-4, 3e-3, log=True)
+*** End Patch ***
