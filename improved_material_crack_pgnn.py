@@ -140,18 +140,23 @@ class ImprovedSymbolicLayer(nn.Module):
             nn.Linear(32, 4),  # 预测4个系数
         )
 
-    def forward(self, z, physics_features):
+    def forward(self, z, physics_features, epoch: int = 0, total_epochs: int = 1):
+        """根据当前训练进度生成符号表达式
+
+        Args:
+            z: 潜在表示
+            physics_features: 物理特征
+            epoch: 当前epoch
+            total_epochs: 总epoch数
         """
-        z: 潜在表示
-        physics_features: 物理特征
-        """
-        batch_size = z.shape[0]
+        # Gumbel-Softmax退火温度
+        tau = max(0.3, 3.0 * (1 - epoch / float(total_epochs)))
 
         # 选择变量
-        var_weights = F.softmax(self.variable_selector(z), dim=-1)
+        var_weights = F.gumbel_softmax(self.variable_selector(z), tau=tau)
 
         # 选择操作符
-        op_weights = F.softmax(self.operator_selector(z), dim=-1)
+        op_weights = F.gumbel_softmax(self.operator_selector(z), tau=tau)
 
         # 预测系数
         coeffs = self.coefficient_net(z)
