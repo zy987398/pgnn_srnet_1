@@ -11,6 +11,7 @@ from sklearn.metrics import r2_score, mean_squared_error
 import warnings
 
 warnings.filterwarnings("ignore")
+torch.backends.cudnn.benchmark = True
 from torch.utils.data import TensorDataset, DataLoader
 
 from improved_material_crack_pgnn import (
@@ -80,6 +81,12 @@ def create_model(trial, num_materials, num_mean, num_std):
         num_mean=num_mean,
         num_std=num_std,
     )
+
+    # Compile the model if supported
+    try:
+        model = torch.compile(model)
+    except Exception:
+        pass
 
     # 动态调整dropout率
     dropout_rate = trial.suggest_float(
@@ -183,6 +190,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
     best_val_r2 = -float("inf")
     patience_counter = 0
     best_model_wts = None
+    scaler = torch.cuda.amp.GradScaler()
 
     for epoch in range(epochs):
         loss_fn.update_epoch(epoch, epochs)
@@ -200,27 +208,29 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
 
             optimizer.zero_grad()
 
-            pred1, unc1, _, _ = model(batch_materials, batch_features)
-            pred2, unc2, _, _ = model(batch_materials, batch_features)
-            if (
-                torch.isnan(pred1).any()
-                or torch.isinf(pred1).any()
-                or torch.isnan(pred2).any()
-                or torch.isinf(pred2).any()
-            ):
-                return -1.0
-            loss1, metrics = loss_fn(pred1, unc1, batch_target, model, batch_raw)
-            loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
-            consistency = F.mse_loss(pred1, pred2)
-            loss = (loss1 + loss2) / 2 + 0.5 * consistency
+            with torch.cuda.amp.autocast():
+                pred1, unc1, _, _ = model(batch_materials, batch_features)
+                pred2, unc2, _, _ = model(batch_materials, batch_features)
+                if (
+                    torch.isnan(pred1).any()
+                    or torch.isinf(pred1).any()
+                    or torch.isnan(pred2).any()
+                    or torch.isinf(pred2).any()
+                ):
+                    return -1.0
+                loss1, metrics = loss_fn(pred1, unc1, batch_target, model, batch_raw)
+                loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
+                consistency = F.mse_loss(pred1, pred2)
+                loss = (loss1 + loss2) / 2 + 0.5 * consistency
 
             if torch.isnan(loss) or torch.isinf(loss):
                 return -1.0
 
-            loss.backward()
-            # 更严格的梯度裁剪
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
             epoch_loss += loss.item() * batch_target.size(0)
@@ -229,12 +239,12 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
 
         # 验证
         model.eval()
-        with torch.no_grad():
+        with torch.no_grad(), torch.cuda.amp.autocast():
             val_pred, val_uncertainty, _, _ = model(val_materials, val_features)
             val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
 
-            val_pred_np = safe_expm1(val_pred.cpu().squeeze().numpy())
-            val_target_np = safe_expm1(val_target.cpu().squeeze().numpy())
+            val_pred_np = safe_expm1(val_pred).cpu().squeeze().numpy()
+            val_target_np = safe_expm1(val_target).cpu().squeeze().numpy()
             if np.any(~np.isfinite(val_pred_np)):
                 val_pred_np = np.nan_to_num(val_pred_np)
             if np.any(~np.isfinite(val_target_np)):
@@ -271,10 +281,10 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
 
         # 再次计算R²
         model.eval()
-        with torch.no_grad():
+        with torch.no_grad(), torch.cuda.amp.autocast():
             val_pred, _, _, _ = model(val_materials, val_features)
-            val_pred_np = safe_expm1(val_pred.cpu().squeeze().numpy())
-            val_target_np = safe_expm1(val_target.cpu().squeeze().numpy())
+            val_pred_np = safe_expm1(val_pred).cpu().squeeze().numpy()
+            val_target_np = safe_expm1(val_target).cpu().squeeze().numpy()
             if np.any(~np.isfinite(val_pred_np)):
                 val_pred_np = np.nan_to_num(val_pred_np)
             if np.any(~np.isfinite(val_target_np)):
@@ -466,6 +476,7 @@ def retrain_with_best_params(
 
         best_r2, patience_ctr = -1e9, 0
         best_wts = None
+        scaler = torch.cuda.amp.GradScaler()
 
         for epoch in range(epochs):
             loss_fn.update_epoch(epoch, epochs)
@@ -481,23 +492,26 @@ def retrain_with_best_params(
 
                 optimizer.zero_grad()
 
-                pred1, unc1, _, _ = model(batch_materials, batch_features)
-                pred2, unc2, _, _ = model(batch_materials, batch_features)
-                if (
-                    torch.isnan(pred1).any()
-                    or torch.isinf(pred1).any()
-                    or torch.isnan(pred2).any()
-                    or torch.isinf(pred2).any()
-                ):
-                    continue
-                loss1, _ = loss_fn(pred1, unc1, batch_target, model, batch_raw)
-                loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
-                consistency = F.mse_loss(pred1, pred2)
-                loss = (loss1 + loss2) / 2 + 0.5 * consistency
+                with torch.cuda.amp.autocast():
+                    pred1, unc1, _, _ = model(batch_materials, batch_features)
+                    pred2, unc2, _, _ = model(batch_materials, batch_features)
+                    if (
+                        torch.isnan(pred1).any()
+                        or torch.isinf(pred1).any()
+                        or torch.isnan(pred2).any()
+                        or torch.isinf(pred2).any()
+                    ):
+                        continue
+                    loss1, _ = loss_fn(pred1, unc1, batch_target, model, batch_raw)
+                    loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
+                    consistency = F.mse_loss(pred1, pred2)
+                    loss = (loss1 + loss2) / 2 + 0.5 * consistency
 
-                loss.backward()
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 scheduler.step()
 
                 epoch_loss += loss.item() * batch_target.size(0)
@@ -505,13 +519,13 @@ def retrain_with_best_params(
             epoch_loss /= len(train_dataset)
 
             model.eval()
-            with torch.no_grad():
+            with torch.no_grad(), torch.cuda.amp.autocast():
                 val_pred, _, _, _ = model(val_materials, val_features)
                 if torch.isnan(val_pred).any() or torch.isinf(val_pred).any():
                     val_r2 = -1.0
                 else:
-                    val_pred_np = safe_expm1(val_pred.cpu().squeeze().numpy())
-                    val_target_np = safe_expm1(val_target.cpu().squeeze().numpy())
+                    val_pred_np = safe_expm1(val_pred).cpu().squeeze().numpy()
+                    val_target_np = safe_expm1(val_target).cpu().squeeze().numpy()
                     if np.any(~np.isfinite(val_pred_np)):
                         val_pred_np = np.nan_to_num(val_pred_np)
                     if np.any(~np.isfinite(val_target_np)):
@@ -563,7 +577,7 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
     test_target = torch.FloatTensor(test_data["target"]).unsqueeze(1).to(device)
 
     # 标准预测
-    with torch.no_grad():
+    with torch.no_grad(), torch.cuda.amp.autocast():
         if is_ensemble:
             preds = []
             uncs = []
@@ -585,8 +599,8 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
             )
 
         # 转换为NumPy
-        test_pred_np = safe_expm1(test_pred.cpu().squeeze().numpy())
-        test_target_np = safe_expm1(test_target.cpu().squeeze().numpy())
+        test_pred_np = safe_expm1(test_pred).cpu().squeeze().numpy()
+        test_target_np = safe_expm1(test_target).cpu().squeeze().numpy()
         if np.any(~np.isfinite(test_pred_np)):
             test_pred_np = np.nan_to_num(test_pred_np)
         if np.any(~np.isfinite(test_target_np)):
@@ -633,7 +647,7 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
         mc_pred, mc_unc, aleatoric_unc, epistemic_unc = model.predict_with_uncertainty(
             test_materials, test_features, n_samples=30
         )
-    mc_pred_np = safe_expm1(mc_pred.cpu().squeeze().numpy())
+    mc_pred_np = safe_expm1(mc_pred).cpu().squeeze().numpy()
     if np.any(~np.isfinite(mc_pred_np)):
         mc_pred_np = np.nan_to_num(mc_pred_np)
     mc_unc_np = mc_unc.cpu().squeeze().numpy()
