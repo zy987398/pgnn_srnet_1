@@ -1,0 +1,91 @@
+### Python ###
+# Byte-compiled / optimized files
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pyi
+
+# Virtual environments
+venv/
+env/
+.venv/
+.venv*/
+.benv/
+pythonenv*/
+
+# Build and distribution
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+sdist/
+var/
+wheels/
+*.whl
+site/
+
+# Testing and coverage
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+htmlcov/
+.pytest_cache/
+test_results/
+
+# Logs and databases
+*.log
+*.log.*
+logs/
+*.sqlite
+*.db
+*.db-shm
+*.db-wal
+
+# Data and models
+*.csv
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.data
+*.feather
+*.parquet
+*.parq
+*.pth
+*.pt
+*.model
+*.onnx
+*.pb
+*.ckpt
+*.bin
+
+### VSCode ###
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+
+# VSCode specific files
+.history/
+*.vsix
+
+### Jupyter Notebook ###
+.ipynb_checkpoints/
+*.ipynb
+
+### OS generated files ###
+.DS_Store
+.DS_Store?
+._*
+.S
