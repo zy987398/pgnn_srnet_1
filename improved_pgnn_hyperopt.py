@@ -70,10 +70,10 @@ def create_model(trial, num_materials, num_mean, num_std):
     # 模型架构超参数
     material_embed_dim = trial.suggest_int(
         "material_embed_dim", 8, 32, step=8
-    )  # 缩小范围
-    latent_dim = trial.suggest_int("latent_dim", 16, 64, step=16)  # 缩小范围
+    )
+    latent_dim = trial.suggest_int("latent_dim", 16, 64, step=16)
 
-    # 创建模型并修改部分架构
+    # 创建模型
     model = MaterialCrackPGNN(
         num_materials=num_materials,
         material_embed_dim=material_embed_dim,
@@ -82,16 +82,10 @@ def create_model(trial, num_materials, num_mean, num_std):
         num_std=num_std,
     )
 
-    # Compile the model if supported
-    try:
-        model = torch.compile(model)
-    except Exception:
-        pass
-
     # 动态调整dropout率
     dropout_rate = trial.suggest_float(
         "dropout_rate", 0.05, 0.2, step=0.05
-    )  # 更窄的范围
+    )
     for module in model.modules():
         if isinstance(module, nn.Dropout):
             module.p = dropout_rate
@@ -102,39 +96,33 @@ def create_model(trial, num_materials, num_mean, num_std):
 def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
     """使用给定的超参数训练模型"""
 
-    # 训练超参数 - 缩小学习率范围
-    lr = trial.suggest_float("lr", 0.0005, 0.003, log=True)  # 更窄的范围
-    epochs = trial.suggest_int("epochs", 200, 500, step=50)  # 减小上限
+    # 训练超参数
+    lr = trial.suggest_float("lr", 0.0005, 0.002, log=True)  # 进一步缩小范围
+    epochs = trial.suggest_int("epochs", 200, 400, step=50)  # 减小上限
     batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
 
-    # 权重衰减 - 新增
+    # 权重衰减
     weight_decay = trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True)
 
     # 损失函数超参数
     lambda_complexity = trial.suggest_float(
         "lambda_complexity", 1e-5, 5e-4, log=True
     )
-    lambda_physics = trial.suggest_float("lambda_physics", 0.05, 0.20, step=0.01)
+    lambda_physics = trial.suggest_float("lambda_physics", 0.01, 0.10, step=0.01)  # 减小范围
 
-    # 早停参数 - 更敏感
+    # 早停参数
     patience = trial.suggest_int("patience", 40, 80, step=5)
 
     # 数据增强
     use_augmentation = trial.suggest_categorical("augmentation", [True, False])
 
-    # 优化器选择
-    optimizer_name = trial.suggest_categorical("optimizer", ["AdamW", "RMSprop"])
-
     # 创建模型
     model = create_model(trial, num_materials, train_data["num_mean"], train_data["num_std"]).to(device)
 
-    # 创建优化器
-    if optimizer_name == "AdamW":
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=lr, weight_decay=weight_decay
-        )
-    else:
-        optimizer = torch.optim.RMSprop(model.parameters(), lr=lr)
+    # 创建优化器 - 只使用AdamW
+    optimizer = torch.optim.AdamW(
+        model.parameters(), lr=lr, weight_decay=weight_decay
+    )
 
     # 损失函数
     loss_fn = PhysicsInformedLoss(
@@ -167,12 +155,12 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
         train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        drop_last=False,  # 改为False以使用所有数据
-        pin_memory=True,  # 加速数据传输
-        num_workers=0,  # 单进程加载避免额外开销
+        drop_last=False,
+        pin_memory=True,
+        num_workers=0,
     )
 
-    # 学习率预热与调度 (在DataLoader创建后确定steps_per_epoch)
+    # 学习率调度
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=lr,
@@ -208,27 +196,28 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
 
             optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast():
+            with torch.autocast(device_type='cuda' if device == 'cuda' else 'cpu'):
                 pred1, unc1, _, _ = model(batch_materials, batch_features)
                 pred2, unc2, _, _ = model(batch_materials, batch_features)
-                if (
-                    torch.isnan(pred1).any()
-                    or torch.isinf(pred1).any()
-                    or torch.isnan(pred2).any()
-                    or torch.isinf(pred2).any()
-                ):
+                
+                # 检查NaN/Inf
+                if (torch.isnan(pred1).any() or torch.isinf(pred1).any() or
+                    torch.isnan(pred2).any() or torch.isinf(pred2).any()):
+                    print(f"Trial {trial.number}: NaN/Inf detected in predictions")
                     return -1.0
+                    
                 loss1, metrics = loss_fn(pred1, unc1, batch_target, model, batch_raw)
                 loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
                 consistency = F.mse_loss(pred1, pred2)
                 loss = (loss1 + loss2) / 2 + 0.5 * consistency
 
-            if torch.isnan(loss) or torch.isinf(loss):
+            if torch.isnan(loss) or torch.isinf(loss) or loss.item() > 1000:
+                print(f"Trial {trial.number}: 异常损失值 {loss.item()}")
                 return -1.0
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -239,12 +228,13 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
 
         # 验证
         model.eval()
-        with torch.no_grad(), torch.cuda.amp.autocast():
+        with torch.no_grad(), torch.autocast(device_type='cuda' if device == 'cuda' else 'cpu'):
             val_pred, val_uncertainty, _, _ = model(val_materials, val_features)
             val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
 
             val_pred_np = safe_expm1(val_pred).cpu().squeeze().numpy()
             val_target_np = safe_expm1(val_target).cpu().squeeze().numpy()
+            
             if np.any(~np.isfinite(val_pred_np)):
                 val_pred_np = np.nan_to_num(val_pred_np)
             if np.any(~np.isfinite(val_target_np)):
@@ -256,12 +246,10 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
                 val_r2 = -1.0
             val_rmse = np.sqrt(mean_squared_error(val_target_np, val_pred_np))
 
-
         # 早停检查
         if val_r2 > best_val_r2:
             best_val_r2 = val_r2
             patience_counter = 0
-            # 保存最佳模型状态
             best_model_wts = copy.deepcopy(model.state_dict())
         else:
             patience_counter += 1
@@ -269,26 +257,29 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
         if patience_counter >= patience:
             break
 
+        # 中间报告
         if epoch >= 50 and epoch % 10 == 0:
             trial.report(val_r2, epoch)
             if trial.should_prune():
                 break
 
-    # 恢复最佳模型状态进行最终评估
+    # 恢复最佳模型状态
     if best_model_wts is not None:
         model.load_state_dict(best_model_wts)
         model = model.to(device)
 
-        # 再次计算R²
+        # 最终评估
         model.eval()
-        with torch.no_grad(), torch.cuda.amp.autocast():
+        with torch.no_grad(), torch.autocast(device_type='cuda' if device == 'cuda' else 'cpu'):
             val_pred, _, _, _ = model(val_materials, val_features)
             val_pred_np = safe_expm1(val_pred).cpu().squeeze().numpy()
             val_target_np = safe_expm1(val_target).cpu().squeeze().numpy()
+            
             if np.any(~np.isfinite(val_pred_np)):
                 val_pred_np = np.nan_to_num(val_pred_np)
             if np.any(~np.isfinite(val_target_np)):
                 val_target_np = np.nan_to_num(val_target_np)
+                
             try:
                 final_r2 = r2_score(val_target_np, val_pred_np)
             except ValueError:
@@ -303,7 +294,8 @@ def objective(trial, df, device, seed):
     """Optuna目标函数，5折交叉验证"""
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
     fold_scores = []
-    for train_idx, val_idx in skf.split(df, df["材料种类"]):
+    
+    for fold_idx, (train_idx, val_idx) in enumerate(skf.split(df, df["材料种类"])):
         train_df = df.iloc[train_idx]
         val_df = df.iloc[val_idx]
 
@@ -317,6 +309,10 @@ def objective(trial, df, device, seed):
 
         r2 = train_with_trial(trial, train_data, val_data, num_materials, device)
         fold_scores.append(r2)
+        
+        # 如果有fold失败，提前结束
+        if r2 < -0.9:
+            return -1.0
 
     return float(np.mean(fold_scores))
 
@@ -331,19 +327,17 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials=10
     # 读取数据
     df = pd.read_csv(data_path)
 
-    num_materials = df["材料种类"].nunique()
-
     # 设备
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # 创建study - 使用更好的搜索策略
+    # 创建study
     study = optuna.create_study(
         direction="maximize",
         pruner=optuna.pruners.MedianPruner(
-            n_startup_trials=10, n_warmup_steps=100, interval_steps=20
+            n_startup_trials=10, n_warmup_steps=50, interval_steps=10
         ),
-        sampler=optuna.samplers.TPESampler(seed=seed, n_startup_trials=5),
+        sampler=optuna.samplers.TPESampler(seed=seed, n_startup_trials=10),
     )
 
     # 优化
@@ -398,8 +392,11 @@ def retrain_with_best_params(
 
     ensemble_models = []
     fold = 0
+    
     for train_idx, val_idx in kf.split(df):
         fold += 1
+        print(f"\n训练第 {fold}/5 折...")
+        
         train_df = df.iloc[train_idx]
         val_df = df.iloc[val_idx]
 
@@ -414,6 +411,7 @@ def retrain_with_best_params(
         train_df_aug = train_df.copy()
         if use_augmentation:
             train_df_aug = augment_dataset(train_df_aug)
+            
         augmented_train_data = prepare_material_data(
             train_df_aug,
             scaler=train_data["scaler"],
@@ -451,12 +449,9 @@ def retrain_with_best_params(
         ).to(device)
 
         lr = best_params["lr"]
-        if best_params.get("optimizer", "AdamW") == "AdamW":
-            optimizer = torch.optim.AdamW(
-                model.parameters(), lr=lr, weight_decay=best_params.get("weight_decay", 0)
-            )
-        else:
-            optimizer = torch.optim.RMSprop(model.parameters(), lr=lr)
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=lr, weight_decay=best_params.get("weight_decay", 0)
+        )
 
         epochs = best_params["epochs"]
         scheduler = torch.optim.lr_scheduler.OneCycleLR(
@@ -492,16 +487,14 @@ def retrain_with_best_params(
 
                 optimizer.zero_grad()
 
-                with torch.cuda.amp.autocast():
+                with torch.autocast(device_type='cuda' if device == 'cuda' else 'cpu'):
                     pred1, unc1, _, _ = model(batch_materials, batch_features)
                     pred2, unc2, _, _ = model(batch_materials, batch_features)
-                    if (
-                        torch.isnan(pred1).any()
-                        or torch.isinf(pred1).any()
-                        or torch.isnan(pred2).any()
-                        or torch.isinf(pred2).any()
-                    ):
+                    
+                    if (torch.isnan(pred1).any() or torch.isinf(pred1).any() or
+                        torch.isnan(pred2).any() or torch.isinf(pred2).any()):
                         continue
+                        
                     loss1, _ = loss_fn(pred1, unc1, batch_target, model, batch_raw)
                     loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
                     consistency = F.mse_loss(pred1, pred2)
@@ -509,7 +502,7 @@ def retrain_with_best_params(
 
                 scaler.scale(loss).backward()
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
                 scaler.step(optimizer)
                 scaler.update()
                 scheduler.step()
@@ -519,17 +512,19 @@ def retrain_with_best_params(
             epoch_loss /= len(train_dataset)
 
             model.eval()
-            with torch.no_grad(), torch.cuda.amp.autocast():
+            with torch.no_grad(), torch.autocast(device_type='cuda' if device == 'cuda' else 'cpu'):
                 val_pred, _, _, _ = model(val_materials, val_features)
                 if torch.isnan(val_pred).any() or torch.isinf(val_pred).any():
                     val_r2 = -1.0
                 else:
                     val_pred_np = safe_expm1(val_pred).cpu().squeeze().numpy()
                     val_target_np = safe_expm1(val_target).cpu().squeeze().numpy()
+                    
                     if np.any(~np.isfinite(val_pred_np)):
                         val_pred_np = np.nan_to_num(val_pred_np)
                     if np.any(~np.isfinite(val_target_np)):
                         val_target_np = np.nan_to_num(val_target_np)
+                        
                     try:
                         val_r2 = r2_score(val_target_np, val_pred_np)
                     except ValueError:
@@ -542,24 +537,20 @@ def retrain_with_best_params(
             else:
                 patience_ctr += 1
 
-            if patience_ctr >= 25:
+            if patience_ctr >= best_params.get("patience", 50):
                 break
 
         if best_wts is not None:
             model.load_state_dict(best_wts)
 
         ensemble_models.append(copy.deepcopy(model))
+        print(f"第 {fold} 折最佳验证R²: {best_r2:.4f}")
 
     return ensemble_models, None, None
 
 
 def evaluate_model_detailed(model, test_data, device="cuda"):
-    """详细评估模型性能，包括不确定性分析
-
-    Args:
-        model: 单个模型或模型列表(用于集成)
-        test_data: 预处理后的测试数据
-    """
+    """详细评估模型性能，包括不确定性分析"""
 
     is_ensemble = isinstance(model, list)
     if is_ensemble:
@@ -577,7 +568,7 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
     test_target = torch.FloatTensor(test_data["target"]).unsqueeze(1).to(device)
 
     # 标准预测
-    with torch.no_grad(), torch.cuda.amp.autocast():
+    with torch.no_grad(), torch.autocast(device_type='cuda' if device == 'cuda' else 'cpu'):
         if is_ensemble:
             preds = []
             uncs = []
@@ -601,10 +592,12 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
         # 转换为NumPy
         test_pred_np = safe_expm1(test_pred).cpu().squeeze().numpy()
         test_target_np = safe_expm1(test_target).cpu().squeeze().numpy()
+        
         if np.any(~np.isfinite(test_pred_np)):
             test_pred_np = np.nan_to_num(test_pred_np)
         if np.any(~np.isfinite(test_target_np)):
             test_target_np = np.nan_to_num(test_target_np)
+            
         test_uncertainty_np = test_uncertainty.cpu().squeeze().numpy()
         symbolic_np = symbolic_out.cpu().squeeze().numpy()
         residual_np = residual_out.cpu().squeeze().numpy()
@@ -647,9 +640,11 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
         mc_pred, mc_unc, aleatoric_unc, epistemic_unc = model.predict_with_uncertainty(
             test_materials, test_features, n_samples=30
         )
+        
     mc_pred_np = safe_expm1(mc_pred).cpu().squeeze().numpy()
     if np.any(~np.isfinite(mc_pred_np)):
         mc_pred_np = np.nan_to_num(mc_pred_np)
+        
     mc_unc_np = mc_unc.cpu().squeeze().numpy()
     aleatoric_np = aleatoric_unc.cpu().squeeze().numpy()
     epistemic_np = epistemic_unc.cpu().squeeze().numpy()
@@ -678,7 +673,7 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
     print(f"  随机不确定性 (Aleatoric): {mean_aleatoric:.4f}")
     print(f"  不确定性比例 (Epistemic/Aleatoric): {ratio:.4f}")
 
-    # 计算每个样本的可靠度 (不确定性校准)
+    # 计算每个样本的可靠度
     errors = np.abs(mc_pred_np - test_target_np)
     calibration_scores = errors / (np.sqrt(mc_unc_np) + 1e-6)
     well_calibrated = np.mean((calibration_scores <= 2.0))
@@ -711,9 +706,13 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
 
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
+    import os
+    
+    # 创建结果目录
+    os.makedirs("results", exist_ok=True)
 
     # 运行超参数优化
-    study = run_hyperopt(n_trials=50)  # 可以增加trials获得更好结果
+    study = run_hyperopt(n_trials=50)
 
     # 使用最佳参数重新训练
     ensemble_models, train_losses, test_r2_history = retrain_with_best_params(study)
@@ -735,19 +734,26 @@ if __name__ == "__main__":
     fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
     # 优化历史
-    ax1.plot([t.value for t in study.trials if t.value is not None])
-    ax1.set_xlabel("Trial")
-    ax1.set_ylabel("Validation R²")
-    ax1.set_title("Hyperparameter Optimization History")
-    ax1.grid(True, alpha=0.3)
+    trial_values = [t.value for t in study.trials if t.value is not None and t.value > -0.9]
+    if trial_values:
+        ax1.plot(trial_values)
+        ax1.set_xlabel("Trial")
+        ax1.set_ylabel("Validation R²")
+        ax1.set_title("Hyperparameter Optimization History")
+        ax1.grid(True, alpha=0.3)
+    else:
+        ax1.text(0.5, 0.5, "No valid trials", ha='center', va='center')
 
     # 训练损失
-    ax2.plot(train_losses)
-    ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Loss")
-    ax2.set_title("Training Loss with Best Hyperparameters")
-    ax2.set_yscale("log")
-    ax2.grid(True, alpha=0.3)
+    if train_losses:
+        ax2.plot(train_losses)
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("Loss")
+        ax2.set_title("Training Loss with Best Hyperparameters")
+        ax2.set_yscale("log")
+        ax2.grid(True, alpha=0.3)
+    else:
+        ax2.text(0.5, 0.5, "No training data", ha='center', va='center')
 
     plt.tight_layout()
     plt.savefig("results/improved_hyperopt_results.png", dpi=300)
@@ -759,7 +765,7 @@ if __name__ == "__main__":
     ax1.scatter(
         results["predictions"]["y_true"], results["predictions"]["y_pred"], alpha=0.6
     )
-    ax1.plot([0, 10], [0, 10], "r--")  # 理想线
+    ax1.plot([0, 10], [0, 10], "r--")
     ax1.set_xlabel("True Crack Depth")
     ax1.set_ylabel("Predicted Crack Depth")
     ax1.set_title(f'Standard Prediction (R² = {results["standard"]["r2"]:.4f})')
@@ -773,7 +779,7 @@ if __name__ == "__main__":
         cmap="viridis",
         alpha=0.6,
     )
-    ax2.plot([0, 10], [0, 10], "r--")  # 理想线
+    ax2.plot([0, 10], [0, 10], "r--")
     ax2.set_xlabel("True Crack Depth")
     ax2.set_ylabel("MC Prediction")
     ax2.set_title(f'MC Dropout Prediction (R² = {results["mc_dropout"]["r2"]:.4f})')

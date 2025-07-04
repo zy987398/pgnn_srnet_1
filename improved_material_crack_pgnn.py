@@ -13,7 +13,9 @@ from torch.utils.data import TensorDataset, DataLoader
 
 def safe_expm1(x: torch.Tensor) -> torch.Tensor:
     """GPU-safe expm1 with clipping."""
-    return torch.clamp(x, -10, 10).expm1()
+    x = torch.clamp(x, -10, 10)
+    result = x.expm1()
+    return torch.clamp(result, -1e6, 1e6)  # 添加输出限制
 
 
 class MaterialEmbedding(nn.Module):
@@ -28,7 +30,7 @@ class MaterialEmbedding(nn.Module):
 
 
 class PhysicsInformedFeatureExtractor(nn.Module):
-    """物理信息特征提取器"""
+    """物理信息特征提取器 - 改进版"""
 
     def __init__(self, input_dim=6):
         super().__init__()
@@ -39,6 +41,9 @@ class PhysicsInformedFeatureExtractor(nn.Module):
         x: [batch_size, 6] - [硬度, 弹性模量, 断裂韧性, 晶粒粒径, 压溃压力, 磨粒速度]
         """
         features = [x]
+        
+        # 改进：对输入进行裁剪，防止极端值
+        x = torch.clamp(x, -10, 10)
 
         # 基于断裂力学的特征工程
         hardness = x[:, 0:1]
@@ -47,29 +52,40 @@ class PhysicsInformedFeatureExtractor(nn.Module):
         grain_size = x[:, 3:4]
         pressure = x[:, 4:5]
         velocity = x[:, 5:6]
+        
+        # 改进：使用更大的epsilon值防止除零
+        eps = 0.1  # 从1e-6改为0.1
+        
+        # 确保所有物理量为正
+        elastic_modulus_safe = elastic_modulus.abs() + eps
+        fracture_toughness_safe = fracture_toughness.abs() + eps
+        grain_size_safe = grain_size.abs() + eps
 
         # 1. Griffith能量释放率相关特征
-        # Griffith G = (P² √a)/E
-        sqrt_g = torch.sqrt(torch.abs(grain_size) + 1e-6)
-        energy_release_rate = (pressure**2) * sqrt_g / (elastic_modulus.abs() + 1e-6)
+        sqrt_g = torch.sqrt(grain_size_safe)
+        energy_release_rate = (pressure**2) * sqrt_g / elastic_modulus_safe
+        # 改进：限制输出范围
+        energy_release_rate = torch.clamp(energy_release_rate, -100, 100)
         features.append(energy_release_rate)
 
         # K_ratio = P √a / K_IC
-        k_ratio = pressure * sqrt_g / (fracture_toughness.abs() + 1e-6)
+        k_ratio = pressure * sqrt_g / fracture_toughness_safe
+        k_ratio = torch.clamp(k_ratio, -100, 100)
         features.append(k_ratio)
 
         # Hertz contact stress ∝ (P·E²/a²)^{1/3}
-        expr = pressure * elastic_modulus**2 / (grain_size**2 + 1e-6)
-        contact_stress = torch.sign(expr) * torch.pow(expr.abs() + 1e-6, 1 / 3)
+        expr = pressure * elastic_modulus_safe**2 / (grain_size_safe**2)
+        contact_stress = torch.sign(expr) * torch.pow(expr.abs() + eps, 1 / 3)
+        contact_stress = torch.clamp(contact_stress, -100, 100)
         features.append(contact_stress)
 
         # Hall-Petch
-        hall_petch = 1 / torch.sqrt(torch.abs(grain_size) + 1e-6)
+        hall_petch = 1 / torch.sqrt(grain_size_safe)
         features.append(hall_petch)
 
         # 3. 材料脆性指数
-        # B = H/K_IC (Lawn's brittleness index)
-        brittleness = hardness / (fracture_toughness + 1e-6)
+        brittleness = hardness / fracture_toughness_safe
+        brittleness = torch.clamp(brittleness, -100, 100)
         features.append(brittleness)
 
         # 5. 能量输入
@@ -77,16 +93,17 @@ class PhysicsInformedFeatureExtractor(nn.Module):
         features.append(energy_input)
 
         # 6. 韧性模量比
-        toughness_modulus_ratio = fracture_toughness / (elastic_modulus + 1e-6)
+        toughness_modulus_ratio = fracture_toughness / elastic_modulus_safe
+        toughness_modulus_ratio = torch.clamp(toughness_modulus_ratio, -10, 10)
         features.append(toughness_modulus_ratio)
 
         # 改进：添加更多交互特征
-        # 硬度与弹性模量的比值 (H/E) - 与塑性变形相关
-        he_ratio = hardness / (elastic_modulus + 1e-6)
+        he_ratio = hardness / elastic_modulus_safe
+        he_ratio = torch.clamp(he_ratio, -10, 10)
         features.append(he_ratio)
 
-        # 能量释放率与断裂韧性比值 - 裂纹扩展趋势
-        fracture_tendency = energy_release_rate / (fracture_toughness + 1e-6)
+        fracture_tendency = energy_release_rate / fracture_toughness_safe
+        fracture_tendency = torch.clamp(fracture_tendency, -100, 100)
         features.append(fracture_tendency)
 
         return torch.cat(features, dim=1)
@@ -116,7 +133,7 @@ class ResidualBlock(nn.Module):
 
 
 class ImprovedSymbolicLayer(nn.Module):
-    """改进的符号表达式层，专门针对裂纹深度预测"""
+    """改进的符号表达式层 - 数值稳定版"""
 
     def __init__(self, latent_dim=32):
         super().__init__()
@@ -128,9 +145,9 @@ class ImprovedSymbolicLayer(nn.Module):
         # 物理变量选择网络
         self.variable_selector = nn.Sequential(
             nn.Linear(latent_dim, 64),
-            nn.GELU(),  # 改进：使用GELU激活函数
-            nn.LayerNorm(64),  # 改进：LayerNorm替换BatchNorm
-            nn.Linear(64, 15),  # 原始+衍生特征 (增加了2个交互特征)
+            nn.GELU(),
+            nn.LayerNorm(64),
+            nn.Linear(64, 15),  # 原始+衍生特征
         )
 
         # 操作符选择网络
@@ -146,18 +163,11 @@ class ImprovedSymbolicLayer(nn.Module):
             nn.Linear(latent_dim, 32),
             nn.GELU(),
             nn.LayerNorm(32),
-            nn.Linear(32, self.num_operators),  # 与操作符数量一致
+            nn.Linear(32, self.num_operators),
         )
 
     def forward(self, z, physics_features, epoch: int = 0, total_epochs: int = 1):
-        """根据当前训练进度生成符号表达式
-
-        Args:
-            z: 潜在表示
-            physics_features: 物理特征
-            epoch: 当前epoch
-            total_epochs: 总epoch数
-        """
+        """根据当前训练进度生成符号表达式"""
         # Gumbel-Softmax退火温度
         tau = max(0.3, 3.0 * (1 - epoch / float(total_epochs)))
 
@@ -167,14 +177,17 @@ class ImprovedSymbolicLayer(nn.Module):
         # 选择操作符
         op_weights = F.gumbel_softmax(self.operator_selector(z), tau=tau)
 
-        # 预测系数
+        # 预测系数 - 改进：限制系数范围
         coeffs = self.coefficient_net(z)
+        coeffs = torch.tanh(coeffs) * 5  # 限制在[-5, 5]范围
 
         # 构建符号表达式（加权组合）
-        # 使用软选择机制
         selected_features = torch.matmul(
             var_weights.unsqueeze(1), physics_features.unsqueeze(2)
         ).squeeze(-1)
+        
+        # 改进：对选择的特征进行裁剪
+        selected_features = torch.clamp(selected_features, -10, 10)
 
         # 应用不同的操作符（软操作）
         expressions = []
@@ -189,22 +202,28 @@ class ImprovedSymbolicLayer(nn.Module):
 
         # 乘法或平方 (*)
         square = coeffs[:, 2:3] * (selected_features ** 2)
+        square = torch.clamp(square, -100, 100)  # 改进：限制平方项
         expressions.append(square * op_weights[:, 2:3])
 
         # 平方根项 (sqrt)
-        sqrt_term = coeffs[:, 3:4] * torch.sqrt(torch.abs(selected_features) + 1e-6)
+        sqrt_term = coeffs[:, 3:4] * torch.sqrt(selected_features.abs() + 0.1)
         expressions.append(sqrt_term * op_weights[:, 3:4])
 
-        # 倒数项 (1/x)
-        inv_term = coeffs[:, 4:5] * (1.0 / (selected_features + 1e-3))
+        # 倒数项 (1/x) - 改进：使用更大的epsilon和clamp
+        inv_term = coeffs[:, 4:5] / (selected_features.abs() + 0.5)
+        inv_term = torch.clamp(inv_term, -10, 10)
         expressions.append(inv_term * op_weights[:, 4:5])
 
         # 1.5次方项 (^1.5)
-        power_term = coeffs[:, 5:6] * torch.sign(selected_features) * torch.pow(torch.abs(selected_features) + 1e-6, 1.5)
+        power_term = coeffs[:, 5:6] * torch.sign(selected_features) * \
+                     torch.pow(selected_features.abs() + 0.1, 1.5)
+        power_term = torch.clamp(power_term, -50, 50)  # 改进：限制幂次项
         expressions.append(power_term * op_weights[:, 5:6])
 
         # 组合所有项
         symbolic_output = sum(expressions)
+        # 改进：限制最终输出
+        symbolic_output = torch.clamp(symbolic_output, -20, 20)
 
         # 计算复杂度（用于正则化）
         self.complexity = -torch.sum(
@@ -257,10 +276,10 @@ class MaterialCrackPGNN(nn.Module):
         # 符号表达式层
         self.symbolic_layer = ImprovedSymbolicLayer(latent_dim)
         # Compile symbolic layer for fusion and speed
-        try:
-            self.symbolic_layer = torch.jit.script(self.symbolic_layer)
-        except Exception:
-            pass
+        # try:
+        #     self.symbolic_layer = torch.jit.script(self.symbolic_layer)
+        # except Exception:
+        #     pass
 
         # FiLM 条件化层
         self.film = nn.Linear(material_embed_dim, latent_dim * 2)
@@ -392,14 +411,14 @@ class MaterialCrackPGNN(nn.Module):
 
 
 class PhysicsInformedLoss(nn.Module):
-    """改进的物理信息损失函数"""
+    """改进的物理信息损失函数 - 数值稳定版"""
 
     def __init__(self, lambda_complexity=1e-3, lambda_physics=1e-2, weight_decay=0.0):
         super().__init__()
         self.lambda_complexity = lambda_complexity
         self.lambda_physics = lambda_physics
         self.current_epoch = 0
-        self.total_epochs = 1  # 会在训练中更新
+        self.total_epochs = 1
 
     def update_epoch(self, current, total):
         """更新当前epoch和总epoch数"""
@@ -408,21 +427,28 @@ class PhysicsInformedLoss(nn.Module):
 
     def get_physics_weight(self):
         """使用余弦退火计算物理约束权重"""
-        if self.current_epoch < 10:  # 前10个epoch权重为0，让模型先学习数据
+        if self.current_epoch < 10:
             return 0.0
 
-        # 余弦退火，逐渐增加到最大值，然后保持
         progress = min(1.0, (self.current_epoch - 10) / (self.total_epochs * 0.3))
         weight = self.lambda_physics * (1 - np.cos(progress * np.pi)) / 2
         return weight
 
     def forward(self, pred, uncertainty, target, model, numeric_features):
         batch_size = pred.shape[0]
+        
+        # 改进：确保uncertainty有下界和上界
+        uncertainty = uncertainty.clamp(min=0.01, max=10.0)
+        
+        # 改进：限制预测值范围
+        pred = torch.clamp(pred, -10, 10)
 
-        # 1. NLL损失（异方差高斯）
+        # 1. NLL损失（异方差高斯） - 改进版
         nll_loss = 0.5 * (
-            torch.log(2 * np.pi * uncertainty) + (target - pred) ** 2 / uncertainty
+            torch.log(uncertainty) + (target - pred) ** 2 / uncertainty
         )
+        # 改进：限制单个样本的损失值
+        nll_loss = nll_loss.clamp(max=50.0)
         nll_loss = nll_loss.mean()
 
         # 2. 复杂度正则化
@@ -432,16 +458,26 @@ class PhysicsInformedLoss(nn.Module):
             else 0
         )
 
-        # 3. 物理约束损失 - 使用余弦退火的权重
+        # 3. 物理约束损失
         physics_loss = self.compute_physics_constraints(pred, numeric_features)
+        # 改进：限制物理损失的最大值
+        physics_loss = physics_loss.clamp(max=10.0)
         physics_weight = self.get_physics_weight()
+        
+        # 改进：添加预测值的L2正则化，防止预测值过大
+        pred_reg = 0.001 * pred.pow(2).mean()
 
         # 总损失
         total_loss = (
             nll_loss
+            + pred_reg
             + self.lambda_complexity * complexity_loss
             + physics_weight * physics_loss
         )
+        
+        # 改进：最终损失值检查
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            total_loss = torch.tensor(100.0, device=total_loss.device)
 
         return total_loss, {
             "nll": nll_loss.item(),
@@ -456,21 +492,32 @@ class PhysicsInformedLoss(nn.Module):
         }
 
     def compute_physics_constraints(self, pred, features):
-        """向量化的物理约束计算"""
+        """向量化的物理约束计算 - 改进版"""
+        # 改进：对预测值进行裁剪
+        pred = torch.clamp(pred, -10, 10)
         pred_real = safe_expm1(pred.squeeze())
+        pred_real = torch.clamp(pred_real, 0, 100)  # 裂纹深度应为正值且有上限
 
-        grain_size = features[:, 3]
+        grain_size = features[:, 3].abs() + 0.1
         pressure = features[:, 4]
-        hardness = features[:, 0]
-        fracture_toughness = features[:, 2]
+        hardness = features[:, 0].abs() + 0.1
+        fracture_toughness = features[:, 2].abs() + 0.1
 
+        # 改进：使用更稳定的约束计算
         constraint1 = torch.relu(pred_real - 2.5 * grain_size)
-        pressure_factor = torch.sigmoid(-(pressure - 0.2) * 10)
+        constraint1 = torch.clamp(constraint1, 0, 10)
+        
+        pressure_factor = torch.sigmoid(-(pressure - 0.2) * 5)  # 减小系数
         constraint2 = pressure_factor * pred_real
-        brittleness = hardness / (fracture_toughness + 1e-6)
-        high_brittleness = torch.sigmoid((brittleness - brittleness.mean()) * 5)
+        constraint2 = torch.clamp(constraint2, 0, 10)
+        
+        brittleness = hardness / fracture_toughness
+        brittleness = torch.clamp(brittleness, 0, 10)
+        high_brittleness = torch.sigmoid((brittleness - brittleness.mean()) * 2)
         baseline = safe_expm1(pred.mean().detach()) * 0.5
+        baseline = torch.clamp(baseline, 0, 10)
         constraint3 = high_brittleness * torch.relu(pred_real - baseline)
+        constraint3 = torch.clamp(constraint3, 0, 10)
 
         constraints = torch.stack([constraint1, constraint2, 0.5 * constraint3])
         return constraints.mean()
@@ -621,7 +668,7 @@ def train_material_model(
 
             optimizer.zero_grad()
 
-            with torch.cuda.amp.autocast():
+            with torch.autocast(device_type=device):
                 pred1, unc1, _, _ = model(batch_mats, batch_feats)
                 pred2, unc2, _, _ = model(batch_mats, batch_feats)
                 loss1, metrics = loss_fn(pred1, unc1, batch_tgt, model, batch_raw)
@@ -631,7 +678,7 @@ def train_material_model(
 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
@@ -643,7 +690,7 @@ def train_material_model(
 
         # 验证
         model.eval()
-        with torch.no_grad(), torch.cuda.amp.autocast():
+        with torch.no_grad(), torch.autocast(device_type=device):
             val_pred, val_uncertainty, _, _ = model(val_materials, val_features)
             val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
             val_losses.append(val_loss.item())
