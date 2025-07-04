@@ -6,6 +6,7 @@ import torch.nn.functional as F
 import numpy as np
 import pandas as pd
 import copy
+import contextlib
 from sklearn.model_selection import train_test_split, StratifiedKFold, KFold
 from sklearn.metrics import r2_score, mean_squared_error
 import warnings
@@ -178,7 +179,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
     best_val_r2 = -float("inf")
     patience_counter = 0
     best_model_wts = None
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.cuda.amp.GradScaler() if device == 'cuda' else None
 
     for epoch in range(epochs):
         loss_fn.update_epoch(epoch, epochs)
@@ -187,6 +188,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
         # 训练
         model.train()
         epoch_loss = 0
+        invalid_found = False
 
         for batch_materials, batch_features, batch_raw, batch_target in train_loader:
             batch_materials = batch_materials.to(device, non_blocking=True)
@@ -196,55 +198,77 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
 
             optimizer.zero_grad()
 
-            with torch.autocast(device_type='cuda' if device == 'cuda' else 'cpu'):
+            with (
+                torch.autocast(device_type='cuda') if device == 'cuda' else contextlib.nullcontext()
+            ):
                 pred1, unc1, _, _ = model(batch_materials, batch_features)
                 pred2, unc2, _, _ = model(batch_materials, batch_features)
-                
-                # 检查NaN/Inf
-                if (torch.isnan(pred1).any() or torch.isinf(pred1).any() or
-                    torch.isnan(pred2).any() or torch.isinf(pred2).any()):
-                    print(f"Trial {trial.number}: NaN/Inf detected in predictions")
-                    return -1.0
-                    
+
+                invalid = (
+                    torch.isnan(pred1).any()
+                    or torch.isinf(pred1).any()
+                    or torch.isnan(pred2).any()
+                    or torch.isinf(pred2).any()
+                )
+                if invalid:
+                    warnings.warn(f"Trial {trial.number}: NaN/Inf detected, skipping batch")
+                    optimizer.zero_grad()
+                    invalid_found = True
+                    continue
+
                 loss1, metrics = loss_fn(pred1, unc1, batch_target, model, batch_raw)
                 loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
                 consistency = F.mse_loss(pred1, pred2)
                 loss = (loss1 + loss2) / 2 + 0.5 * consistency
 
             if torch.isnan(loss) or torch.isinf(loss) or loss.item() > 1000:
-                print(f"Trial {trial.number}: 异常损失值 {loss.item()}")
-                return -1.0
+                warnings.warn(f"Trial {trial.number}: abnormal loss {loss.item()}")
+                optimizer.zero_grad()
+                invalid_found = True
+                continue
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
-            scaler.step(optimizer)
-            scaler.update()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+                optimizer.step()
             scheduler.step()
 
             epoch_loss += loss.item() * batch_target.size(0)
 
         epoch_loss /= len(train_dataset)
+        if invalid_found:
+            trial.report(float('nan'), epoch)
+            raise optuna.TrialPruned()
 
         # 验证
         model.eval()
-        with torch.no_grad(), torch.autocast(device_type='cuda' if device == 'cuda' else 'cpu'):
+        with torch.no_grad(), (
+            torch.autocast(device_type='cuda') if device == 'cuda' else contextlib.nullcontext()
+        ):
             val_pred, val_uncertainty, _, _ = model(val_materials, val_features)
             val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
 
+            val_pred_log = val_pred.cpu().squeeze().numpy()
+            val_target_log = val_target.cpu().squeeze().numpy()
+            if np.var(val_target_log) < 1e-6:
+                val_r2 = 0.0
+            else:
+                val_r2 = r2_score(val_target_log, val_pred_log)
+
             val_pred_np = safe_expm1(val_pred).cpu().squeeze().numpy()
             val_target_np = safe_expm1(val_target).cpu().squeeze().numpy()
-            
             if np.any(~np.isfinite(val_pred_np)):
                 val_pred_np = np.nan_to_num(val_pred_np)
             if np.any(~np.isfinite(val_target_np)):
                 val_target_np = np.nan_to_num(val_target_np)
-
-            try:
-                val_r2 = r2_score(val_target_np, val_pred_np)
-            except ValueError:
-                val_r2 = -1.0
             val_rmse = np.sqrt(mean_squared_error(val_target_np, val_pred_np))
+            trial.set_user_attr("rmse", float(val_rmse))
 
         # 早停检查
         if val_r2 > best_val_r2:
@@ -270,20 +294,25 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
 
         # 最终评估
         model.eval()
-        with torch.no_grad(), torch.autocast(device_type='cuda' if device == 'cuda' else 'cpu'):
+        with torch.no_grad(), (
+            torch.autocast(device_type='cuda') if device == 'cuda' else contextlib.nullcontext()
+        ):
             val_pred, _, _, _ = model(val_materials, val_features)
-            val_pred_np = safe_expm1(val_pred).cpu().squeeze().numpy()
-            val_target_np = safe_expm1(val_target).cpu().squeeze().numpy()
-            
-            if np.any(~np.isfinite(val_pred_np)):
-                val_pred_np = np.nan_to_num(val_pred_np)
-            if np.any(~np.isfinite(val_target_np)):
-                val_target_np = np.nan_to_num(val_target_np)
-                
-            try:
-                final_r2 = r2_score(val_target_np, val_pred_np)
-            except ValueError:
-                final_r2 = -1.0
+            pred_log = val_pred.cpu().squeeze().numpy()
+            target_log = val_target.cpu().squeeze().numpy()
+            if np.var(target_log) < 1e-6:
+                final_r2 = 0.0
+            else:
+                final_r2 = r2_score(target_log, pred_log)
+
+            pred_np = safe_expm1(val_pred).cpu().squeeze().numpy()
+            target_np = safe_expm1(val_target).cpu().squeeze().numpy()
+            if np.any(~np.isfinite(pred_np)):
+                pred_np = np.nan_to_num(pred_np)
+            if np.any(~np.isfinite(target_np)):
+                target_np = np.nan_to_num(target_np)
+            final_rmse = np.sqrt(mean_squared_error(target_np, pred_np))
+            trial.set_user_attr("final_rmse", float(final_rmse))
 
         return final_r2
 
@@ -309,10 +338,6 @@ def objective(trial, df, device, seed):
 
         r2 = train_with_trial(trial, train_data, val_data, num_materials, device)
         fold_scores.append(r2)
-        
-        # 如果有fold失败，提前结束
-        if r2 < -0.9:
-            return -1.0
 
     return float(np.mean(fold_scores))
 
@@ -471,7 +496,7 @@ def retrain_with_best_params(
 
         best_r2, patience_ctr = -1e9, 0
         best_wts = None
-        scaler = torch.cuda.amp.GradScaler()
+        scaler = torch.cuda.amp.GradScaler() if device == 'cuda' else None
 
         for epoch in range(epochs):
             loss_fn.update_epoch(epoch, epochs)
@@ -487,12 +512,20 @@ def retrain_with_best_params(
 
                 optimizer.zero_grad()
 
-                with torch.autocast(device_type='cuda' if device == 'cuda' else 'cpu'):
+                with (
+                    torch.autocast(device_type='cuda') if device == 'cuda' else contextlib.nullcontext()
+                ):
                     pred1, unc1, _, _ = model(batch_materials, batch_features)
                     pred2, unc2, _, _ = model(batch_materials, batch_features)
-                    
-                    if (torch.isnan(pred1).any() or torch.isinf(pred1).any() or
-                        torch.isnan(pred2).any() or torch.isinf(pred2).any()):
+
+                    if (
+                        torch.isnan(pred1).any()
+                        or torch.isinf(pred1).any()
+                        or torch.isnan(pred2).any()
+                        or torch.isinf(pred2).any()
+                    ):
+                        warnings.warn("NaN/Inf detected, skipping batch")
+                        optimizer.zero_grad()
                         continue
                         
                     loss1, _ = loss_fn(pred1, unc1, batch_target, model, batch_raw)
@@ -500,11 +533,16 @@ def retrain_with_best_params(
                     consistency = F.mse_loss(pred1, pred2)
                     loss = (loss1 + loss2) / 2 + 0.5 * consistency
 
-                scaler.scale(loss).backward()
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
-                scaler.step(optimizer)
-                scaler.update()
+                if scaler is not None:
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+                    optimizer.step()
                 scheduler.step()
 
                 epoch_loss += loss.item() * batch_target.size(0)
@@ -512,23 +550,19 @@ def retrain_with_best_params(
             epoch_loss /= len(train_dataset)
 
             model.eval()
-            with torch.no_grad(), torch.autocast(device_type='cuda' if device == 'cuda' else 'cpu'):
+            with torch.no_grad(), (
+                torch.autocast(device_type='cuda') if device == 'cuda' else contextlib.nullcontext()
+            ):
                 val_pred, _, _, _ = model(val_materials, val_features)
                 if torch.isnan(val_pred).any() or torch.isinf(val_pred).any():
                     val_r2 = -1.0
                 else:
-                    val_pred_np = safe_expm1(val_pred).cpu().squeeze().numpy()
-                    val_target_np = safe_expm1(val_target).cpu().squeeze().numpy()
-                    
-                    if np.any(~np.isfinite(val_pred_np)):
-                        val_pred_np = np.nan_to_num(val_pred_np)
-                    if np.any(~np.isfinite(val_target_np)):
-                        val_target_np = np.nan_to_num(val_target_np)
-                        
-                    try:
-                        val_r2 = r2_score(val_target_np, val_pred_np)
-                    except ValueError:
-                        val_r2 = -1.0
+                    pred_log = val_pred.cpu().squeeze().numpy()
+                    target_log = val_target.cpu().squeeze().numpy()
+                    if np.var(target_log) < 1e-6:
+                        val_r2 = 0.0
+                    else:
+                        val_r2 = r2_score(target_log, pred_log)
 
             if val_r2 > best_r2:
                 best_r2 = val_r2
@@ -568,7 +602,9 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
     test_target = torch.FloatTensor(test_data["target"]).unsqueeze(1).to(device)
 
     # 标准预测
-    with torch.no_grad(), torch.autocast(device_type='cuda' if device == 'cuda' else 'cpu'):
+    with torch.no_grad(), (
+        torch.autocast(device_type='cuda') if device == 'cuda' else contextlib.nullcontext()
+    ):
         if is_ensemble:
             preds = []
             uncs = []
@@ -592,7 +628,7 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
         # 转换为NumPy
         test_pred_np = safe_expm1(test_pred).cpu().squeeze().numpy()
         test_target_np = safe_expm1(test_target).cpu().squeeze().numpy()
-        
+
         if np.any(~np.isfinite(test_pred_np)):
             test_pred_np = np.nan_to_num(test_pred_np)
         if np.any(~np.isfinite(test_target_np)):
@@ -603,10 +639,12 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
         residual_np = residual_out.cpu().squeeze().numpy()
 
         # 计算指标
-        try:
-            r2 = r2_score(test_target_np, test_pred_np)
-        except ValueError:
-            r2 = -1.0
+        y_true_log = test_target.squeeze().cpu().numpy()
+        y_pred_log = test_pred.squeeze().cpu().numpy()
+        if np.var(y_true_log) < 1e-6:
+            r2 = 0.0
+        else:
+            r2 = r2_score(y_true_log, y_pred_log)
         rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
 
         # 计算符号表达式和残差网络的贡献
@@ -649,10 +687,12 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
     aleatoric_np = aleatoric_unc.cpu().squeeze().numpy()
     epistemic_np = epistemic_unc.cpu().squeeze().numpy()
 
-    try:
-        mc_r2 = r2_score(test_target_np, mc_pred_np)
-    except ValueError:
-        mc_r2 = -1.0
+    y_true_log = test_target.squeeze().cpu().numpy()
+    y_pred_mc_log = mc_pred.squeeze().cpu().numpy()
+    if np.var(y_true_log) < 1e-6:
+        mc_r2 = 0.0
+    else:
+        mc_r2 = r2_score(y_true_log, y_pred_mc_log)
     mc_rmse = np.sqrt(mean_squared_error(test_target_np, mc_pred_np))
 
     # 不确定性指标

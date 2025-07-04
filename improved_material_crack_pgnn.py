@@ -9,13 +9,14 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 from typing import Dict, List, Tuple, Optional
 import pandas as pd
 from torch.utils.data import TensorDataset, DataLoader
+import contextlib
 
 
 def safe_expm1(x: torch.Tensor) -> torch.Tensor:
-    """GPU-safe expm1 with clipping."""
-    x = torch.clamp(x, -10, 10)
+    """GPU-safe expm1 with a relaxed clipping range."""
+    x = torch.clamp(x, -15, 15)
     result = x.expm1()
-    return torch.clamp(result, -1e6, 1e6)  # 添加输出限制
+    return torch.clamp(result, -1e6, 1e6)
 
 
 class MaterialEmbedding(nn.Module):
@@ -651,7 +652,7 @@ def train_material_model(
     # 更新总epoch数
     loss_fn.total_epochs = epochs
 
-    scaler = torch.cuda.amp.GradScaler()
+    scaler = torch.cuda.amp.GradScaler() if device == "cuda" else None
 
     for epoch in range(epochs):
         loss_fn.update_epoch(epoch, epochs)
@@ -668,7 +669,9 @@ def train_material_model(
 
             optimizer.zero_grad()
 
-            with torch.autocast(device_type=device):
+            with (
+                torch.autocast(device_type='cuda') if device == 'cuda' else contextlib.nullcontext()
+            ):
                 pred1, unc1, _, _ = model(batch_mats, batch_feats)
                 pred2, unc2, _, _ = model(batch_mats, batch_feats)
                 loss1, metrics = loss_fn(pred1, unc1, batch_tgt, model, batch_raw)
@@ -676,11 +679,16 @@ def train_material_model(
                 consistency = F.mse_loss(pred1, pred2)
                 loss = (loss1 + loss2) / 2 + 0.5 * consistency
 
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
-            scaler.step(optimizer)
-            scaler.update()
+            if scaler is not None:
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.1)
+                optimizer.step()
             scheduler.step()
 
             epoch_loss += loss.item() * batch_tgt.size(0)
@@ -690,7 +698,9 @@ def train_material_model(
 
         # 验证
         model.eval()
-        with torch.no_grad(), torch.autocast(device_type=device):
+        with torch.no_grad(), (
+            torch.autocast(device_type='cuda') if device == 'cuda' else contextlib.nullcontext()
+        ):
             val_pred, val_uncertainty, _, _ = model(val_materials, val_features)
             val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
             val_losses.append(val_loss.item())
