@@ -137,6 +137,12 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+    # ---- Stochastic Weight Averaging (SWA) ----
+    from torch.optim.swa_utils import AveragedModel, SWALR
+    swa_model = AveragedModel(model)
+    swa_start = int(epochs * 0.8)
+    swa_scheduler = SWALR(optimizer, swa_lr=lr * 0.1)
+
     # 损失函数
     loss_fn = PhysicsInformedLoss(
         lambda_complexity=lambda_complexity,
@@ -212,6 +218,13 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
 
+            # SWA update
+            if epoch >= swa_start:
+                swa_model.update_parameters(model)
+                swa_scheduler.step()
+            else:
+                scheduler.step()
+
             epoch_loss += loss.item() * batch_target.size(0)
 
         epoch_loss /= len(train_dataset)
@@ -228,8 +241,6 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
             val_r2 = r2_score(val_target_np, val_pred_np)
             val_rmse = np.sqrt(mean_squared_error(val_target_np, val_pred_np))
 
-        # 更新学习率
-        scheduler.step()
 
         # 早停检查
         if val_r2 > best_val_r2:
@@ -249,6 +260,10 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
         # 如果trial应该被剪枝则停止
         if trial.should_prune():
             raise optuna.TrialPruned()
+
+    # If SWA was applied, use averaged weights
+    if epochs > swa_start:
+        model.load_state_dict(swa_model.module.state_dict())
 
     # 恢复最佳模型状态进行最终评估
     if best_model_wts is not None:
@@ -430,6 +445,12 @@ def retrain_with_best_params(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+    # ---- Stochastic Weight Averaging (SWA) ----
+    from torch.optim.swa_utils import AveragedModel, SWALR
+    swa_model = AveragedModel(model)
+    swa_start = int(epochs * 0.8)
+    swa_scheduler = SWALR(optimizer, swa_lr=lr * 0.1)
+
     # 损失函数
     loss_fn = PhysicsInformedLoss(
         lambda_complexity=best_params["lambda_complexity"],
@@ -468,14 +489,19 @@ def retrain_with_best_params(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
 
+            # SWA update
+            if epoch >= swa_start:
+                swa_model.update_parameters(model)
+                swa_scheduler.step()
+            else:
+                scheduler.step()
+
             epoch_loss += loss.item() * batch_target.size(0)
 
         epoch_loss /= len(train_dataset)
         train_losses.append(epoch_loss)
 
-        # 更新学习率
-        scheduler.step()
-        current_lr = scheduler.get_last_lr()[0]
+        current_lr = optimizer.param_groups[0]["lr"]
 
         # 评估
         model.eval()
@@ -504,6 +530,10 @@ def retrain_with_best_params(
         if patience_ctr >= 25:
             print("Early-stop triggered.")
             break
+
+    # If SWA was applied, use averaged weights
+    if epochs > swa_start:
+        model.load_state_dict(swa_model.module.state_dict())
 
     if best_model_wts is not None:
         model.load_state_dict(best_model_wts)

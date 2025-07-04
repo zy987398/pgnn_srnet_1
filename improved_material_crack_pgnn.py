@@ -520,6 +520,12 @@ def train_material_model(
 
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
+    # ---- Stochastic Weight Averaging (SWA) ----
+    from torch.optim.swa_utils import AveragedModel, SWALR
+    swa_model = AveragedModel(model)
+    swa_start = int(epochs * 0.8)
+    swa_scheduler = SWALR(optimizer, swa_lr=lr * 0.1)
+
     # 改进：使用自定义物理损失函数
     loss_fn = PhysicsInformedLoss(weight_decay=weight_decay)
 
@@ -556,6 +562,13 @@ def train_material_model(
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
         optimizer.step()
 
+        # Stochastic Weight Averaging update
+        if epoch >= swa_start:
+            swa_model.update_parameters(model)
+            swa_scheduler.step()
+        else:
+            scheduler.step()
+
         train_losses.append(loss.item())
 
         # 验证
@@ -565,15 +578,17 @@ def train_material_model(
             val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
             val_losses.append(val_loss.item())
 
-        # 更新学习率
-        scheduler.step()
 
         if (epoch + 1) % 20 == 0:
-            current_lr = scheduler.get_last_lr()[0]
+            current_lr = optimizer.param_groups[0]["lr"]
             print(f"Epoch {epoch+1}/{epochs}, LR: {current_lr:.6f}")
             print(
                 f'  Train Loss: {loss.item():.4f} (NLL: {metrics["nll"]:.4f}, Physics: {metrics["physics"]:.4f}, Weight: {metrics["physics_weight"]:.4f})'
             )
             print(f"  Val Loss: {val_loss.item():.4f}")
+
+    # If SWA was applied, copy averaged weights back to the model
+    if epochs > swa_start:
+        model.load_state_dict(swa_model.module.state_dict())
 
     return train_losses, val_losses
