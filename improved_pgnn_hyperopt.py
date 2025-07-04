@@ -14,7 +14,7 @@ from torch.utils.data import TensorDataset, DataLoader
 
 from improved_material_crack_pgnn import (
     MaterialCrackPGNN,
-    PhysicsInformedLoss,
+    AdaptiveLoss,
     prepare_material_data,
 )
 
@@ -144,12 +144,15 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
     swa_scheduler = SWALR(optimizer, swa_lr=lr * 0.1)
 
     # 损失函数
-    loss_fn = PhysicsInformedLoss(
+    loss_fn = AdaptiveLoss(
         lambda_complexity=lambda_complexity,
         lambda_physics=lambda_physics,
         weight_decay=0.0,
     )
     loss_fn.total_epochs = epochs
+
+    from torch.cuda.amp import autocast, GradScaler
+    scaler = GradScaler()
 
     # 准备数据 - 可选数据增强
     train_df = reconstruct_df(train_data)
@@ -205,18 +208,20 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
 
             optimizer.zero_grad()
 
-            pred, uncertainty, symbolic, residual = model(batch_materials, batch_raw)
-            loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
+            with autocast():
+                pred, uncertainty, symbolic, residual = model(batch_materials, batch_raw)
+                loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
 
             # 检查NaN
             if torch.isnan(loss) or torch.isinf(loss):
                 trial.report(-1.0, epoch)
                 raise optuna.TrialPruned()
 
-            loss.backward()
-            # 更严格的梯度裁剪
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             # SWA update
             if epoch >= swa_start:
@@ -231,7 +236,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
 
         # 验证
         model.eval()
-        with torch.no_grad():
+        with torch.no_grad(), autocast():
             val_pred, val_uncertainty, _, _ = model(val_materials, val_raw)
             val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
 
@@ -272,7 +277,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
 
         # 再次计算R²
         model.eval()
-        with torch.no_grad():
+        with torch.no_grad(), autocast():
             val_pred, _, _, _ = model(val_materials, val_raw)
             val_pred_np = val_pred.cpu().squeeze().numpy()
             final_r2 = r2_score(val_target_np, val_pred_np)
@@ -452,12 +457,15 @@ def retrain_with_best_params(
     swa_scheduler = SWALR(optimizer, swa_lr=lr * 0.1)
 
     # 损失函数
-    loss_fn = PhysicsInformedLoss(
+    loss_fn = AdaptiveLoss(
         lambda_complexity=best_params["lambda_complexity"],
         lambda_physics=best_params["lambda_physics"],
         weight_decay=0.0,
     )
     loss_fn.total_epochs = epochs
+
+    from torch.cuda.amp import autocast, GradScaler
+    scaler = GradScaler()
 
     # 训练
     print("\n使用最佳超参数重新训练...")
@@ -482,12 +490,15 @@ def retrain_with_best_params(
 
             optimizer.zero_grad()
 
-            pred, uncertainty, _, _ = model(batch_materials, batch_raw)
-            loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
+            with autocast():
+                pred, uncertainty, _, _ = model(batch_materials, batch_raw)
+                loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
 
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
 
             # SWA update
             if epoch >= swa_start:
@@ -505,7 +516,7 @@ def retrain_with_best_params(
 
         # 评估
         model.eval()
-        with torch.no_grad():
+        with torch.no_grad(), autocast():
             test_pred, test_uncertainty, _, _ = model(test_materials, test_raw)
             test_pred_np = test_pred.cpu().squeeze().numpy()
             test_target_np = test_target.cpu().squeeze().numpy()
@@ -542,7 +553,7 @@ def retrain_with_best_params(
     model.eval()
 
     # 标准预测
-    with torch.no_grad():
+    with torch.no_grad(), autocast():
         test_pred, test_uncertainty, _, _ = model(test_materials, test_raw)
         test_pred_np = test_pred.cpu().squeeze().numpy()
         test_target_np = test_target.cpu().squeeze().numpy()
@@ -579,7 +590,7 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
     test_target = torch.FloatTensor(test_data["target"]).unsqueeze(1).to(device)
 
     # 标准预测
-    with torch.no_grad():
+    with torch.no_grad(), autocast():
         test_pred, test_uncertainty, symbolic_out, residual_out = model(
             test_materials, test_raw
         )
