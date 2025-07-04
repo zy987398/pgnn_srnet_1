@@ -120,6 +120,18 @@ class PhysicsInformedFeatureExtractor(nn.Module):
         fatigue_param = velocity * pressure / (fracture_toughness + 1e-6)
         features.append(fatigue_param)
 
+        # 裂纹驱动力指标
+        crack_driving_force = pressure * torch.sqrt(grain_size) / (
+            fracture_toughness + 1e-6
+        )
+        features.append(crack_driving_force)
+
+        # 材料韧脆转变参数
+        ductility_index = (
+            fracture_toughness * elastic_modulus / (hardness**2 + 1e-6)
+        )
+        features.append(ductility_index)
+
         return torch.cat(features, dim=1)
 
 
@@ -160,7 +172,7 @@ class AdaptiveSymbolicLayer(nn.Module):
             nn.Linear(latent_dim, 64),
             nn.GELU(),
             nn.LayerNorm(64),
-            nn.Linear(64, 19),
+            nn.Linear(64, 21),
         )
 
         self.operator_selector = nn.Sequential(
@@ -226,7 +238,7 @@ class MaterialCrackPGNN(nn.Module):
 
         # 物理特征提取
         self.physics_extractor = PhysicsInformedFeatureExtractor()
-        physics_dim = 6 + 7 + 2 + 4  # 原始特征 + 衍生特征 + 交互 + 物理增强
+        physics_dim = 6 + 7 + 2 + 6  # 原始特征 + 衍生特征 + 交互 + 物理增强
         self.feature_interaction = FeatureInteractionModule(physics_dim)
         # 改进：计算特征总维度
         input_dim = material_embed_dim + physics_dim
@@ -511,6 +523,15 @@ def smart_augment(df: pd.DataFrame, model_predictions=None):
     return pd.concat([df, aug_df], ignore_index=True)
 
 
+def physics_aware_augment(df: pd.DataFrame) -> pd.DataFrame:
+    """保持物理关系的数据增强"""
+    aug_df = df.copy()
+    scale = 1 + np.random.uniform(-0.05, 0.05)
+    aug_df["压溃压力"] *= scale
+    aug_df["亚表面裂纹深度"] *= scale ** 0.5
+    return aug_df
+
+
 # 数据预处理与增强
 def prepare_material_data(
     df,
@@ -548,6 +569,7 @@ def prepare_material_data(
     # 数据增强 - 只在训练时进行
     if augment:
         aug_df = smart_augment(df)
+        aug_df = physics_aware_augment(aug_df)
         return prepare_material_data(
             aug_df, scaler=scaler, le=le, augment=False
         )
@@ -573,19 +595,10 @@ def train_material_model(
         model.parameters(), lr=lr, weight_decay=0
     )  # 不使用AdamW的weight_decay
 
-    # 改进：使用带预热的学习率调度器
-    warmup_epochs = 10
-
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            # 线性预热
-            return epoch / warmup_epochs
-        else:
-            # 余弦退火
-            progress = (epoch - warmup_epochs) / (epochs - warmup_epochs)
-            return 0.5 * (1 + np.cos(np.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    # 改进：使用带重启的余弦退火调度器
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=50, T_mult=2
+    )
 
     # ---- Stochastic Weight Averaging (SWA) ----
     from torch.optim.swa_utils import AveragedModel, SWALR

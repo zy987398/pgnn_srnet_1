@@ -59,7 +59,18 @@ def augment_dataset(orig_df, noise_scale=0.05):
         0, noise_scale, aug_df[numeric_cols].shape
     )
 
-    return pd.concat([orig_df, aug_df], ignore_index=True)
+    phys_df = physics_aware_augment(orig_df)
+
+    return pd.concat([orig_df, aug_df, phys_df], ignore_index=True)
+
+
+def physics_aware_augment(df: pd.DataFrame) -> pd.DataFrame:
+    """保持物理关系的数据增强"""
+    aug_df = df.copy()
+    scale = 1 + np.random.uniform(-0.05, 0.05)
+    aug_df["压溃压力"] *= scale
+    aug_df["亚表面裂纹深度"] *= scale ** 0.5
+    return aug_df
 
 
 def create_model(trial, num_materials):
@@ -123,19 +134,10 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
     else:
         optimizer = torch.optim.RMSprop(model.parameters(), lr=lr)
 
-    # 学习率预热与调度
-    warmup_epochs = 10
-
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            # 线性预热
-            return epoch / warmup_epochs
-        else:
-            # 余弦退火
-            progress = (epoch - warmup_epochs) / (epochs - warmup_epochs)
-            return 0.5 * (1 + np.cos(np.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    # 学习率调度
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=50, T_mult=2
+    )
 
     # ---- Stochastic Weight Averaging (SWA) ----
     from torch.optim.swa_utils import AveragedModel, SWALR
@@ -439,16 +441,10 @@ def retrain_with_best_params(
 
     # 学习率调度
     epochs = best_params["epochs"]
-    warmup_epochs = 10
 
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return epoch / warmup_epochs
-        else:
-            progress = (epoch - warmup_epochs) / (epochs - warmup_epochs)
-            return 0.5 * (1 + np.cos(np.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+        optimizer, T_0=50, T_mult=2
+    )
 
     # ---- Stochastic Weight Averaging (SWA) ----
     from torch.optim.swa_utils import AveragedModel, SWALR
