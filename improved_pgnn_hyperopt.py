@@ -62,19 +62,33 @@ def augment_dataset(orig_df, noise_scale=0.05):
     return pd.concat([orig_df, aug_df], ignore_index=True)
 
 
-def create_model(trial, num_materials):
+def create_model(trial, num_materials, space=None):
     """根据trial创建模型"""
-    # 模型架构超参数
+    if space is None:
+        material_range = (8, 32)
+        latent_range = (32, 128)
+        block_range = (2, 4)
+    else:
+        material_range = space.get("material_embed_dim", (8, 32))
+        latent_range = space.get("latent_dim", (32, 128))
+        block_range = space.get("num_blocks", (2, 4))
+
     material_embed_dim = trial.suggest_int(
-        "material_embed_dim", 8, 32, step=8
-    )  # 缩小范围
-    latent_dim = trial.suggest_int("latent_dim", 16, 64, step=16)  # 缩小范围
+        "material_embed_dim", int(material_range[0]), int(material_range[1]), step=8
+    )
+    latent_dim = trial.suggest_int(
+        "latent_dim", int(latent_range[0]), int(latent_range[1]), step=32
+    )
+    num_blocks = trial.suggest_int(
+        "num_blocks", int(block_range[0]), int(block_range[1])
+    )
 
     # 创建模型并修改部分架构
     model = MaterialCrackPGNN(
         num_materials=num_materials,
         material_embed_dim=material_embed_dim,
         latent_dim=latent_dim,
+        num_blocks=num_blocks,
     )
 
     # 动态调整dropout率
@@ -88,11 +102,11 @@ def create_model(trial, num_materials):
     return model
 
 
-def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
+def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", space=None):
     """使用给定的超参数训练模型"""
 
     # 训练超参数 - 缩小学习率范围
-    lr = trial.suggest_float("lr", 0.0005, 0.003, log=True)  # 更窄的范围
+    lr = trial.suggest_float("lr", 1e-4, 3e-3, log=True)
     epochs = trial.suggest_int("epochs", 200, 500, step=50)  # 减小上限
     batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
 
@@ -113,7 +127,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
     optimizer_name = trial.suggest_categorical("optimizer", ["AdamW", "RMSprop"])
 
     # 创建模型
-    model = create_model(trial, num_materials).to(device)
+    model = create_model(trial, num_materials, space).to(device)
 
     # 创建优化器
     if optimizer_name == "AdamW":
@@ -287,7 +301,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
     return best_val_r2
 
 
-def objective(trial, df, device, seed):
+def objective(trial, df, device, seed, space=None):
     """Optuna目标函数，5折交叉验证"""
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
     fold_scores = []
@@ -303,67 +317,122 @@ def objective(trial, df, device, seed):
         )
         num_materials = train_data["num_materials"]
 
-        r2 = train_with_trial(trial, train_data, val_data, num_materials, device)
+        r2 = train_with_trial(trial, train_data, val_data, num_materials, device, space)
         fold_scores.append(r2)
 
     return float(np.mean(fold_scores))
 
 
-def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials=100, seed=42):
-    """运行超参数优化"""
+def run_hyperopt(
+    data_path: str = "3011916164精确材料性能数据.csv",
+    n_trials_stage1: int = 50,
+    n_trials_stage2: int = 50,
+    top_k: int = 5,
+    seed: int = 42,
+):
+    """双阶段超参数搜索"""
 
-    # 设置随机种子
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # 读取数据
     df = pd.read_csv(data_path)
 
-    num_materials = df["材料种类"].nunique()
-
-    # 设备
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # 创建study - 使用更好的搜索策略
-    study = optuna.create_study(
+    # ----- 阶段1: Hyperband 粗搜 -----
+    study1 = optuna.create_study(
         direction="maximize",
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=30),
-        sampler=optuna.samplers.TPESampler(seed=seed, n_startup_trials=5),
+        pruner=optuna.pruners.HyperbandPruner(),
+        sampler=optuna.samplers.TPESampler(seed=seed),
     )
-
-    # 优化
-    study.optimize(
+    study1.optimize(
         lambda trial: objective(trial, df, device, seed),
-        n_trials=n_trials,
+        n_trials=n_trials_stage1,
         show_progress_bar=True,
         catch=(Exception,),
     )
 
-    # 打印结果
+    # 根据阶段1结果定义收缩后的搜索空间
+    global_bounds = {
+        "material_embed_dim": (8, 32),
+        "latent_dim": (32, 128),
+        "num_blocks": (2, 4),
+        "dropout_rate": (0.05, 0.2),
+        "lr": (1e-4, 3e-3),
+        "epochs": (200, 500),
+        "batch_size": [16, 32, 64],
+        "weight_decay": (1e-5, 1e-3),
+        "lambda_complexity": (1e-6, 1e-4),
+        "lambda_physics": (0.05, 0.20),
+        "patience": (20, 40),
+        "augmentation": [True, False],
+        "optimizer": ["AdamW", "RMSprop"],
+    }
+
+    top_trials = sorted(
+        [t for t in study1.trials if t.value is not None],
+        key=lambda t: t.value,
+        reverse=True,
+    )[:top_k]
+
+    space = {}
+    for name, bounds in global_bounds.items():
+        if isinstance(bounds, tuple):
+            vals = [t.params.get(name, bounds[0]) for t in top_trials]
+            low = max(bounds[0], min(vals))
+            high = min(bounds[1], max(vals))
+            span = high - low
+            space[name] = (
+                max(bounds[0], low - span * 0.5),
+                min(bounds[1], high + span * 0.5),
+            )
+        else:
+            vals = list({t.params.get(name) for t in top_trials if name in t.params})
+            space[name] = vals if vals else bounds
+
+    # ----- 阶段2: 局部TPE微调并动态收缩 -----
+    study2 = optuna.create_study(direction="maximize", sampler=optuna.samplers.TPESampler(seed=seed))
+
+    for _ in range(n_trials_stage2):
+        study2.optimize(
+            lambda trial: objective(trial, df, device, seed, space),
+            n_trials=1,
+            catch=(Exception,),
+        )
+
+        best = sorted(
+            [t for t in study2.trials if t.value is not None],
+            key=lambda t: t.value,
+            reverse=True,
+        )[:top_k]
+        for name, bounds in global_bounds.items():
+            if isinstance(bounds, tuple):
+                vals = [t.params.get(name, bounds[0]) for t in best]
+                low = max(bounds[0], min(vals))
+                high = min(bounds[1], max(vals))
+                span = high - low
+                space[name] = (
+                    max(bounds[0], low - span * 0.3),
+                    min(bounds[1], high + span * 0.3),
+                )
+            else:
+                vals = list({t.params.get(name) for t in best if name in t.params})
+                if vals:
+                    space[name] = vals
+
+    final_study = study2 if study2.best_value > study1.best_value else study1
+
     print("\n" + "=" * 50)
     print("优化完成!")
     print("=" * 50)
 
-    print(f"\n最佳验证R²: {study.best_value:.4f}")
+    print(f"\n最佳验证R²: {final_study.best_value:.4f}")
     print("\n最佳超参数:")
-    for key, value in study.best_params.items():
+    for key, value in final_study.best_params.items():
         print(f"  {key}: {value}")
 
-    # 统计信息
-    completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
-    print(f"\n完成的trials: {len(completed_trials)}/{n_trials}")
-
-    # 超参数重要性
-    try:
-        importance = optuna.importance.get_param_importances(study)
-        print("\n超参数重要性:")
-        for key, value in sorted(importance.items(), key=lambda x: x[1], reverse=True):
-            print(f"  {key}: {value:.3f}")
-    except:
-        pass
-
-    return study
+    return final_study
 
 
 # 使用最佳超参数重新训练
@@ -390,6 +459,7 @@ def retrain_with_best_params(
         material_embed_dim=best_params["material_embed_dim"],
         latent_dim=best_params["latent_dim"],
         dropout_rate=best_params["dropout_rate"],
+        num_blocks=best_params.get("num_blocks", 4),
     )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -679,8 +749,8 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
 if __name__ == "__main__":
     import matplotlib.pyplot as plt
 
-    # 运行超参数优化
-    study = run_hyperopt(n_trials=50)  # 可以增加trials获得更好结果
+    # 运行双阶段超参数优化
+    study = run_hyperopt(n_trials_stage1=30, n_trials_stage2=20)
 
     # 使用最佳参数重新训练
     model, train_losses, test_r2_history = retrain_with_best_params(study)

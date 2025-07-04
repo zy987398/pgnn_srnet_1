@@ -146,6 +146,23 @@ class ResidualBlock(nn.Module):
         return out + residual  # 残差连接
 
 
+class FiLMLayer(nn.Module):
+    """FiLM调制层，用物理特征调制隐藏表示"""
+
+    def __init__(self, cond_dim: int, feature_dim: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(cond_dim, feature_dim * 2),
+            nn.GELU(),
+            nn.Linear(feature_dim * 2, feature_dim * 2),
+        )
+
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        gamma_beta = self.net(cond)
+        gamma, beta = gamma_beta.chunk(2, dim=-1)
+        return gamma * x + beta
+
+
 class AdaptiveSymbolicLayer(nn.Module):
     """具有注意力和门控机制的符号层"""
 
@@ -217,7 +234,12 @@ class MaterialCrackPGNN(nn.Module):
     """专门用于材料裂纹深度预测的PGNN"""
 
     def __init__(
-        self, num_materials, material_embed_dim=16, latent_dim=32, dropout_rate=0.1
+        self,
+        num_materials,
+        material_embed_dim: int = 16,
+        latent_dim: int = 32,
+        dropout_rate: float = 0.1,
+        num_blocks: int = 4,
     ):
         super().__init__()
 
@@ -236,10 +258,17 @@ class MaterialCrackPGNN(nn.Module):
         self.encoder_norm = nn.LayerNorm(latent_dim)
 
         # 添加残差块
+        num_blocks = max(2, min(4, num_blocks))
         dropout_rates = [0.05, 0.1, 0.15, 0.2]
         self.residual_blocks = nn.ModuleList(
-            [ResidualBlock(latent_dim, dropout_rates[min(i, 3)]) for i in range(4)]
+            [ResidualBlock(latent_dim, dropout_rates[min(i, 3)]) for i in range(num_blocks)]
         )
+
+        # FiLM 调制层，仅作用于第2和第3个残差块
+        self.film_layers = nn.ModuleDict()
+        for idx in range(num_blocks):
+            if 1 <= idx <= 2:  # 只在第2、3个残差块后应用FiLM
+                self.film_layers[str(idx)] = FiLMLayer(physics_dim, latent_dim)
 
         # 符号表达式层
         self.symbolic_layer = AdaptiveSymbolicLayer(latent_dim)
@@ -291,9 +320,11 @@ class MaterialCrackPGNN(nn.Module):
         z = self.input_layer(combined_features)
         z = self.encoder_norm(z)
 
-        # 通过残差块
-        for block in self.residual_blocks:
+        # 通过残差块，并在第2~3个块后使用FiLM调制
+        for idx, block in enumerate(self.residual_blocks):
             z = block(z)
+            if str(idx) in self.film_layers:
+                z = self.film_layers[str(idx)](z, physics_features)
             # 在推理时如果启用MC Dropout，保持dropout激活
             if self.mc_dropout_enabled and not self.training:
                 z = F.dropout(z, p=0.1, training=True)
