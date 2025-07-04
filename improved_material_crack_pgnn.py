@@ -5,6 +5,7 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from typing import Dict, List, Tuple, Optional
 import pandas as pd
+from torch.utils.data import TensorDataset, DataLoader
 
 
 class MaterialEmbedding(nn.Module):
@@ -113,7 +114,7 @@ class ImprovedSymbolicLayer(nn.Module):
         super().__init__()
 
         # 预定义的物理操作符
-        self.operators = ["*", "/", "^", "sqrt", "log"]
+        self.operators = ["+", "-", "*", "sqrt", "1/x", "^1.5"]
         self.num_operators = len(self.operators)
 
         # 物理变量选择网络
@@ -137,7 +138,7 @@ class ImprovedSymbolicLayer(nn.Module):
             nn.Linear(latent_dim, 32),
             nn.GELU(),
             nn.LayerNorm(32),
-            nn.Linear(32, 4),  # 预测4个系数
+            nn.Linear(32, self.num_operators),  # 与操作符数量一致
         )
 
     def forward(self, z, physics_features, epoch: int = 0, total_epochs: int = 1):
@@ -170,21 +171,29 @@ class ImprovedSymbolicLayer(nn.Module):
         # 应用不同的操作符（软操作）
         expressions = []
 
-        # 线性项
+        # 线性项 (+)
         linear = coeffs[:, 0:1] * selected_features
         expressions.append(linear * op_weights[:, 0:1])
 
-        # 平方项
-        square = coeffs[:, 1:2] * (selected_features**2)
-        expressions.append(square * op_weights[:, 1:2])
+        # 反向项 (-)
+        negative = coeffs[:, 1:2] * (-selected_features)
+        expressions.append(negative * op_weights[:, 1:2])
 
-        # 平方根项
-        sqrt_term = coeffs[:, 2:3] * torch.sqrt(torch.abs(selected_features) + 1e-6)
-        expressions.append(sqrt_term * op_weights[:, 2:3])
+        # 乘法或平方 (*)
+        square = coeffs[:, 2:3] * (selected_features ** 2)
+        expressions.append(square * op_weights[:, 2:3])
 
-        # 对数项
-        log_term = coeffs[:, 3:4] * torch.log(torch.abs(selected_features) + 1)
-        expressions.append(log_term * op_weights[:, 3:4])
+        # 平方根项 (sqrt)
+        sqrt_term = coeffs[:, 3:4] * torch.sqrt(torch.abs(selected_features) + 1e-6)
+        expressions.append(sqrt_term * op_weights[:, 3:4])
+
+        # 倒数项 (1/x)
+        inv_term = coeffs[:, 4:5] * (1.0 / (selected_features + 1e-6))
+        expressions.append(inv_term * op_weights[:, 4:5])
+
+        # 1.5次方项 (^1.5)
+        power_term = coeffs[:, 5:6] * torch.sign(selected_features) * torch.pow(torch.abs(selected_features) + 1e-6, 1.5)
+        expressions.append(power_term * op_weights[:, 5:6])
 
         # 组合所有项
         symbolic_output = sum(expressions)
@@ -317,7 +326,8 @@ class MaterialCrackPGNN(nn.Module):
         sym_detached = symbolic_output.detach()
         gamma_beta = self.film(material_embed)
         gamma, beta = gamma_beta.chunk(2, dim=-1)
-        res_in = gamma * z + beta
+        z_norm = F.layer_norm(z, z.shape[-1:])
+        res_in = gamma * z_norm + beta
         residual_input = torch.cat([res_in, sym_detached], dim=-1)
         residual_output = self.residual_net(residual_input)
 
@@ -516,8 +526,11 @@ def prepare_material_data(
         # 为原始特征也添加相应的噪声（确保一致性）
         aug_numeric_raw *= 1 + np.random.normal(0, noise_scale, aug_numeric_raw.shape)
 
-        # 目标变量也略微调整，以保持与特征的相关性
-        aug_target_raw *= 1 + np.random.normal(0, noise_scale * 0.5, aug_target_raw.shape)
+        # 保持裂纹与晶粒尺寸的比例一致
+        factor = 1 + np.random.normal(0, noise_scale, size=(n_augment, 1))
+        aug_numeric_raw[:, 3:4] *= factor
+        aug_target_raw *= factor.squeeze()
+
         aug_target = np.log1p(aug_target_raw)
 
         # 5. 合并原始数据和增强数据
@@ -551,23 +564,26 @@ def train_material_model(
         model.parameters(), lr=lr, weight_decay=0
     )  # 不使用AdamW的weight_decay
 
+    train_dataset = TensorDataset(
+        torch.LongTensor(train_data["material_ids"]),
+        torch.FloatTensor(train_data["numeric_features"]),
+        torch.FloatTensor(train_data["numeric_raw"]),
+        torch.FloatTensor(train_data["target"]).unsqueeze(1),
+    )
+    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
+
     scheduler = torch.optim.lr_scheduler.OneCycleLR(
         optimizer,
         max_lr=lr,
         epochs=epochs,
-        steps_per_epoch=1,
+        steps_per_epoch=len(train_loader),
         pct_start=0.3,
     )
 
     # 改进：使用自定义物理损失函数
     loss_fn = PhysicsInformedLoss(weight_decay=weight_decay)
 
-    # 准备数据
-    train_materials = torch.LongTensor(train_data["material_ids"]).to(device)
-    train_features = torch.FloatTensor(train_data["numeric_features"]).to(device)
-    train_raw = torch.FloatTensor(train_data["numeric_raw"]).to(device)
-    train_target = torch.FloatTensor(train_data["target"]).unsqueeze(1).to(device)
-
+    # 准备验证数据
     val_materials = torch.LongTensor(val_data["material_ids"]).to(device)
     val_features = torch.FloatTensor(val_data["numeric_features"]).to(device)
     val_raw = torch.FloatTensor(val_data["numeric_raw"]).to(device)
@@ -583,25 +599,34 @@ def train_material_model(
         loss_fn.update_epoch(epoch, epochs)
         model.set_epoch(epoch, epochs)
 
-        # 训练
         model.train()
-        optimizer.zero_grad()
+        epoch_loss = 0.0
 
-        pred1, unc1, _, _ = model(train_materials, train_features)
-        pred2, unc2, _, _ = model(train_materials, train_features)
+        for batch_mats, batch_feats, batch_raw, batch_tgt in train_loader:
+            batch_mats = batch_mats.to(device)
+            batch_feats = batch_feats.to(device)
+            batch_raw = batch_raw.to(device)
+            batch_tgt = batch_tgt.to(device)
 
-        loss1, metrics = loss_fn(pred1, unc1, train_target, model, train_raw)
-        loss2, _ = loss_fn(pred2, unc2, train_target, model, train_raw)
-        kl = F.kl_div(pred1.log(), pred2, reduction='batchmean') + F.kl_div(pred2.log(), pred1, reduction='batchmean')
-        loss = (loss1 + loss2) / 2 + 0.5 * kl
+            optimizer.zero_grad()
 
-        loss.backward()
-        # 更严格的梯度裁剪
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-        optimizer.step()
-        scheduler.step()
+            pred1, unc1, _, _ = model(batch_mats, batch_feats)
+            pred2, unc2, _, _ = model(batch_mats, batch_feats)
 
-        train_losses.append(loss.item())
+            loss1, metrics = loss_fn(pred1, unc1, batch_tgt, model, batch_raw)
+            loss2, _ = loss_fn(pred2, unc2, batch_tgt, model, batch_raw)
+            consistency = F.mse_loss(pred1, pred2)
+            loss = (loss1 + loss2) / 2 + 0.5 * consistency
+
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            optimizer.step()
+            scheduler.step()
+
+            epoch_loss += loss.item() * batch_tgt.size(0)
+
+        epoch_loss /= len(train_dataset)
+        train_losses.append(epoch_loss)
 
         # 验证
         model.eval()
