@@ -17,6 +17,7 @@ from improved_material_crack_pgnn import (
     MaterialCrackPGNN,
     PhysicsInformedLoss,
     prepare_material_data,
+    safe_expm1,
 )
 
 
@@ -201,6 +202,13 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
 
             pred1, unc1, _, _ = model(batch_materials, batch_features)
             pred2, unc2, _, _ = model(batch_materials, batch_features)
+            if (
+                torch.isnan(pred1).any()
+                or torch.isinf(pred1).any()
+                or torch.isnan(pred2).any()
+                or torch.isinf(pred2).any()
+            ):
+                return -1.0
             loss1, metrics = loss_fn(pred1, unc1, batch_target, model, batch_raw)
             loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
             consistency = F.mse_loss(pred1, pred2)
@@ -225,10 +233,17 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
             val_pred, val_uncertainty, _, _ = model(val_materials, val_features)
             val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
 
-            val_pred_np = np.expm1(val_pred.cpu().squeeze().numpy())
-            val_target_np = np.expm1(val_target.cpu().squeeze().numpy())
+            val_pred_np = safe_expm1(val_pred.cpu().squeeze().numpy())
+            val_target_np = safe_expm1(val_target.cpu().squeeze().numpy())
+            if np.any(~np.isfinite(val_pred_np)):
+                val_pred_np = np.nan_to_num(val_pred_np)
+            if np.any(~np.isfinite(val_target_np)):
+                val_target_np = np.nan_to_num(val_target_np)
 
-            val_r2 = r2_score(val_target_np, val_pred_np)
+            try:
+                val_r2 = r2_score(val_target_np, val_pred_np)
+            except ValueError:
+                val_r2 = -1.0
             val_rmse = np.sqrt(mean_squared_error(val_target_np, val_pred_np))
 
 
@@ -258,9 +273,16 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
         model.eval()
         with torch.no_grad():
             val_pred, _, _, _ = model(val_materials, val_features)
-            val_pred_np = np.expm1(val_pred.cpu().squeeze().numpy())
-            val_target_np = np.expm1(val_target.cpu().squeeze().numpy())
-            final_r2 = r2_score(val_target_np, val_pred_np)
+            val_pred_np = safe_expm1(val_pred.cpu().squeeze().numpy())
+            val_target_np = safe_expm1(val_target.cpu().squeeze().numpy())
+            if np.any(~np.isfinite(val_pred_np)):
+                val_pred_np = np.nan_to_num(val_pred_np)
+            if np.any(~np.isfinite(val_target_np)):
+                val_target_np = np.nan_to_num(val_target_np)
+            try:
+                final_r2 = r2_score(val_target_np, val_pred_np)
+            except ValueError:
+                final_r2 = -1.0
 
         return final_r2
 
@@ -461,6 +483,13 @@ def retrain_with_best_params(
 
                 pred1, unc1, _, _ = model(batch_materials, batch_features)
                 pred2, unc2, _, _ = model(batch_materials, batch_features)
+                if (
+                    torch.isnan(pred1).any()
+                    or torch.isinf(pred1).any()
+                    or torch.isnan(pred2).any()
+                    or torch.isinf(pred2).any()
+                ):
+                    continue
                 loss1, _ = loss_fn(pred1, unc1, batch_target, model, batch_raw)
                 loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
                 consistency = F.mse_loss(pred1, pred2)
@@ -478,9 +507,19 @@ def retrain_with_best_params(
             model.eval()
             with torch.no_grad():
                 val_pred, _, _, _ = model(val_materials, val_features)
-                val_pred_np = np.expm1(val_pred.cpu().squeeze().numpy())
-                val_target_np = np.expm1(val_target.cpu().squeeze().numpy())
-                val_r2 = r2_score(val_target_np, val_pred_np)
+                if torch.isnan(val_pred).any() or torch.isinf(val_pred).any():
+                    val_r2 = -1.0
+                else:
+                    val_pred_np = safe_expm1(val_pred.cpu().squeeze().numpy())
+                    val_target_np = safe_expm1(val_target.cpu().squeeze().numpy())
+                    if np.any(~np.isfinite(val_pred_np)):
+                        val_pred_np = np.nan_to_num(val_pred_np)
+                    if np.any(~np.isfinite(val_target_np)):
+                        val_target_np = np.nan_to_num(val_target_np)
+                    try:
+                        val_r2 = r2_score(val_target_np, val_pred_np)
+                    except ValueError:
+                        val_r2 = -1.0
 
             if val_r2 > best_r2:
                 best_r2 = val_r2
@@ -546,14 +585,21 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
             )
 
         # 转换为NumPy
-        test_pred_np = np.expm1(test_pred.cpu().squeeze().numpy())
-        test_target_np = np.expm1(test_target.cpu().squeeze().numpy())
+        test_pred_np = safe_expm1(test_pred.cpu().squeeze().numpy())
+        test_target_np = safe_expm1(test_target.cpu().squeeze().numpy())
+        if np.any(~np.isfinite(test_pred_np)):
+            test_pred_np = np.nan_to_num(test_pred_np)
+        if np.any(~np.isfinite(test_target_np)):
+            test_target_np = np.nan_to_num(test_target_np)
         test_uncertainty_np = test_uncertainty.cpu().squeeze().numpy()
         symbolic_np = symbolic_out.cpu().squeeze().numpy()
         residual_np = residual_out.cpu().squeeze().numpy()
 
         # 计算指标
-        r2 = r2_score(test_target_np, test_pred_np)
+        try:
+            r2 = r2_score(test_target_np, test_pred_np)
+        except ValueError:
+            r2 = -1.0
         rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
 
         # 计算符号表达式和残差网络的贡献
@@ -587,12 +633,17 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
         mc_pred, mc_unc, aleatoric_unc, epistemic_unc = model.predict_with_uncertainty(
             test_materials, test_features, n_samples=30
         )
-    mc_pred_np = np.expm1(mc_pred.cpu().squeeze().numpy())
+    mc_pred_np = safe_expm1(mc_pred.cpu().squeeze().numpy())
+    if np.any(~np.isfinite(mc_pred_np)):
+        mc_pred_np = np.nan_to_num(mc_pred_np)
     mc_unc_np = mc_unc.cpu().squeeze().numpy()
     aleatoric_np = aleatoric_unc.cpu().squeeze().numpy()
     epistemic_np = epistemic_unc.cpu().squeeze().numpy()
 
-    mc_r2 = r2_score(test_target_np, mc_pred_np)
+    try:
+        mc_r2 = r2_score(test_target_np, mc_pred_np)
+    except ValueError:
+        mc_r2 = -1.0
     mc_rmse = np.sqrt(mean_squared_error(test_target_np, mc_pred_np))
 
     # 不确定性指标
