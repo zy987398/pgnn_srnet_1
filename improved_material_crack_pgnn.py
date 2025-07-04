@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+# Enable cuDNN autotuner for fixed-size inputs
+torch.backends.cudnn.benchmark = True
 import numpy as np
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from typing import Dict, List, Tuple, Optional
@@ -8,9 +11,9 @@ import pandas as pd
 from torch.utils.data import TensorDataset, DataLoader
 
 
-def safe_expm1(x: np.ndarray) -> np.ndarray:
-    """Compute expm1 with clipping to avoid overflow."""
-    return np.expm1(np.clip(x, -10, 10))
+def safe_expm1(x: torch.Tensor) -> torch.Tensor:
+    """GPU-safe expm1 with clipping."""
+    return torch.clamp(x, -10, 10).expm1()
 
 
 class MaterialEmbedding(nn.Module):
@@ -253,6 +256,11 @@ class MaterialCrackPGNN(nn.Module):
 
         # 符号表达式层
         self.symbolic_layer = ImprovedSymbolicLayer(latent_dim)
+        # Compile symbolic layer for fusion and speed
+        try:
+            self.symbolic_layer = torch.jit.script(self.symbolic_layer)
+        except Exception:
+            pass
 
         # FiLM 条件化层
         self.film = nn.Linear(material_embed_dim, latent_dim * 2)
@@ -448,30 +456,24 @@ class PhysicsInformedLoss(nn.Module):
         }
 
     def compute_physics_constraints(self, pred, features):
-        """改进的物理约束计算"""
-        # 约束1：裂纹深度应该与晶粒尺寸有关（不能超过某个比例）
-        # 改进：使用更合理的上限系数
+        """向量化的物理约束计算"""
+        pred_real = safe_expm1(pred.squeeze())
+
         grain_size = features[:, 3]
-        pred_real = torch.expm1(pred.squeeze())
-        constraint1 = F.relu(pred_real - 2.5 * grain_size)
-
-        # 约束2：零压力应该产生很小的裂纹
-        # 改进：使用更平滑的过渡函数
         pressure = features[:, 4]
-        # 使用sigmoid在低压力区域逐渐增加惩罚
-        pressure_factor = torch.sigmoid(-(pressure - 0.2) * 10)
-        constraint2 = pressure_factor * pred_real
-
-        # 约束3：高硬度材料的裂纹应该更小（新增）
         hardness = features[:, 0]
         fracture_toughness = features[:, 2]
-        # 高硬度低韧性材料应该有较小裂纹
+
+        constraint1 = torch.relu(pred_real - 2.5 * grain_size)
+        pressure_factor = torch.sigmoid(-(pressure - 0.2) * 10)
+        constraint2 = pressure_factor * pred_real
         brittleness = hardness / (fracture_toughness + 1e-6)
         high_brittleness = torch.sigmoid((brittleness - brittleness.mean()) * 5)
-        constraint3 = high_brittleness * F.relu(pred_real - torch.expm1(pred.mean()) * 0.5)
+        baseline = safe_expm1(pred.mean().detach()) * 0.5
+        constraint3 = high_brittleness * torch.relu(pred_real - baseline)
 
-        # 加权平均所有约束
-        return constraint1.mean() + constraint2.mean() + 0.5 * constraint3.mean()
+        constraints = torch.stack([constraint1, constraint2, 0.5 * constraint3])
+        return constraints.mean()
 
 
 # 数据预处理与增强
@@ -602,6 +604,8 @@ def train_material_model(
     # 更新总epoch数
     loss_fn.total_epochs = epochs
 
+    scaler = torch.cuda.amp.GradScaler()
+
     for epoch in range(epochs):
         loss_fn.update_epoch(epoch, epochs)
         model.set_epoch(epoch, epochs)
@@ -617,17 +621,19 @@ def train_material_model(
 
             optimizer.zero_grad()
 
-            pred1, unc1, _, _ = model(batch_mats, batch_feats)
-            pred2, unc2, _, _ = model(batch_mats, batch_feats)
+            with torch.cuda.amp.autocast():
+                pred1, unc1, _, _ = model(batch_mats, batch_feats)
+                pred2, unc2, _, _ = model(batch_mats, batch_feats)
+                loss1, metrics = loss_fn(pred1, unc1, batch_tgt, model, batch_raw)
+                loss2, _ = loss_fn(pred2, unc2, batch_tgt, model, batch_raw)
+                consistency = F.mse_loss(pred1, pred2)
+                loss = (loss1 + loss2) / 2 + 0.5 * consistency
 
-            loss1, metrics = loss_fn(pred1, unc1, batch_tgt, model, batch_raw)
-            loss2, _ = loss_fn(pred2, unc2, batch_tgt, model, batch_raw)
-            consistency = F.mse_loss(pred1, pred2)
-            loss = (loss1 + loss2) / 2 + 0.5 * consistency
-
-            loss.backward()
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-            optimizer.step()
+            scaler.step(optimizer)
+            scaler.update()
             scheduler.step()
 
             epoch_loss += loss.item() * batch_tgt.size(0)
@@ -637,7 +643,7 @@ def train_material_model(
 
         # 验证
         model.eval()
-        with torch.no_grad():
+        with torch.no_grad(), torch.cuda.amp.autocast():
             val_pred, val_uncertainty, _, _ = model(val_materials, val_features)
             val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
             val_losses.append(val_loss.item())
