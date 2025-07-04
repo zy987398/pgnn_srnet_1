@@ -103,11 +103,13 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
     weight_decay = trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True)
 
     # 损失函数超参数
-    lambda_complexity = trial.suggest_float("lambda_complexity", 1e-6, 1e-4, log=True)
+    lambda_complexity = trial.suggest_float(
+        "lambda_complexity", 1e-5, 5e-4, log=True
+    )
     lambda_physics = trial.suggest_float("lambda_physics", 0.05, 0.20, step=0.01)
 
     # 早停参数 - 更敏感
-    patience = trial.suggest_int("patience", 20, 40, step=5)
+    patience = trial.suggest_int("patience", 40, 80, step=5)
 
     # 数据增强
     use_augmentation = trial.suggest_categorical("augmentation", [True, False])
@@ -201,13 +203,11 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
             pred2, unc2, _, _ = model(batch_materials, batch_features)
             loss1, metrics = loss_fn(pred1, unc1, batch_target, model, batch_raw)
             loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
-            kl = F.kl_div(pred1.log(), pred2, reduction='batchmean') + F.kl_div(pred2.log(), pred1, reduction='batchmean')
-            loss = (loss1 + loss2) / 2 + 0.5 * kl
+            consistency = F.mse_loss(pred1, pred2)
+            loss = (loss1 + loss2) / 2 + 0.5 * consistency
 
-            # 检查NaN
             if torch.isnan(loss) or torch.isinf(loss):
-                trial.report(-1.0, epoch)
-                raise optuna.TrialPruned()
+                return -1.0
 
             loss.backward()
             # 更严格的梯度裁剪
@@ -244,12 +244,10 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
         if patience_counter >= patience:
             break
 
-        # 向Optuna报告中间结果
-        trial.report(val_r2, epoch)
-
-        # 如果trial应该被剪枝则停止
-        if trial.should_prune():
-            raise optuna.TrialPruned()
+        if epoch >= 50 and epoch % 10 == 0:
+            trial.report(val_r2, epoch)
+            if trial.should_prune():
+                break
 
     # 恢复最佳模型状态进行最终评估
     if best_model_wts is not None:
@@ -310,7 +308,9 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials=10
     # 创建study - 使用更好的搜索策略
     study = optuna.create_study(
         direction="maximize",
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=30),
+        pruner=optuna.pruners.MedianPruner(
+            n_startup_trials=10, n_warmup_steps=100, interval_steps=20
+        ),
         sampler=optuna.samplers.TPESampler(seed=seed, n_startup_trials=5),
     )
 
@@ -327,13 +327,18 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials=10
     print("优化完成!")
     print("=" * 50)
 
-    print(f"\n最佳验证R²: {study.best_value:.4f}")
-    print("\n最佳超参数:")
-    for key, value in study.best_params.items():
-        print(f"  {key}: {value}")
+    completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
+
+    if completed_trials:
+        best_trial = max(completed_trials, key=lambda t: t.value)
+        print(f"\n最佳验证R²: {best_trial.value:.4f}")
+        print("\n最佳超参数:")
+        for key, value in best_trial.params.items():
+            print(f"  {key}: {value}")
+    else:
+        print("\n没有成功完成的trial，请检查搜索过程。")
 
     # 统计信息
-    completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
     print(f"\n完成的trials: {len(completed_trials)}/{n_trials}")
 
     # 超参数重要性
@@ -458,10 +463,8 @@ def retrain_with_best_params(
                 pred2, unc2, _, _ = model(batch_materials, batch_features)
                 loss1, _ = loss_fn(pred1, unc1, batch_target, model, batch_raw)
                 loss2, _ = loss_fn(pred2, unc2, batch_target, model, batch_raw)
-                kl = F.kl_div(pred1.log(), pred2, reduction="batchmean") + F.kl_div(
-                    pred2.log(), pred1, reduction="batchmean"
-                )
-                loss = (loss1 + loss2) / 2 + 0.5 * kl
+                consistency = F.mse_loss(pred1, pred2)
+                loss = (loss1 + loss2) / 2 + 0.5 * consistency
 
                 loss.backward()
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
