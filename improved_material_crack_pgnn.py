@@ -8,6 +8,11 @@ import pandas as pd
 from torch.utils.data import TensorDataset, DataLoader
 
 
+def safe_expm1(x: np.ndarray) -> np.ndarray:
+    """Compute expm1 with clipping to avoid overflow."""
+    return np.expm1(np.clip(x, -10, 10))
+
+
 class MaterialEmbedding(nn.Module):
     """材料种类嵌入层"""
 
@@ -188,7 +193,7 @@ class ImprovedSymbolicLayer(nn.Module):
         expressions.append(sqrt_term * op_weights[:, 3:4])
 
         # 倒数项 (1/x)
-        inv_term = coeffs[:, 4:5] * (1.0 / (selected_features + 1e-6))
+        inv_term = coeffs[:, 4:5] * (1.0 / (selected_features + 1e-3))
         expressions.append(inv_term * op_weights[:, 4:5])
 
         # 1.5次方项 (^1.5)
@@ -332,7 +337,9 @@ class MaterialCrackPGNN(nn.Module):
         residual_output = self.residual_net(residual_input)
 
         # 组合预测（非负）
-        prediction = F.softplus(symbolic_output + residual_output, beta=5) + 1e-3
+        raw_out = symbolic_output + residual_output
+        raw_out = raw_out.clamp(-10, 10)
+        prediction = F.softplus(raw_out, beta=5) + 1e-3
 
         # 不确定性估计 - 随机不确定性
         log_var = self.aleatoric_net(z).clamp(-10, 6)
