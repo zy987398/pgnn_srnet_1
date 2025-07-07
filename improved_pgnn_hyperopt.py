@@ -8,7 +8,10 @@ import copy
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import r2_score, mean_squared_error
 import warnings
-from torch.amp import autocast, GradScaler
+from torch.cuda.amp import autocast, GradScaler
+
+# Global gradient clipping threshold
+GRAD_CLIP = 5.0
 import os
 
 # Create results directory if it doesn't exist
@@ -96,6 +99,7 @@ def create_model(trial, num_materials, space=None):
     latent_dim = trial.suggest_int(
         "latent_dim", int(latent_range[0]), int(latent_range[1]), step=32
     )
+    latent_dim = get_valid_latent_dim(latent_dim)
     num_blocks = trial.suggest_int(
         "num_blocks", int(block_range[0]), int(block_range[1])
     )
@@ -132,7 +136,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
 
         # 损失函数超参数
         lambda_complexity = trial.suggest_float("lambda_complexity", 1e-6, 1e-4, log=True)
-        lambda_physics = trial.suggest_float("lambda_physics", 0.01, 0.10, step=0.01)  # 减小上限
+        lambda_physics = trial.suggest_float("lambda_physics", 0.01, 0.05, step=0.01)
 
         # 早停参数 - 更敏感
         patience = trial.suggest_int("patience", 15, 30, step=5)
@@ -200,6 +204,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
             train_df,
             scaler=train_data["scaler"],
             le=train_data["label_encoder"],
+            verbose=False,
         )
 
         # 创建DataLoader
@@ -243,7 +248,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
                 batch_raw = batch_raw.to(device, non_blocking=True)
                 batch_target = batch_target.to(device, non_blocking=True)
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
                 try:
                     with autocast(device_type=device):
@@ -266,12 +271,12 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
                             return 0.0
 
                     # 反向传播与梯度裁剪
-                    loss.backward()
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
                     grad_norm = model.check_grad_norm() if hasattr(model, 'check_grad_norm') else 0.0
-                    if grad_norm > 10.0:
-                        print(f"Warning: Large gradient detected: {grad_norm:.2f}")
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
+                    scaler.step(optimizer)
+                    scaler.update()
 
                     # SWA update
                     if use_swa and epoch >= swa_start:
@@ -325,7 +330,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
                 trial.report(val_r2, epoch)
                 
                 # 调整学习率
-                scheduler.step(val_r2)
+                scheduler.step()
 
                 # 剪枝逻辑 - 确保训练至少min_epochs_before_pruning轮后才考虑剪枝
                 if trial.should_prune() and epoch >= min_epochs_before_pruning:
@@ -383,11 +388,12 @@ def objective(trial, df, device, seed, space=None):
             train_df = df.iloc[train_idx]
             val_df = df.iloc[val_idx]
 
-            train_data = prepare_material_data(train_df)
+            train_data = prepare_material_data(train_df, verbose=False)
             val_data = prepare_material_data(
                 val_df,
                 scaler=train_data["scaler"],
                 le=train_data["label_encoder"],
+                verbose=False,
             )
             num_materials = train_data["num_materials"]
 
@@ -480,7 +486,7 @@ def run_hyperopt(
         "batch_size": [16, 32],  # 移除较大的batch size
         "weight_decay": (1e-5, 5e-4),
         "lambda_complexity": (1e-6, 5e-5),
-        "lambda_physics": (0.01, 0.08),
+        "lambda_physics": (0.01, 0.05),
         "patience": (15, 25),
         "augmentation": [True, False],
         "optimizer": ["AdamW", "RMSprop"],
@@ -662,11 +668,12 @@ def retrain_with_best_params(
 
     train_df, test_df = train_test_split(df, test_size=0.2, random_state=seed)
 
-    train_data = prepare_material_data(train_df)
+    train_data = prepare_material_data(train_df, verbose=False)
     test_data = prepare_material_data(
         test_df,
         scaler=train_data["scaler"],
         le=train_data["label_encoder"],
+        verbose=False,
     )
 
     # 创建模型
@@ -692,6 +699,7 @@ def retrain_with_best_params(
         train_df_aug,
         scaler=train_data["scaler"],
         le=train_data["label_encoder"],
+        verbose=False,
     )
 
     # 创建DataLoader
@@ -773,7 +781,7 @@ def retrain_with_best_params(
                 batch_raw = batch_raw.to(device, non_blocking=True)
                 batch_target = batch_target.to(device, non_blocking=True)
 
-                optimizer.zero_grad()
+                optimizer.zero_grad(set_to_none=True)
 
                 try:
                     with autocast(device_type=device):
@@ -788,12 +796,12 @@ def retrain_with_best_params(
                         continue
 
                     # 监控梯度
-                    loss.backward()
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
                     grad_norm = model.check_grad_norm() if hasattr(model, 'check_grad_norm') else 0.0
-                    if grad_norm > 10.0:
-                        print(f"Warning: Large gradient detected: {grad_norm:.2f}")
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    optimizer.step()
+                    scaler.step(optimizer)
+                    scaler.update()
 
                     # SWA更新 (如果启用)
                     if use_swa and epoch >= swa_start:
@@ -844,7 +852,7 @@ def retrain_with_best_params(
                     break
 
                 # 基于验证集性能更新学习率
-                scheduler.step(test_r2)
+                scheduler.step()
             except Exception as e:
                 print(f"Error in evaluation: {e}")
                 continue
@@ -1075,11 +1083,12 @@ if __name__ == "__main__":
         # 详细评估
         df = pd.read_csv("3011916164精确材料性能数据.csv")
         train_df, test_df = train_test_split(df, test_size=0.2, random_state=SEED)
-        train_data = prepare_material_data(train_df)
+        train_data = prepare_material_data(train_df, verbose=False)
         test_data = prepare_material_data(
             test_df,
             scaler=train_data["scaler"],
             le=train_data["label_encoder"],
+            verbose=False,
         )
 
         results = evaluate_model_detailed(model, test_data)

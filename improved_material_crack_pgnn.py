@@ -7,6 +7,8 @@ from typing import Dict, List, Tuple, Optional
 import pandas as pd
 from scipy.stats.mstats import winsorize
 
+GRAD_CLIP = 5.0
+
 
 def safe_division(numerator, denominator, eps=1e-6, max_val=1e6):
     """安全除法，防止除零和数值爆炸"""
@@ -491,7 +493,7 @@ class MaterialCrackPGNN(nn.Module):
         
         return prediction, uncertainty, symbolic, residual
 
-    def predict_with_uncertainty(self, material_ids, numeric_features, numeric_raws, n_samples=10):
+    def predict_with_uncertainty(self, material_ids, num_scaled, num_raw, n_samples=10):
         """使用MC Dropout进行带不确定性的预测"""
         self.enable_mc_dropout(True)  # 启用MC Dropout
         self.train()  # 关键：保持train模式以激活Dropout
@@ -501,7 +503,7 @@ class MaterialCrackPGNN(nn.Module):
 
         with torch.no_grad():
             for _ in range(n_samples):
-                pred, uncertainty, _, _ = self(material_ids, numeric_features, numeric_raws)
+                pred, uncertainty, _, _ = self(material_ids, num_scaled, num_raw)
                 predictions.append(pred)
                 uncertainties.append(uncertainty)
 
@@ -559,7 +561,8 @@ class PhysicsInformedLoss(nn.Module):
         physics_loss = self.compute_physics_constraints(pred, numeric_raw)
         
         # 4. 动态权重调整
-        physics_weight = self.lambda_physics * min(1.0, self.current_epoch / 20)
+        warm_progress = max(0.0, self.current_epoch - 30) / 20
+        physics_weight = self.lambda_physics * min(1.0, warm_progress)
         
         # 5. 总损失
         total_loss = nll_loss + self.lambda_complexity * complexity_loss + physics_weight * physics_loss
@@ -697,6 +700,7 @@ def prepare_material_data(
     scaler: Optional[RobustScaler] = None,
     le: Optional[LabelEncoder] = None,
     winsorize_limits=(0.02, 0.02),  # 2%-98%分位数裁剪
+    verbose: bool = True,
 ):
     """改进的数据预处理，使用Winsorize和对数变换处理长尾分布"""
     
@@ -710,7 +714,8 @@ def prepare_material_data(
     # 1. 处理缺失值
     for col in numeric_cols + ["亚表面裂纹深度"]:
         if df_clean[col].isna().any():
-            print(f"Warning: Found NaN values in {col}, filling with median")
+            if verbose:
+                print(f"Warning: Found NaN values in {col}, filling with median")
             df_clean[col] = df_clean[col].fillna(df_clean[col].median())
     
     # 2. Winsorize处理极端值（特别是弹性模量）
@@ -719,7 +724,8 @@ def prepare_material_data(
         winsorized_values = winsorize(original_values, limits=winsorize_limits)
         outlier_count = np.sum(original_values != winsorized_values)
         if outlier_count > 0:
-            print(f"Winsorized {outlier_count} outliers in {col}")
+            if verbose:
+                print(f"Winsorized {outlier_count} outliers in {col}")
             df_clean[col] = winsorized_values
     
     # 3. 对数变换处理长尾分布（重点是弹性模量）
@@ -727,13 +733,15 @@ def prepare_material_data(
     df_log = df_clean.copy()
     
     for col in log_transform_cols:
-        # 确保所有值为正
-        min_val = df_clean[col].min()
-        if min_val <= 0:
-            df_log[col] = np.log1p(df_clean[col] - min_val + 1e-6)
-        else:
-            df_log[col] = np.log1p(df_clean[col])
-        print(f"Applied log1p transform to {col}")
+        if f"{col}_logged" not in df.columns:
+            min_val = df_clean[col].min()
+            if min_val <= 0:
+                df_log[col] = np.log1p(df_clean[col] - min_val + 1e-6)
+            else:
+                df_log[col] = np.log1p(df_clean[col])
+            df_log[f"{col}_logged"] = True
+            if verbose:
+                print(f"Applied log1p transform to {col}")
     
     # 4. 编码材料种类
     if le is None:
@@ -810,7 +818,7 @@ def train_material_model(
         
         # 梯度裁剪
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         optimizer.step()
         scheduler.step()
         
