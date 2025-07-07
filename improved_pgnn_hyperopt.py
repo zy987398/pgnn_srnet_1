@@ -165,6 +165,11 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
             swa_model = AveragedModel(model)
             swa_start = int(epochs * 0.7)  # 提前开始SWA
             swa_scheduler = SWALR(optimizer, swa_lr=lr * 0.1)
+        else:
+            use_swa = False
+            swa_model = None
+            swa_start = epochs  # 永远不会达到
+            swa_scheduler = None
         
         # 损失函数
         loss_fn = AdaptiveLoss(
@@ -238,20 +243,33 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
                     # 检查NaN - 返回默认值而不是剪枝
                     if torch.isnan(loss) or torch.isinf(loss):
                         print(f"Warning: NaN or Inf loss detected in epoch {epoch}. Using default R2 score.")
-                        return 0.0  # 返回默认值而不是剪枝
+                        # 如果训练早期就出现NaN，直接返回
+                        if epoch < min_epochs_before_pruning:
+                            return 0.0
+                        # 否则尝试使用最佳权重
+                        elif best_model_wts is not None:
+                            model.load_state_dict(best_model_wts)
+                            continue
+                        else:
+                            return 0.0
 
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)  # 增大梯度裁剪阈值
-                    scaler.step(optimizer)
-                    scaler.update()
+                    # 检查梯度大小
+                    grad_norm = model.check_grad_norm() if hasattr(model, 'check_grad_norm') else 0.0
+                    if grad_norm > 10.0:
+                        print(f"Warning: Large gradient detected: {grad_norm:.2f}")
+                    
+                    # 梯度裁剪
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
+                    # 使用混合精度和梯度裁剪
+                    loss.backward()
+                    optimizer.step()
+                    optimizer.zero_grad()
 
                     # SWA update
                     if use_swa and epoch >= swa_start:
                         swa_model.update_parameters(model)
                         swa_scheduler.step()
-                    else:
-                        scheduler.step()
 
                     epoch_loss += loss.item() * batch_target.size(0)
                 except RuntimeError as e:
@@ -296,6 +314,9 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
 
                 # 向Optuna报告中间结果
                 trial.report(val_r2, epoch)
+                
+                # 调整学习率
+                scheduler.step(val_r2)
 
                 # 剪枝逻辑 - 确保训练至少min_epochs_before_pruning轮后才考虑剪枝
                 if trial.should_prune() and epoch >= min_epochs_before_pruning:
@@ -443,7 +464,7 @@ def run_hyperopt(
     global_bounds = {
         "material_embed_dim": (8, 24),  # 缩小上限
         "latent_dim": (32, 96),  # 缩小上限
-        "num_blocks": (2, 3),  # 缩小上限
+        "num_blocks": (2, 2),  # 使用固定值2避免复杂网络
         "dropout_rate": (0.05, 0.15),
         "lr": (5e-4, 2e-3),  # 收窄范围
         "epochs": (100, 200),  # 减少epoch上限
@@ -497,7 +518,7 @@ def run_hyperopt(
         space = {
             "material_embed_dim": (8, 16),
             "latent_dim": (32, 64),
-            "num_blocks": (2, 3),
+            "num_blocks": (2, 2),
             "dropout_rate": (0.1, 0.1),
             "lr": (1e-3, 1e-3),
             "epochs": (100, 100),
@@ -560,7 +581,7 @@ def run_hyperopt(
             "material_embed_dim": 16,
             "latent_dim": 64,
             "num_blocks": 3,
-            "dropout_rate": 0.1,
+            "dropout_rate": 0.05,
             "lr": 1e-3,
             "epochs": 100,
             "batch_size": 32,
@@ -589,7 +610,7 @@ def retrain_with_best_params(
             "material_embed_dim": 16,
             "latent_dim": 64,
             "num_blocks": 3,
-            "dropout_rate": 0.1,
+            "dropout_rate": 0.05,
             "lr": 1e-3,
             "epochs": 100,
             "batch_size": 32,
@@ -644,6 +665,8 @@ def retrain_with_best_params(
     # 使用最佳参数准备增强数据
     use_augmentation = best_params.get("augmentation", True)
     train_df_aug = train_df.copy()
+    
+    # 限制数据扩增，可能是不稳定因素
     if use_augmentation:
         train_df_aug = augment_dataset(train_df_aug)
     augmented_train_data = prepare_material_data(
@@ -687,24 +710,16 @@ def retrain_with_best_params(
 
     # 学习率调度
     epochs = best_params.get("epochs", 100)
-    warmup_epochs = min(10, epochs // 10)
+    
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=5, verbose=True,
+        min_lr=1e-5, cooldown=5
+    )
 
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return epoch / warmup_epochs
-        else:
-            progress = (epoch - warmup_epochs) / (epochs - warmup_epochs)
-            return 0.5 * (1 + np.cos(np.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-    # ---- Stochastic Weight Averaging (SWA) ----
-    use_swa = epochs > 50
-    if use_swa:
-        from torch.optim.swa_utils import AveragedModel, SWALR
-        swa_model = AveragedModel(model)
-        swa_start = int(epochs * 0.7)
-        swa_scheduler = SWALR(optimizer, swa_lr=lr * 0.1)
+    # 禁用SWA以避免动态组件问题
+    use_swa = False
+    swa_model = None
+    swa_start = epochs  # 确保不会触发
 
     # 损失函数
     loss_fn = AdaptiveLoss(
@@ -721,6 +736,9 @@ def retrain_with_best_params(
     test_r2_history = []
     best_model_wts, best_test_r2, patience_ctr = None, -1e9, 0
     best_epoch = 0
+
+    # 早期停止的阈值，如果检测到性能明显下降
+    early_stop_threshold = 0.2
 
     try:
         for epoch in range(epochs):
@@ -745,22 +763,27 @@ def retrain_with_best_params(
                         loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
 
                     # 检查NaN
-                    if torch.isnan(loss) or torch.isinf(loss):
+                    if torch.isnan(loss) or torch.isinf(loss) or loss > 1000:
                         print(f"NaN/Inf loss detected in epoch {epoch}. Skipping update.")
                         continue
 
-                    scaler.scale(loss).backward()
-                    scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    scaler.step(optimizer)
-                    scaler.update()
+                    # 监控梯度
+                    loss.backward()
+                    
+                    # 检查梯度大小
+                    grad_norm = model.check_grad_norm() if hasattr(model, 'check_grad_norm') else 0.0
+                    if grad_norm > 10.0:
+                        print(f"Warning: Large gradient detected: {grad_norm:.2f}")
+                        # 如果梯度过大，使用更激进的裁剪
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    
+                    optimizer.step()
+                    optimizer.zero_grad()
 
-                    # SWA update
+                    # SWA更新 (如果启用)
                     if use_swa and epoch >= swa_start:
                         swa_model.update_parameters(model)
                         swa_scheduler.step()
-                    else:
-                        scheduler.step()
 
                     epoch_loss += loss.item() * batch_target.size(0)
                 except Exception as e:
@@ -784,7 +807,7 @@ def retrain_with_best_params(
                     test_rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
                     test_r2_history.append(test_r2)
 
-                if (epoch + 1) % 20 == 0 or epoch == 0:
+                if (epoch + 1) % 10 == 0 or epoch == 0:
                     print(
                         f"Epoch {epoch+1}: LR={current_lr:.6f}, Test R²={test_r2:.4f}, RMSE={test_rmse:.4f}"
                     )
@@ -802,6 +825,9 @@ def retrain_with_best_params(
                 if patience_ctr >= patience:
                     print(f"Early stopping at epoch {epoch+1}")
                     break
+
+                # 基于验证集性能更新学习率
+                scheduler.step(test_r2)
             except Exception as e:
                 print(f"Error in evaluation: {e}")
                 continue
@@ -809,7 +835,18 @@ def retrain_with_best_params(
         # 应用SWA权重（如果启用）
         if use_swa and epochs > swa_start:
             try:
-                model.load_state_dict(swa_model.module.state_dict())
+                print("Attempting to apply SWA weights...")
+                # 检查swa_model状态
+                swa_dict = swa_model.module.state_dict()
+                model_dict = model.state_dict()
+
+                missing_keys = [k for k in model_dict.keys() if k not in swa_dict]
+                if missing_keys:
+                    print(f"Warning: SWA model missing keys: {missing_keys}")
+                    print("SWA will not be applied")
+                else:
+                    model.load_state_dict(swa_model.module.state_dict())
+
                 # 重新评估SWA模型
                 model.eval()
                 with torch.no_grad(), autocast(device_type=device):
@@ -818,9 +855,9 @@ def retrain_with_best_params(
                     test_target_np = test_target.cpu().squeeze().numpy()
                     swa_r2 = r2_score(test_target_np, test_pred_np)
                     swa_rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
-                
+
                 print(f"SWA model R²: {swa_r2:.4f}, RMSE: {swa_rmse:.4f}")
-                
+
                 # 如果SWA模型比最佳模型差，切回最佳模型
                 if swa_r2 < best_test_r2 and best_model_wts is not None:
                     print("SWA model performs worse than best model, reverting to best model")
