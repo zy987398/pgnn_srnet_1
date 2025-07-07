@@ -249,7 +249,9 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
 
                 try:
                     with autocast(device_type=device):
-                        pred, uncertainty, symbolic, residual = model(batch_materials, batch_features)
+                        pred, uncertainty, symbolic, residual = model(
+                            batch_materials, batch_features, batch_raw
+                        )
                         loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
 
                     # 检查NaN - 返回默认值而不是剪枝
@@ -265,18 +267,13 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
                         else:
                             return 0.0
 
-                    # 检查梯度大小
+                    # 反向传播与梯度裁剪
+                    loss.backward()
                     grad_norm = model.check_grad_norm() if hasattr(model, 'check_grad_norm') else 0.0
                     if grad_norm > 10.0:
                         print(f"Warning: Large gradient detected: {grad_norm:.2f}")
-                    
-                    # 梯度裁剪
                     torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-                    # 使用混合精度和梯度裁剪
-                    loss.backward()
                     optimizer.step()
-                    optimizer.zero_grad()
 
                     # SWA update
                     if use_swa and epoch >= swa_start:
@@ -302,7 +299,9 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
             model.eval()
             try:
                 with torch.no_grad(), autocast(device_type=device):
-                    val_pred, val_uncertainty, _, _ = model(val_materials, val_features)
+                    val_pred, val_uncertainty, _, _ = model(
+                        val_materials, val_features, val_raw
+                    )
                     val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
 
                     val_pred_np = val_pred.cpu().squeeze().numpy()
@@ -359,7 +358,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
         model.eval()
         try:
             with torch.no_grad(), autocast(device_type=device):
-                val_pred, _, _, _ = model(val_materials, val_features)
+                val_pred, _, _, _ = model(val_materials, val_features, val_raw)
                 val_pred_np = val_pred.cpu().squeeze().numpy()
                 val_target_np = val_target.cpu().squeeze().numpy()
                 final_r2 = r2_score(val_target_np, val_pred_np)
@@ -782,7 +781,9 @@ def retrain_with_best_params(
 
                 try:
                     with autocast(device_type=device):
-                        pred, uncertainty, _, _ = model(batch_materials, batch_raw)
+                        pred, uncertainty, _, _ = model(
+                            batch_materials, batch_features, batch_raw
+                        )
                         loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
 
                     # 检查NaN
@@ -792,16 +793,11 @@ def retrain_with_best_params(
 
                     # 监控梯度
                     loss.backward()
-                    
-                    # 检查梯度大小
                     grad_norm = model.check_grad_norm() if hasattr(model, 'check_grad_norm') else 0.0
                     if grad_norm > 10.0:
                         print(f"Warning: Large gradient detected: {grad_norm:.2f}")
-                        # 如果梯度过大，使用更激进的裁剪
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-                    
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
                     optimizer.step()
-                    optimizer.zero_grad()
 
                     # SWA更新 (如果启用)
                     if use_swa and epoch >= swa_start:
@@ -822,7 +818,9 @@ def retrain_with_best_params(
             model.eval()
             try:
                 with torch.no_grad(), autocast(device_type=device):
-                    test_pred, test_uncertainty, _, _ = model(test_materials, test_raw)
+                    test_pred, test_uncertainty, _, _ = model(
+                        test_materials, test_features, test_raw
+                    )
                     test_pred_np = test_pred.cpu().squeeze().numpy()
                     test_target_np = test_target.cpu().squeeze().numpy()
 
@@ -873,7 +871,9 @@ def retrain_with_best_params(
                 # 重新评估SWA模型
                 model.eval()
                 with torch.no_grad(), autocast(device_type=device):
-                    test_pred, test_uncertainty, _, _ = model(test_materials, test_raw)
+                    test_pred, test_uncertainty, _, _ = model(
+                        test_materials, test_features, test_raw
+                    )
                     test_pred_np = test_pred.cpu().squeeze().numpy()
                     test_target_np = test_target.cpu().squeeze().numpy()
                     swa_r2 = r2_score(test_target_np, test_pred_np)
@@ -906,7 +906,9 @@ def retrain_with_best_params(
 
     # 标准预测
     with torch.no_grad(), autocast(device_type=device):
-        test_pred, test_uncertainty, _, _ = model(test_materials, test_raw)
+        test_pred, test_uncertainty, _, _ = model(
+            test_materials, test_features, test_raw
+        )
         test_pred_np = test_pred.cpu().squeeze().numpy()
         test_target_np = test_target.cpu().squeeze().numpy()
 
@@ -915,7 +917,7 @@ def retrain_with_best_params(
 
     # MC Dropout预测
     mc_pred, mc_unc, aleatoric_unc, epistemic_unc = model.predict_with_uncertainty(
-        test_materials, test_raw, n_samples=20
+        test_materials, test_features, test_raw, n_samples=20
     )
     mc_pred_np = mc_pred.cpu().squeeze().numpy()
     mc_r2 = r2_score(test_target_np, mc_pred_np)
@@ -945,7 +947,7 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
     try:
         with torch.no_grad(), autocast(device_type=device):
             test_pred, test_uncertainty, symbolic_out, residual_out = model(
-                test_materials, test_raw
+                test_materials, test_features, test_raw
             )
 
             # 转换为NumPy
@@ -980,7 +982,7 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
     # MC Dropout预测
     try:
         mc_pred, mc_unc, aleatoric_unc, epistemic_unc = model.predict_with_uncertainty(
-            test_materials, test_raw, n_samples=30
+            test_materials, test_features, test_raw, n_samples=30
         )
         mc_pred_np = mc_pred.cpu().squeeze().numpy()
         mc_unc_np = mc_unc.cpu().squeeze().numpy()
