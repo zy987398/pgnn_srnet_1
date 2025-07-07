@@ -5,7 +5,7 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler, LabelEncoder, MinMaxScaler
 from typing import Dict, List, Tuple, Optional
 import pandas as pd
-
+from torch.amp import autocast, GradScaler
 
 class MaterialEmbedding(nn.Module):
     """材料种类嵌入层"""
@@ -16,6 +16,36 @@ class MaterialEmbedding(nn.Module):
 
     def forward(self, material_ids):
         return self.embedding(material_ids)
+
+
+class FeatureInteractionModule(nn.Module):
+    """二阶物理交互特征提取"""
+
+    def __init__(self, input_dim: int, hidden_dim: int = 64):
+        super().__init__()
+        # 修改点 ①：Linear 输入维度 = 2 * input_dim * input_dim
+        self.interaction_net = nn.Sequential(
+            nn.Linear(input_dim * input_dim * 2, hidden_dim),  # ←★★
+            nn.GELU(),
+            nn.LayerNorm(hidden_dim),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, input_dim),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        x: (batch, input_dim)
+        输出与 x 同形状，包含二阶交互校正
+        """
+        b, d = x.shape
+        x1 = x.unsqueeze(2).expand(-1, -1, d)  # (b, d, d)
+        x2 = x.unsqueeze(1).expand(-1, d, -1)  # (b, d, d)
+        # 拼接得到 (b, d, d, 2) → view 为 (b, 2*d*d)
+        interactions = torch.cat([x1, x2], dim=-1).contiguous()
+        interactions = self.interaction_net(interactions.view(b, -1))
+        return x + interactions
+
 
 
 class PhysicsInformedFeatureExtractor(nn.Module):
@@ -80,6 +110,23 @@ class PhysicsInformedFeatureExtractor(nn.Module):
         fracture_tendency = energy_release_rate / (fracture_toughness + 1e-6)
         features.append(fracture_tendency)
 
+        # ---- 物理特征增强 ----
+        # 应变能密度
+        strain_energy = 0.5 * pressure**2 / (elastic_modulus + 1e-6)
+        features.append(strain_energy)
+
+        # 临界裂纹长度 (Irwin 准则)
+        critical_crack = (fracture_toughness / (pressure + 1e-6)) ** 2
+        features.append(critical_crack)
+
+        # 塑性区尺寸估计
+        plastic_zone = (fracture_toughness / (hardness + 1e-6)) ** 2
+        features.append(plastic_zone)
+
+        # 疲劳参数 (Paris law inspired)
+        fatigue_param = velocity * pressure / (fracture_toughness + 1e-6)
+        features.append(fatigue_param)
+
         return torch.cat(features, dim=1)
 
 
@@ -106,25 +153,40 @@ class ResidualBlock(nn.Module):
         return out + residual  # 残差连接
 
 
-class ImprovedSymbolicLayer(nn.Module):
-    """改进的符号表达式层，专门针对裂纹深度预测"""
+class FiLMLayer(nn.Module):
+    """FiLM调制层，用物理特征调制隐藏表示"""
 
-    def __init__(self, latent_dim=32):
+    def __init__(self, cond_dim: int, feature_dim: int):
         super().__init__()
-
-        # 预定义的物理操作符
-        self.operators = ["*", "/", "^", "sqrt", "log"]
-        self.num_operators = len(self.operators)
-
-        # 物理变量选择网络
-        self.variable_selector = nn.Sequential(
-            nn.Linear(latent_dim, 64),
-            nn.GELU(),  # 改进：使用GELU激活函数
-            nn.LayerNorm(64),  # 改进：LayerNorm替换BatchNorm
-            nn.Linear(64, 15),  # 原始+衍生特征 (增加了2个交互特征)
+        self.net = nn.Sequential(
+            nn.Linear(cond_dim, feature_dim * 2),
+            nn.GELU(),
+            nn.Linear(feature_dim * 2, feature_dim * 2),
         )
 
-        # 操作符选择网络
+    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
+        gamma_beta = self.net(cond)
+        gamma, beta = gamma_beta.chunk(2, dim=-1)
+        return gamma * x + beta
+
+
+class AdaptiveSymbolicLayer(nn.Module):
+    """具有注意力和门控机制的符号层"""
+
+    def __init__(self, latent_dim: int = 32):
+        super().__init__()
+
+        self.attention = nn.MultiheadAttention(latent_dim, num_heads=4, batch_first=True)
+        self.operators = ["*", "/", "^2", "^3", "sqrt", "log", "exp", "sin"]
+        self.num_operators = len(self.operators)
+
+        self.variable_selector = nn.Sequential(
+            nn.Linear(latent_dim, 64),
+            nn.GELU(),
+            nn.LayerNorm(64),
+            nn.Linear(64, 19),
+        )
+
         self.operator_selector = nn.Sequential(
             nn.Linear(latent_dim, 32),
             nn.GELU(),
@@ -132,62 +194,45 @@ class ImprovedSymbolicLayer(nn.Module):
             nn.Linear(32, self.num_operators),
         )
 
-        # 系数预测网络
         self.coefficient_net = nn.Sequential(
             nn.Linear(latent_dim, 32),
             nn.GELU(),
             nn.LayerNorm(32),
-            nn.Linear(32, 4),  # 预测4个系数
+            nn.Linear(32, 4),
         )
 
-    def forward(self, z, physics_features):
-        """
-        z: 潜在表示
-        physics_features: 物理特征
-        """
-        batch_size = z.shape[0]
+        self.gate = nn.Sequential(nn.Linear(latent_dim, latent_dim), nn.Sigmoid())
 
-        # 选择变量
+    def forward(self, z: torch.Tensor, physics_features: torch.Tensor) -> torch.Tensor:
+        attn_out, _ = self.attention(z.unsqueeze(1), z.unsqueeze(1), z.unsqueeze(1))
+        z = attn_out.squeeze(1)
+
         var_weights = F.softmax(self.variable_selector(z), dim=-1)
-
-        # 选择操作符
         op_weights = F.softmax(self.operator_selector(z), dim=-1)
-
-        # 预测系数
         coeffs = self.coefficient_net(z)
 
-        # 构建符号表达式（加权组合）
-        # 使用软选择机制
-        selected_features = torch.matmul(
-            var_weights.unsqueeze(1), physics_features.unsqueeze(2)
-        ).squeeze(-1)
+        selected_features = torch.matmul(var_weights.unsqueeze(1), physics_features.unsqueeze(2)).squeeze(-1)
 
-        # 应用不同的操作符（软操作）
         expressions = []
+        expressions.append(coeffs[:, 0:1] * selected_features)
+        expressions.append(coeffs[:, 1:2] * (selected_features ** 2))
+        expressions.append(coeffs[:, 2:3] * (selected_features ** 3))
+        expressions.append(coeffs[:, 3:4] * torch.sqrt(torch.abs(selected_features) + 1e-6))
 
-        # 线性项
-        linear = coeffs[:, 0:1] * selected_features
-        expressions.append(linear * op_weights[:, 0:1])
+        ops = [selected_features,
+               1.0 / (selected_features + 1e-6),
+               selected_features ** 2,
+               selected_features ** 3,
+               torch.sqrt(torch.abs(selected_features) + 1e-6),
+               torch.log(torch.abs(selected_features) + 1e-6),
+               torch.exp(selected_features.clamp(max=20)),
+               torch.sin(selected_features)]
 
-        # 平方项
-        square = coeffs[:, 1:2] * (selected_features**2)
-        expressions.append(square * op_weights[:, 1:2])
+        op_comb = sum(w.unsqueeze(1) * op for w, op in zip(op_weights.split(1, dim=1), ops))
 
-        # 平方根项
-        sqrt_term = coeffs[:, 2:3] * torch.sqrt(torch.abs(selected_features) + 1e-6)
-        expressions.append(sqrt_term * op_weights[:, 2:3])
+        symbolic_output = sum(expressions) * self.gate(z) + op_comb
 
-        # 对数项
-        log_term = coeffs[:, 3:4] * torch.log(torch.abs(selected_features) + 1)
-        expressions.append(log_term * op_weights[:, 3:4])
-
-        # 组合所有项
-        symbolic_output = sum(expressions)
-
-        # 计算复杂度（用于正则化）
-        self.complexity = -torch.sum(
-            var_weights * torch.log(var_weights + 1e-8), dim=-1
-        ).mean()
+        self.complexity = -torch.sum(var_weights * torch.log(var_weights + 1e-8), dim=-1).mean()
 
         return symbolic_output
 
@@ -196,18 +241,23 @@ class MaterialCrackPGNN(nn.Module):
     """专门用于材料裂纹深度预测的PGNN"""
 
     def __init__(
-        self, num_materials, material_embed_dim=16, latent_dim=32, dropout_rate=0.1
+        self,
+        num_materials,
+        material_embed_dim: int = 16,
+        latent_dim: int = 32,
+        dropout_rate: float = 0.1,
+        num_blocks: int = 4,
     ):
         super().__init__()
-
+        self.latent_dim = latent_dim
         # 材料嵌入
         self.material_embedding = MaterialEmbedding(num_materials, material_embed_dim)
 
         # 物理特征提取
         self.physics_extractor = PhysicsInformedFeatureExtractor()
-
-        # 改进：计算特征总维度 (包括新增的交互特征)
-        physics_dim = 6 + 7 + 2  # 原始特征 + 原有衍生特征 + 新增交互特征
+        physics_dim = 6 + 7 + 2 + 4  # 原始特征 + 衍生特征 + 交互 + 物理增强
+        self.feature_interaction = FeatureInteractionModule(physics_dim)
+        # 改进：计算特征总维度
         input_dim = material_embed_dim + physics_dim
 
         # 编码器 (使用残差连接)
@@ -215,23 +265,23 @@ class MaterialCrackPGNN(nn.Module):
         self.encoder_norm = nn.LayerNorm(latent_dim)
 
         # 添加残差块
+        num_blocks = max(2, min(4, num_blocks))
+        dropout_rates = [0.05, 0.1, 0.15, 0.2]
         self.residual_blocks = nn.ModuleList(
-            [ResidualBlock(latent_dim, dropout_rate) for _ in range(2)]
+            [ResidualBlock(latent_dim, dropout_rates[min(i, 3)]) for i in range(num_blocks)]
         )
+
+        # FiLM 调制层，仅作用于第2和第3个残差块
+        self.film_layers = nn.ModuleDict()
+        for idx in range(num_blocks):
+            if 1 <= idx <= 2:  # 只在第2、3个残差块后应用FiLM
+                self.film_layers[str(idx)] = FiLMLayer(physics_dim, latent_dim)
 
         # 符号表达式层
-        self.symbolic_layer = ImprovedSymbolicLayer(latent_dim)
+        self.symbolic_layer = AdaptiveSymbolicLayer(latent_dim)
 
         # 残差网络（捕获非线性效应）
-        self.residual_net = nn.Sequential(
-            nn.Linear(latent_dim + 1, 64),
-            nn.GELU(),
-            nn.LayerNorm(64),
-            nn.Dropout(dropout_rate),
-            nn.Linear(64, 32),
-            nn.GELU(),
-            nn.Linear(32, 1),
-        )
+        self.residual_net = None
 
         # 不确定性预测 - 分离认知不确定性和随机不确定性
         self.aleatoric_net = nn.Sequential(
@@ -260,6 +310,7 @@ class MaterialCrackPGNN(nn.Module):
 
         # 提取物理特征
         physics_features = self.physics_extractor(numeric_features)
+        physics_features = self.feature_interaction(physics_features)
 
         # 组合所有特征
         combined_features = torch.cat([material_embed, physics_features], dim=1)
@@ -268,29 +319,53 @@ class MaterialCrackPGNN(nn.Module):
         z = self.input_layer(combined_features)
         z = self.encoder_norm(z)
 
-        # 通过残差块
-        for block in self.residual_blocks:
+        # 通过残差块，并在第2~3个块后使用FiLM调制
+        for idx, block in enumerate(self.residual_blocks):
             z = block(z)
+            if str(idx) in self.film_layers:
+                z = self.film_layers[str(idx)](z, physics_features)
             # 在推理时如果启用MC Dropout，保持dropout激活
             if self.mc_dropout_enabled and not self.training:
                 z = F.dropout(z, p=0.1, training=True)
 
         # 符号表达式输出
-        symbolic_output = self.symbolic_layer(z, physics_features)
+        symbolic = self.symbolic_layer(z, physics_features)
+        # ---------- 将符号层结果归约为 1 维 ----------
+        # ---------- 1) 获取符号层输出 ----------
+        symbolic = self.symbolic_layer(z, physics_features)       # 形状可能是 (b, n_sym, 1)
 
-        # 残差网络输入：符号层输出与潜在表示，切断梯度
-        sym_detached = symbolic_output.detach()
-        residual_input = torch.cat([z, sym_detached], dim=-1)
+        # ---------- 2) 统一拉平成二维 ----------
+        if symbolic.dim() == 3 and symbolic.size(-1) == 1:        # (b, n_sym, 1) → (b, n_sym)
+            symbolic = symbolic.squeeze(-1)
+        if symbolic.dim() > 2:                                    # 兜底：任意 3-D → 2-D
+            symbolic = symbolic.contiguous().view(symbolic.size(0), -1)  # (b, n_flat)
+
+        # ---------- 3) 若仍有多列，先聚合到 1 列 ----------
+        if symbolic.size(1) > 1:                                  # (b, n_flat) → (b, 1)
+            symbolic = symbolic.mean(dim=1, keepdim=True)
+
+        # ---------- 4) 与 z 拼接后送残差网 ----------
+        residual_input = torch.cat([z, symbolic.detach()], dim=-1)  # (b, latent_dim+1)
+
+        # ── 动态创建 residual_net 的首层 ──────────────────
+        if self.residual_net is None:
+            in_dim = residual_input.size(1)                   # latent_dim + n_sym_flat
+            self.residual_net = nn.Sequential(
+                nn.Linear(in_dim, self.latent_dim),
+                nn.GELU(),
+                nn.LayerNorm(self.latent_dim),
+                nn.Linear(self.latent_dim, 1),
+            ).to(residual_input.device)
         residual_output = self.residual_net(residual_input)
 
         # 组合预测（非负）
-        prediction = F.softplus(symbolic_output + residual_output, beta=5) + 1e-3
+        prediction = F.softplus(symbolic + residual_output, beta=5) + 1e-3
 
         # 不确定性估计 - 随机不确定性
         log_var = self.aleatoric_net(z).clamp(-10, 6)
         uncertainty = torch.exp(log_var) + 1e-6
 
-        return prediction, uncertainty, symbolic_output, residual_output
+        return prediction, uncertainty, symbolic, residual_output
 
     def predict_with_uncertainty(self, material_ids, numeric_features, n_samples=10):
         """使用MC Dropout进行带不确定性的预测"""
@@ -420,6 +495,74 @@ class PhysicsInformedLoss(nn.Module):
         return constraint1.mean() + constraint2.mean() + 0.5 * constraint3.mean()
 
 
+class AdaptiveLoss(PhysicsInformedLoss):
+    """动态权重的物理损失函数"""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.loss_weights = nn.Parameter(torch.ones(3))
+
+    def forward(self, pred, uncertainty, target, model, numeric_features):
+        nll_loss = 0.5 * (
+            torch.log(2 * np.pi * uncertainty) + (target - pred) ** 2 / uncertainty
+        ).mean()
+        complexity_loss = (
+            model.symbolic_layer.complexity if hasattr(model.symbolic_layer, "complexity") else 0
+        )
+        physics_loss = self.compute_physics_constraints(pred, numeric_features)
+        weights = F.softmax(self.loss_weights, dim=0)
+        total_loss = (
+            weights[0] * nll_loss + weights[1] * complexity_loss + weights[2] * physics_loss
+        )
+
+        return total_loss, {
+            "nll": nll_loss.item(),
+            "complexity": complexity_loss.item() if torch.is_tensor(complexity_loss) else complexity_loss,
+            "physics": physics_loss.item(),
+            "physics_weight": float(weights[2].item()),
+            "total": total_loss.item(),
+        }
+
+
+def smart_augment(df: pd.DataFrame, model_predictions=None):
+    """根据预测误差进行mixup的数据增强"""
+    df = df.copy()
+    features = df[[
+        "莫氏硬度",
+        "弹性模量",
+        "断裂韧性",
+        "晶粒粒径",
+        "压溃压力",
+        "磨粒速度",
+    ]].values
+    targets = df["亚表面裂纹深度"].values
+
+    if model_predictions is not None:
+        errors = np.abs(targets - model_predictions)
+        weights = errors / (errors.sum() + 1e-6)
+    else:
+        weights = np.ones(len(df)) / len(df)
+
+    shuffled_idx = np.random.permutation(len(df))
+    alpha = 0.2
+    lam = np.random.beta(alpha, alpha)
+    mixed_features = lam * features + (1 - lam) * features[shuffled_idx]
+    mixed_targets = lam * targets + (1 - lam) * targets[shuffled_idx]
+
+    aug_df = pd.DataFrame(mixed_features, columns=[
+        "莫氏硬度",
+        "弹性模量",
+        "断裂韧性",
+        "晶粒粒径",
+        "压溃压力",
+        "磨粒速度",
+    ])
+    aug_df["材料种类"] = df["材料种类"].values
+    aug_df["亚表面裂纹深度"] = mixed_targets
+
+    return pd.concat([df, aug_df], ignore_index=True)
+
+
 # 数据预处理与增强
 def prepare_material_data(
     df,
@@ -456,34 +599,10 @@ def prepare_material_data(
 
     # 数据增强 - 只在训练时进行
     if augment:
-        # 1. 样本数量
-        n_samples = len(material_ids)
-        n_augment = n_samples // 4  # 增加25%的样本
-
-        # 2. 随机选择要增强的样本索引
-        aug_indices = np.random.choice(n_samples, n_augment, replace=False)
-
-        # 3. 为每个特征添加微小噪声
-        aug_material_ids = material_ids[aug_indices].copy()
-        aug_numeric_scaled = numeric_scaled[aug_indices].copy()
-        aug_numeric_raw = numeric_raw[aug_indices].copy()
-        aug_target = target[aug_indices].copy()
-
-        # 4. 添加高斯噪声
-        noise_scale = 0.05  # 5%的噪声
-        aug_numeric_scaled += np.random.normal(0, noise_scale, aug_numeric_scaled.shape)
-
-        # 为原始特征也添加相应的噪声（确保一致性）
-        aug_numeric_raw *= 1 + np.random.normal(0, noise_scale, aug_numeric_raw.shape)
-
-        # 目标变量也略微调整，以保持与特征的相关性
-        aug_target *= 1 + np.random.normal(0, noise_scale * 0.5, aug_target.shape)
-
-        # 5. 合并原始数据和增强数据
-        material_ids = np.concatenate([material_ids, aug_material_ids])
-        numeric_scaled = np.concatenate([numeric_scaled, aug_numeric_scaled])
-        numeric_raw = np.concatenate([numeric_raw, aug_numeric_raw])
-        target = np.concatenate([target, aug_target])
+        aug_df = smart_augment(df)
+        return prepare_material_data(
+            aug_df, scaler=scaler, le=le, augment=False
+        )
 
     return {
         "material_ids": material_ids,
@@ -527,7 +646,8 @@ def train_material_model(
     swa_scheduler = SWALR(optimizer, swa_lr=lr * 0.1)
 
     # 改进：使用自定义物理损失函数
-    loss_fn = PhysicsInformedLoss(weight_decay=weight_decay)
+    loss_fn = AdaptiveLoss(weight_decay=weight_decay)
+    scaler = GradScaler()
 
     # 准备数据
     train_materials = torch.LongTensor(train_data["material_ids"]).to(device)
@@ -554,13 +674,15 @@ def train_material_model(
         model.train()
         optimizer.zero_grad()
 
-        pred, uncertainty, symbolic, residual = model(train_materials, train_features)
-        loss, metrics = loss_fn(pred, uncertainty, train_target, model, train_raw)
+        with autocast(device_type=device):
+            pred, uncertainty, symbolic, residual = model(train_materials, train_features)
+            loss, metrics = loss_fn(pred, uncertainty, train_target, model, train_raw)
 
-        loss.backward()
-        # 更严格的梯度裁剪
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
-        optimizer.step()
+        scaler.step(optimizer)
+        scaler.update()
 
         # Stochastic Weight Averaging update
         if epoch >= swa_start:
@@ -573,7 +695,7 @@ def train_material_model(
 
         # 验证
         model.eval()
-        with torch.no_grad():
+        with torch.no_grad(), autocast(device_type=device):
             val_pred, val_uncertainty, _, _ = model(val_materials, val_features)
             val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
             val_losses.append(val_loss.item())
