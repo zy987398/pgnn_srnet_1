@@ -187,7 +187,6 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
         loss_fn = AdaptiveLoss(
             lambda_complexity=lambda_complexity,
             lambda_physics=lambda_physics,
-            weight_decay=0.0,
         )
         loss_fn.total_epochs = epochs
         scaler = GradScaler()
@@ -201,7 +200,6 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
             train_df,
             scaler=train_data["scaler"],
             le=train_data["label_encoder"],
-            augment=False,
         )
 
         # 创建DataLoader
@@ -694,7 +692,6 @@ def retrain_with_best_params(
         train_df_aug,
         scaler=train_data["scaler"],
         le=train_data["label_encoder"],
-        augment=False,
     )
 
     # 创建DataLoader
@@ -747,7 +744,6 @@ def retrain_with_best_params(
     loss_fn = AdaptiveLoss(
         lambda_complexity=best_params.get("lambda_complexity", 1e-5),
         lambda_physics=best_params.get("lambda_physics", 0.05),
-        weight_decay=0.0,
     )
     loss_fn.total_epochs = epochs
     scaler = GradScaler()

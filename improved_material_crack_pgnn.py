@@ -5,7 +5,6 @@ import numpy as np
 from sklearn.preprocessing import StandardScaler, LabelEncoder, MinMaxScaler, RobustScaler
 from typing import Dict, List, Tuple, Optional
 import pandas as pd
-from torch.amp import autocast, GradScaler
 from scipy.stats.mstats import winsorize
 
 
