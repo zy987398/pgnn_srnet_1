@@ -24,6 +24,16 @@ from improved_material_crack_pgnn import (
 )
 
 
+# Define stable hyperparameter bounds
+def get_valid_latent_dim(value):
+    """Ensure latent_dim is divisible by 4 for MultiheadAttention compatibility"""
+    # Round to nearest multiple of 16 to ensure divisibility by 4
+    return max(16, (value // 16) * 16)
+
+def get_valid_embed_dim(value):
+    """Ensure embedding dimension is suitable"""
+    return max(8, (value // 8) * 8)  # Multiple of 8
+
 def reconstruct_df(data_dict):
     """将预处理后的数据还原成DataFrame"""
     le = data_dict["label_encoder"]
@@ -79,8 +89,10 @@ def create_model(trial, num_materials, space=None):
         block_range = space.get("num_blocks", (2, 4))
 
     material_embed_dim = trial.suggest_int(
-        "material_embed_dim", int(material_range[0]), int(material_range[1]), step=8
+        "material_embed_dim", get_valid_embed_dim(material_range[0]), 
+        get_valid_embed_dim(material_range[1]), step=8
     )
+
     latent_dim = trial.suggest_int(
         "latent_dim", int(latent_range[0]), int(latent_range[1]), step=32
     )
@@ -111,7 +123,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
     """使用给定的超参数训练模型"""
     try:
         # 训练超参数 - 缩小学习率范围
-        lr = trial.suggest_float("lr", 1e-4, 3e-3, log=True)
+        lr = trial.suggest_float("lr", 5e-4, 1e-3)  # More narrow range
         epochs = trial.suggest_int("epochs", 100, 300, step=50)  # 减小上下限
         batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
 
@@ -463,7 +475,7 @@ def run_hyperopt(
     # 根据阶段1结果定义收缩后的搜索空间
     global_bounds = {
         "material_embed_dim": (8, 24),  # 缩小上限
-        "latent_dim": (32, 96),  # 缩小上限
+        "latent_dim": (32, 64),  # 缩小上限
         "num_blocks": (2, 2),  # 使用固定值2避免复杂网络
         "dropout_rate": (0.05, 0.15),
         "lr": (5e-4, 2e-3),  # 收窄范围
@@ -489,7 +501,17 @@ def run_hyperopt(
         print(f"Top {len(top_trials)} trials from Stage 1:")
         for i, t in enumerate(top_trials):
             print(f"  Trial {i+1}: R2={t.value:.4f}, params={t.params}")
-        
+
+        # Fix embedding dimensions for compatibility
+        if "material_embed_dim" in global_bounds:
+            material_range = global_bounds["material_embed_dim"]
+            global_bounds["material_embed_dim"] = (
+                get_valid_embed_dim(material_range[0]), get_valid_embed_dim(material_range[1])
+            )
+        if "latent_dim" in global_bounds:
+            latent_range = global_bounds["latent_dim"]
+            global_bounds["latent_dim"] = (get_valid_latent_dim(latent_range[0]), get_valid_latent_dim(latent_range[1]))
+
         for name, bounds in global_bounds.items():
             if isinstance(bounds, tuple):
                 vals = [t.params.get(name, bounds[0]) for t in top_trials if name in t.params]
@@ -516,9 +538,9 @@ def run_hyperopt(
     else:
         # 使用更保守的默认空间
         space = {
-            "material_embed_dim": (8, 16),
-            "latent_dim": (32, 64),
-            "num_blocks": (2, 2),
+            "material_embed_dim":  16,
+            "latent_dim": 32, 
+            "num_blocks": 2,
             "dropout_rate": (0.1, 0.1),
             "lr": (1e-3, 1e-3),
             "epochs": (100, 100),
@@ -579,7 +601,7 @@ def run_hyperopt(
         # 设置默认参数
         final_study.best_params = {
             "material_embed_dim": 16,
-            "latent_dim": 64,
+            "latent_dim": 32,
             "num_blocks": 3,
             "dropout_rate": 0.05,
             "lr": 1e-3,
@@ -720,6 +742,7 @@ def retrain_with_best_params(
     use_swa = False
     swa_model = None
     swa_start = epochs  # 确保不会触发
+    swa_scheduler = None  # 防止未定义错误
 
     # 损失函数
     loss_fn = AdaptiveLoss(
