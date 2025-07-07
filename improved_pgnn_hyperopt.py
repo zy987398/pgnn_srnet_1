@@ -737,9 +737,9 @@ def retrain_with_best_params(
     # 学习率调度
     epochs = best_params.get("epochs", 100)
     
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5, verbose=True,
-        min_lr=1e-5, cooldown=5
+    # 使用余弦退火学习率调度以避免metric依赖
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=epochs
     )
 
     # 禁用SWA以避免动态组件问题

@@ -451,7 +451,11 @@ class MaterialCrackPGNN(nn.Module):
             nn.GELU(),
             nn.Linear(16, 1)
         )
-    
+
+        # 控制MC Dropout与梯度监控
+        self.mc_dropout_enabled = False
+        self.max_grad = 0.0
+
     def forward(self, material_ids, numeric_scaled, numeric_raw):
         """
         material_ids: [batch_size] - 材料类别ID
@@ -523,6 +527,24 @@ class MaterialCrackPGNN(nn.Module):
             aleatoric_uncertainty,
             epistemic_uncertainty,
         )
+
+    def enable_mc_dropout(self, enable: bool = True):
+        """在评估模式下显式启用或关闭Dropout"""
+        self.mc_dropout_enabled = enable
+        for m in self.modules():
+            if isinstance(m, nn.Dropout):
+                m.train(enable)
+
+    def check_grad_norm(self) -> float:
+        """计算并记录当前梯度范数"""
+        total_norm = 0.0
+        for p in self.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+        self.max_grad = max(self.max_grad, total_norm)
+        return total_norm
 
 
 class PhysicsInformedLoss(nn.Module):
