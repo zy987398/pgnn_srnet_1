@@ -8,7 +8,7 @@ import copy
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import r2_score, mean_squared_error
 import warnings
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 
 # Global gradient clipping threshold
 GRAD_CLIP = 5.0
@@ -281,7 +281,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
                     # SWA update
                     if use_swa and epoch >= swa_start:
                         swa_model.update_parameters(model)
-                        swa_scheduler.step()
+                        swa_scheduler.step(val_r2)
 
                     epoch_loss += loss.item() * batch_target.size(0)
                 except RuntimeError as e:
@@ -806,7 +806,7 @@ def retrain_with_best_params(
                     # SWA更新 (如果启用)
                     if use_swa and epoch >= swa_start:
                         swa_model.update_parameters(model)
-                        swa_scheduler.step()
+                        swa_scheduler.step(test_r2)
 
                     epoch_loss += loss.item() * batch_target.size(0)
                 except Exception as e:
