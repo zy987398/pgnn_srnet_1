@@ -1,286 +1,221 @@
+"""
+模型训练相关函数
+包含基础训练循环和评估函数
+"""
+
 import torch
 import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
 import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.preprocessing import StandardScaler
-from sklearn.model_selection import train_test_split
+from sklearn.metrics import r2_score, mean_squared_error
+from models import GRAD_CLIP
+from losses import PhysicsInformedLoss
 
-# 导入之前定义的模型类（假设已经导入）
-from model import PGNNSymbolic, PGNNLoss, train_pgnn, create_physics_features
 
-class PhysicsDataset(Dataset):
-    """物理数据集类"""
-    def __init__(self, X, y, transform=None):
-        self.X = torch.FloatTensor(X)
-        self.y = torch.FloatTensor(y).reshape(-1, 1)
-        self.transform = transform
+def train_material_model(
+    model, train_data, val_data, epochs=100, lr=5e-4, device="cuda"
+):
+    """
+    训练材料裂纹预测模型
+    
+    参数:
+        model: 模型实例
+        train_data: 训练数据字典
+        val_data: 验证数据字典
+        epochs: 训练轮数
+        lr: 学习率
+        device: 计算设备
+    
+    返回:
+        训练后的模型，训练损失列表，验证损失列表
+    """
+    model = model.to(device)
+    
+    # 优化器和调度器
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+    
+    # 损失函数
+    loss_fn = PhysicsInformedLoss()
+    
+    # 准备数据
+    train_materials = torch.LongTensor(train_data["material_ids"]).to(device)
+    train_scaled = torch.FloatTensor(train_data["numeric_features"]).to(device)
+    train_raw = torch.FloatTensor(train_data["numeric_raw"]).to(device)
+    train_target = torch.FloatTensor(train_data["target"]).unsqueeze(1).to(device)
+    
+    val_materials = torch.LongTensor(val_data["material_ids"]).to(device)
+    val_scaled = torch.FloatTensor(val_data["numeric_features"]).to(device)
+    val_raw = torch.FloatTensor(val_data["numeric_raw"]).to(device)
+    val_target = torch.FloatTensor(val_data["target"]).unsqueeze(1).to(device)
+    
+    train_losses = []
+    val_losses = []
+    
+    print(f"Starting training for {epochs} epochs...")
+    
+    for epoch in range(epochs):
+        # 更新损失函数的epoch信息（用于动态权重）
+        loss_fn.update_epoch(epoch, epochs)
         
-    def __len__(self):
-        return len(self.X)
-    
-    def __getitem__(self, idx):
-        x = self.X[idx]
-        y = self.y[idx]
+        # 训练阶段
+        model.train()
+        optimizer.zero_grad()
         
-        if self.transform:
-            x = self.transform(x)
-            
-        return x, y
+        # 前向传播
+        pred, uncertainty, _, _ = model(train_materials, train_scaled, train_raw)
+        loss, metrics = loss_fn(pred, uncertainty, train_target, model, train_raw)
+        
+        # 反向传播
+        loss.backward()
+        
+        # 梯度裁剪，防止梯度爆炸
+        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+        
+        optimizer.step()
+        train_losses.append(loss.item())
+        
+        # 验证阶段（每10个epoch验证一次）
+        if epoch % 10 == 0:
+            model.eval()
+            with torch.no_grad():
+                val_pred, val_uncertainty, _, _ = model(val_materials, val_scaled, val_raw)
+                val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
+                val_losses.append(val_loss.item())
+                
+                # 计算R²分数
+                val_r2 = r2_score(
+                    val_target.cpu().numpy(), 
+                    val_pred.cpu().numpy()
+                )
+                
+                print(f"Epoch {epoch}: Train Loss = {loss.item():.4f}, "
+                      f"Val Loss = {val_loss.item():.4f}, Val R² = {val_r2:.4f}")
+                print(f"  Metrics: NLL = {metrics['nll']:.4f}, "
+                      f"Physics = {metrics['physics']:.4f} "
+                      f"(weight = {metrics['physics_weight']:.4f})")
+        
+        # 更新学习率
+        scheduler.step()
+        
+    return model, train_losses, val_losses
 
-def generate_synthetic_physics_data(n_samples=1000, noise_level=0.1):
-    """生成合成物理数据用于测试"""
-    np.random.seed(42)
-    
-    # 生成基础特征
-    x1 = np.random.uniform(-5, 5, n_samples)
-    x2 = np.random.uniform(-5, 5, n_samples)
-    x3 = np.random.uniform(0.1, 10, n_samples)
-    
-    # 创建物理关系（例如：简单的物理定律）
-    # y = a * x1^2 + b * log(x3) + c * x1 * x2 + noise
-    y = 2.5 * x1**2 + 3.0 * np.log(x3) + 0.5 * x1 * x2
-    
-    # 添加噪声
-    y += np.random.normal(0, noise_level, n_samples)
-    
-    # 创建额外的噪声特征
-    noise_features = np.random.randn(n_samples, 57)
-    
-    # 组合所有特征
-    X = np.column_stack([x1, x2, x3, noise_features])
-    
-    return X, y
 
-def prepare_data_loaders(X, y, batch_size=32, val_split=0.2, test_split=0.1):
-    """准备数据加载器"""
-    # 分割数据
-    X_temp, X_test, y_temp, y_test = train_test_split(
-        X, y, test_size=test_split, random_state=42
-    )
-    X_train, X_val, y_train, y_val = train_test_split(
-        X_temp, y_temp, test_size=val_split/(1-test_split), random_state=42
-    )
+def evaluate_model_detailed(model, test_data, device="cuda"):
+    """
+    详细评估模型性能，包括不确定性分析
     
-    # 标准化
-    scaler = StandardScaler()
-    X_train = scaler.fit_transform(X_train)
-    X_val = scaler.transform(X_val)
-    X_test = scaler.transform(X_test)
+    参数:
+        model: 训练好的模型
+        test_data: 测试数据字典
+        device: 计算设备
     
-    # 创建数据集
-    train_dataset = PhysicsDataset(X_train, y_train)
-    val_dataset = PhysicsDataset(X_val, y_val)
-    test_dataset = PhysicsDataset(X_test, y_test)
-    
-    # 创建数据加载器
-    train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
-    test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
-    
-    return train_loader, val_loader, test_loader, scaler
-
-def evaluate_model(model, test_loader, device='cuda'):
-    """评估模型性能"""
+    返回:
+        包含各种评估指标的结果字典
+    """
+    model = model.to(device)
     model.eval()
-    predictions = []
-    uncertainties = []
-    actuals = []
-    symbolic_preds = []
-    residuals = []
-    
+
+    # 准备数据
+    test_materials = torch.LongTensor(test_data["material_ids"]).to(device)
+    test_features = torch.FloatTensor(test_data["numeric_features"]).to(device)
+    test_raw = torch.FloatTensor(test_data["numeric_raw"]).to(device)
+    test_target = torch.FloatTensor(test_data["target"]).unsqueeze(1).to(device)
+
+    # 标准预测
     with torch.no_grad():
-        for x, y in test_loader:
-            x, y = x.to(device), y.to(device)
-            
-            y_pred, sigma_squared, c, r = model(x)
-            
-            predictions.extend(y_pred.cpu().numpy())
-            uncertainties.extend(sigma_squared.cpu().numpy())
-            actuals.extend(y.cpu().numpy())
-            symbolic_preds.extend(c.cpu().numpy())
-            residuals.extend(r.cpu().numpy())
+        test_pred, test_uncertainty, symbolic_out, residual_out = model(
+            test_materials, test_features, test_raw
+        )
+
+        # 转换为NumPy
+        test_pred_np = test_pred.cpu().squeeze().numpy()
+        test_target_np = test_target.cpu().squeeze().numpy()
+        test_uncertainty_np = test_uncertainty.cpu().squeeze().numpy()
+        symbolic_np = symbolic_out.cpu().squeeze().numpy()
+        residual_np = residual_out.cpu().squeeze().numpy()
+
+        # 计算基础指标
+        r2 = r2_score(test_target_np, test_pred_np)
+        rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
+        mae = np.mean(np.abs(test_target_np - test_pred_np))
+
+        # 计算符号表达式和残差网络的贡献
+        symbolic_contrib = np.mean(
+            np.abs(symbolic_np) / (np.abs(symbolic_np) + np.abs(residual_np) + 1e-6)
+        )
+
+        # 计算不确定性与误差的相关性
+        errors = np.abs(test_pred_np - test_target_np)
+        uncertainty_error_corr = np.corrcoef(errors, test_uncertainty_np)[0, 1]
+
+    # MC Dropout预测（带不确定性）
+    mc_pred, mc_unc, aleatoric_unc, epistemic_unc = model.predict_with_uncertainty(
+        test_materials, test_features, test_raw, n_samples=30
+    )
     
-    predictions = np.array(predictions)
-    uncertainties = np.array(uncertainties)
-    actuals = np.array(actuals)
-    symbolic_preds = np.array(symbolic_preds)
-    residuals = np.array(residuals)
-    
-    # 计算指标
-    mse = np.mean((predictions - actuals)**2)
-    rmse = np.sqrt(mse)
-    mae = np.mean(np.abs(predictions - actuals))
-    
-    # R^2分数
-    ss_res = np.sum((actuals - predictions)**2)
-    ss_tot = np.sum((actuals - np.mean(actuals))**2)
-    r2 = 1 - (ss_res / ss_tot)
-    
-    return {
-        'mse': mse,
-        'rmse': rmse,
-        'mae': mae,
-        'r2': r2,
-        'predictions': predictions,
-        'uncertainties': uncertainties,
-        'actuals': actuals,
-        'symbolic_preds': symbolic_preds,
-        'residuals': residuals
+    mc_pred_np = mc_pred.cpu().squeeze().numpy()
+    mc_unc_np = mc_unc.cpu().squeeze().numpy()
+    aleatoric_np = aleatoric_unc.cpu().squeeze().numpy()
+    epistemic_np = epistemic_unc.cpu().squeeze().numpy()
+
+    # MC Dropout指标
+    mc_r2 = r2_score(test_target_np, mc_pred_np)
+    mc_rmse = np.sqrt(mean_squared_error(test_target_np, mc_pred_np))
+
+    # 不确定性分析
+    mean_epistemic = np.mean(epistemic_np)
+    mean_aleatoric = np.mean(aleatoric_np)
+    ratio = mean_epistemic / (mean_aleatoric + 1e-6)
+
+    # 不确定性校准
+    errors = np.abs(mc_pred_np - test_target_np)
+    calibration_scores = errors / (np.sqrt(mc_unc_np) + 1e-6)
+    well_calibrated = np.mean((calibration_scores <= 2.0))
+
+    # 打印详细结果
+    print("\n===== 详细模型评估 =====")
+    print(f"标准预测:")
+    print(f"  R²: {r2:.4f}, RMSE: {rmse:.4f}, MAE: {mae:.4f}")
+    print(f"  符号表达式贡献: {symbolic_contrib:.2f} ({symbolic_contrib*100:.1f}%)")
+    print(f"  不确定性-误差相关性: {uncertainty_error_corr:.4f}")
+
+    print(f"\nMC Dropout预测:")
+    print(f"  R²: {mc_r2:.4f}, RMSE: {mc_rmse:.4f}")
+    print(f"  认知不确定性 (Epistemic): {mean_epistemic:.4f}")
+    print(f"  随机不确定性 (Aleatoric): {mean_aleatoric:.4f}")
+    print(f"  不确定性比例 (Epistemic/Aleatoric): {ratio:.4f}")
+
+    print(f"\n不确定性校准:")
+    print(f"  良好校准比例: {well_calibrated:.2f} ({well_calibrated*100:.1f}%)")
+
+    # 返回结果字典
+    results = {
+        "standard": {
+            "r2": r2, 
+            "rmse": rmse, 
+            "mae": mae,
+            "symbolic_contrib": symbolic_contrib,
+            "uncertainty_error_corr": uncertainty_error_corr
+        },
+        "mc_dropout": {
+            "r2": mc_r2, 
+            "rmse": mc_rmse
+        },
+        "uncertainty": {
+            "epistemic": mean_epistemic,
+            "aleatoric": mean_aleatoric,
+            "ratio": ratio,
+            "calibration": well_calibrated,
+        },
+        "predictions": {
+            "y_true": test_target_np,
+            "y_pred": test_pred_np,
+            "y_mc_pred": mc_pred_np,
+            "uncertainty": test_uncertainty_np,
+            "mc_uncertainty": mc_unc_np,
+            "epistemic": epistemic_np,
+            "aleatoric": aleatoric_np,
+        },
     }
 
-def plot_results(results, save_path=None):
-    """可视化结果"""
-    fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-    
-    # 1. 预测 vs 实际
-    ax = axes[0, 0]
-    ax.scatter(results['actuals'], results['predictions'], alpha=0.5)
-    ax.plot([results['actuals'].min(), results['actuals'].max()], 
-            [results['actuals'].min(), results['actuals'].max()], 'r--')
-    ax.set_xlabel('Actual Values')
-    ax.set_ylabel('Predicted Values')
-    ax.set_title(f'Predictions vs Actuals (R² = {results["r2"]:.3f})')
-    
-    # 2. 残差图
-    ax = axes[0, 1]
-    residuals = results['actuals'] - results['predictions']
-    ax.scatter(results['predictions'], residuals, alpha=0.5)
-    ax.axhline(y=0, color='r', linestyle='--')
-    ax.set_xlabel('Predicted Values')
-    ax.set_ylabel('Residuals')
-    ax.set_title('Residual Plot')
-    
-    # 3. 不确定性分布
-    ax = axes[1, 0]
-    ax.hist(np.sqrt(results['uncertainties']), bins=30, alpha=0.7)
-    ax.set_xlabel('Predicted Standard Deviation')
-    ax.set_ylabel('Frequency')
-    ax.set_title('Uncertainty Distribution')
-    
-    # 4. 符号表达式 vs 残差贡献
-    ax = axes[1, 1]
-    ax.scatter(results['symbolic_preds'], results['residuals'], alpha=0.5)
-    ax.set_xlabel('Symbolic Expression Output')
-    ax.set_ylabel('Residual Branch Output')
-    ax.set_title('Symbolic vs Residual Contributions')
-    
-    plt.tight_layout()
-    
-    if save_path:
-        plt.savefig(save_path)
-    plt.show()
-
-def main():
-    """主训练流程"""
-    # 设置设备
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    print(f"Using device: {device}")
-    
-    # 生成数据
-    print("Generating synthetic physics data...")
-    X, y = generate_synthetic_physics_data(n_samples=5000)
-    print(f"Data shape: X={X.shape}, y={y.shape}")
-    
-    # 准备数据加载器
-    train_loader, val_loader, test_loader, scaler = prepare_data_loaders(
-        X, y, batch_size=64
-    )
-    
-    # 创建模型
-    model = PGNNSymbolic(input_dim=60, latent_dim=16)
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
-    # 训练模型
-    print("\nTraining model...")
-    train_losses, val_losses = train_pgnn(
-        model, train_loader, val_loader, 
-        epochs=100, lr=1e-3, device=device
-    )
-    
-    # 评估模型
-    print("\nEvaluating model...")
-    results = evaluate_model(model, test_loader, device)
-    
-    print(f"\nTest Results:")
-    print(f"  MSE: {results['mse']:.4f}")
-    print(f"  RMSE: {results['rmse']:.4f}")
-    print(f"  MAE: {results['mae']:.4f}")
-    print(f"  R²: {results['r2']:.4f}")
-    
-    # 绘制结果
-    plot_results(results)
-    
-    # 绘制训练曲线
-    plt.figure(figsize=(10, 5))
-    plt.subplot(1, 2, 1)
-    plt.plot(train_losses, label='Train Loss')
-    plt.plot(val_losses, label='Val Loss')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training History')
-    plt.legend()
-    
-    plt.subplot(1, 2, 2)
-    plt.plot(train_losses[-50:], label='Train Loss (last 50)')
-    plt.plot(val_losses[-50:], label='Val Loss (last 50)')
-    plt.xlabel('Epoch')
-    plt.ylabel('Loss')
-    plt.title('Training History (Zoomed)')
-    plt.legend()
-    
-    plt.tight_layout()
-    plt.show()
-    
-    # 保存模型
-    torch.save({
-        'model_state_dict': model.state_dict(),
-        'scaler': scaler,
-        'train_losses': train_losses,
-        'val_losses': val_losses,
-        'test_results': results
-    }, 'pgnn_model.pth')
-    print("\nModel saved to pgnn_model.pth")
-
-# 高级功能：符号表达式提取和简化
-def extract_and_simplify_expression(model, sample_data, device='cuda'):
-    """提取并简化符号表达式"""
-    model.eval()
-    model = model.to(device)
-    sample_data = sample_data.to(device)
-    
-    with torch.no_grad():
-        z = model.encoder(sample_data)
-        
-        # 获取符号层的输出
-        op_logits = model.symbolic_layer.operator_net(z)
-        var_logits = model.symbolic_layer.variable_net(z)
-        constants = model.symbolic_layer.constant_net(z)
-        
-        # 获取最可能的操作和变量
-        op_probs = torch.softmax(op_logits, dim=-1)
-        var_probs = torch.softmax(var_logits, dim=-1)
-        
-        # 提取表达式结构
-        top_ops = torch.topk(op_probs, k=3, dim=-1)
-        top_vars = torch.topk(var_probs, k=5, dim=-1)
-        
-        expression_info = {
-            'top_operators': [(model.symbolic_layer.operators[idx], prob.item()) 
-                             for idx, prob in zip(top_ops.indices[0], top_ops.values[0])],
-            'top_variables': [(idx.item(), prob.item()) 
-                             for idx, prob in zip(top_vars.indices[0], top_vars.values[0])],
-            'constants': constants[0].cpu().numpy()
-        }
-        
-    return expression_info
-
-# 使用示例
-if __name__ == "__main__":
-    # 运行主训练流程
-    main()
-    
-    # 或者加载已保存的模型
-    # checkpoint = torch.load('pgnn_model.pth')
-    # model = PGNNSymbolic(input_dim=60, latent_dim=16)
-    # model.load_state_dict(checkpoint['model_state_dict'])
+    return results

@@ -582,7 +582,7 @@ class PhysicsInformedLoss(nn.Module):
         
         # 4. 动态权重调整
         warm_progress = max(0.0, self.current_epoch - 30) / 20
-        physics_weight = self.lambda_physics * min(1.0, warm_progress)
+        physics_weight = self.lambda_physics * min(0.3, warm_progress)
         
         # 5. 总损失
         total_loss = nll_loss + self.lambda_complexity * complexity_loss + physics_weight * physics_loss

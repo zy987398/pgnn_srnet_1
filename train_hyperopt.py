@@ -1,0 +1,696 @@
+"""
+超参数优化相关函数
+使用Optuna进行贝叶斯优化
+"""
+
+import optuna
+from optuna.trial import TrialState
+import torch
+import torch.nn as nn
+import numpy as np
+import pandas as pd
+import copy
+from sklearn.model_selection import train_test_split, StratifiedKFold
+from sklearn.metrics import r2_score, mean_squared_error
+from torch.utils.data import TensorDataset, DataLoader
+from torch.amp import autocast, GradScaler
+
+from models import MaterialCrackPGNN, GRAD_CLIP
+from losses import AdaptiveLoss
+from utils import prepare_material_data, augment_dataset, reconstruct_df
+
+
+def get_valid_latent_dim(value):
+    """确保latent_dim能被4整除（用于MultiheadAttention）"""
+    return max(16, (value // 16) * 16)
+
+
+def get_valid_embed_dim(value):
+    """确保embedding维度合适"""
+    return max(8, (value // 8) * 8)
+
+
+def create_model(trial, num_materials, space=None):
+    """
+    根据trial创建模型
+    可以使用预定义的搜索空间或默认范围
+    """
+    if space is None:
+        material_range = (8, 32)
+        latent_range = (32, 128)
+        block_range = (2, 4)
+    else:
+        material_range = space.get("material_embed_dim", (8, 32))
+        latent_range = space.get("latent_dim", (32, 128))
+        block_range = space.get("num_blocks", (2, 4))
+
+    # 模型架构超参数
+    material_embed_dim = trial.suggest_int(
+        "material_embed_dim", 
+        get_valid_embed_dim(material_range[0]), 
+        get_valid_embed_dim(material_range[1]), 
+        step=8
+    )
+
+    latent_dim = trial.suggest_int(
+        "latent_dim", 
+        int(latent_range[0]), 
+        int(latent_range[1]), 
+        step=32
+    )
+    latent_dim = get_valid_latent_dim(latent_dim)
+    
+    num_blocks = trial.suggest_int(
+        "num_blocks", 
+        int(block_range[0]), 
+        int(block_range[1])
+    )
+
+    # 创建模型
+    model = MaterialCrackPGNN(
+        num_materials=num_materials,
+        material_embed_dim=material_embed_dim,
+        latent_dim=latent_dim,
+        num_blocks=num_blocks,
+    )
+
+    # 动态调整dropout率
+    dropout_rate = trial.suggest_float("dropout_rate", 0.05, 0.2, step=0.05)
+    for module in model.modules():
+        if isinstance(module, nn.Dropout):
+            module.p = dropout_rate
+
+    return model
+
+
+def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", space=None):
+    """
+    使用给定的超参数训练模型
+    返回验证集R²分数
+    """
+    try:
+        # 训练超参数
+        lr = trial.suggest_float("lr", 5e-4, 1e-2, log=True)
+        epochs = trial.suggest_int("epochs", 100, 300, step=50)
+        batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+        weight_decay = trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True)
+
+        # 损失函数超参数
+        lambda_complexity = trial.suggest_float("lambda_complexity", 1e-6, 1e-4, log=True)
+        lambda_physics = trial.suggest_float("lambda_physics", 0.01, 0.05, step=0.01)
+
+        # 早停参数
+        patience = trial.suggest_int("patience", 15, 30, step=5)
+
+        # 其他选项
+        use_augmentation = trial.suggest_categorical("augmentation", [True, False])
+        optimizer_name = trial.suggest_categorical("optimizer", ["AdamW", "RMSprop"])
+
+        # 创建模型
+        model = create_model(trial, num_materials, space).to(device)
+
+        # 创建优化器
+        if optimizer_name == "AdamW":
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=lr, weight_decay=weight_decay
+            )
+        else:
+            optimizer = torch.optim.RMSprop(
+                model.parameters(), lr=lr, weight_decay=weight_decay
+            )
+
+        # 学习率调度
+        warmup_epochs = min(10, epochs // 10)
+        def lr_lambda(epoch):
+            if epoch < warmup_epochs:
+                return epoch / warmup_epochs
+            else:
+                progress = (epoch - warmup_epochs) / (epochs - warmup_epochs)
+                return 0.5 * (1 + np.cos(np.pi * progress))
+
+        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+
+        # 损失函数
+        loss_fn = AdaptiveLoss(
+            lambda_complexity=lambda_complexity,
+            lambda_physics=lambda_physics,
+        )
+        loss_fn.total_epochs = epochs
+        scaler = GradScaler()
+
+        # 准备数据
+        train_df = reconstruct_df(train_data)
+        if use_augmentation:
+            train_df = augment_dataset(train_df)
+
+        augmented_train_data = prepare_material_data(
+            train_df,
+            scaler=train_data["scaler"],
+            le=train_data["label_encoder"],
+            verbose=False,
+        )
+
+        # 创建DataLoader
+        train_dataset = TensorDataset(
+            torch.LongTensor(augmented_train_data["material_ids"]),
+            torch.FloatTensor(augmented_train_data["numeric_features"]),
+            torch.FloatTensor(augmented_train_data["numeric_raw"]),
+            torch.FloatTensor(augmented_train_data["target"]).unsqueeze(1),
+        )
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            drop_last=False,
+            pin_memory=True,
+            num_workers=0,
+        )
+
+        # 验证数据
+        val_materials = torch.LongTensor(val_data["material_ids"]).to(device)
+        val_features = torch.FloatTensor(val_data["numeric_features"]).to(device)
+        val_raw = torch.FloatTensor(val_data["numeric_raw"]).to(device)
+        val_target = torch.FloatTensor(val_data["target"]).unsqueeze(1).to(device)
+
+        # 训练循环
+        best_val_r2 = -float("inf")
+        patience_counter = 0
+        best_model_wts = None
+        min_epochs_before_pruning = 10
+
+        for epoch in range(epochs):
+            loss_fn.update_epoch(epoch, epochs)
+
+            # 训练
+            model.train()
+            epoch_loss = 0
+
+            for batch_materials, batch_features, batch_raw, batch_target in train_loader:
+                batch_materials = batch_materials.to(device, non_blocking=True)
+                batch_features = batch_features.to(device, non_blocking=True)
+                batch_raw = batch_raw.to(device, non_blocking=True)
+                batch_target = batch_target.to(device, non_blocking=True)
+
+                optimizer.zero_grad(set_to_none=True)
+
+                try:
+                    with autocast(device_type=device):
+                        pred, uncertainty, symbolic, residual = model(
+                            batch_materials, batch_features, batch_raw
+                        )
+                        loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
+
+                    # 检查NaN
+                    if torch.isnan(loss) or torch.isinf(loss):
+                        print(f"Warning: NaN or Inf loss detected in epoch {epoch}")
+                        if epoch < min_epochs_before_pruning:
+                            return 0.0
+                        elif best_model_wts is not None:
+                            model.load_state_dict(best_model_wts)
+                            continue
+                        else:
+                            return 0.0
+
+                    # 反向传播
+                    scaler.scale(loss).backward()
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                    scaler.step(optimizer)
+                    scaler.update()
+
+                    epoch_loss += loss.item() * batch_target.size(0)
+                    
+                except RuntimeError as e:
+                    print(f"Runtime error in batch training: {e}")
+                    if 'out of memory' in str(e).lower():
+                        torch.cuda.empty_cache()
+                        return 0.0
+                    else:
+                        return 0.0
+
+            epoch_loss /= len(train_dataset)
+
+            # 验证
+            model.eval()
+            try:
+                with torch.no_grad(), autocast(device_type=device):
+                    val_pred, val_uncertainty, _, _ = model(
+                        val_materials, val_features, val_raw
+                    )
+                    val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
+
+                    val_pred_np = val_pred.cpu().squeeze().numpy()
+                    val_target_np = val_target.cpu().squeeze().numpy()
+
+                    val_r2 = r2_score(val_target_np, val_pred_np)
+
+                # 早停检查
+                if val_r2 > best_val_r2:
+                    best_val_r2 = val_r2
+                    patience_counter = 0
+                    best_model_wts = copy.deepcopy(model.state_dict())
+                else:
+                    patience_counter += 1
+
+                if patience_counter >= patience:
+                    print(f"Early stopping at epoch {epoch}")
+                    break
+
+                # 向Optuna报告中间结果
+                trial.report(val_r2, epoch)
+                
+                # 更新学习率
+                scheduler.step()
+
+                # 剪枝检查
+                if trial.should_prune() and epoch >= min_epochs_before_pruning:
+                    raise optuna.TrialPruned()
+            
+            except Exception as e:
+                print(f"Error in validation: {e}")
+                return 0.0
+
+        # 恢复最佳模型权重
+        if best_model_wts is not None:
+            model.load_state_dict(best_model_wts)
+
+        return best_val_r2
+
+    except Exception as e:
+        print(f"Trial failed with error: {e}")
+        return 0.0
+
+
+def objective(trial, df, device, seed, space=None):
+    """
+    Optuna目标函数，使用交叉验证
+    """
+    try:
+        n_splits = 3  # 3折交叉验证
+        skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
+        fold_scores = []
+        
+        for fold_idx, (train_idx, val_idx) in enumerate(skf.split(df, df["材料种类"])):
+            print(f"Training fold {fold_idx+1}/{n_splits}")
+            train_df = df.iloc[train_idx]
+            val_df = df.iloc[val_idx]
+
+            train_data = prepare_material_data(train_df, verbose=False)
+            val_data = prepare_material_data(
+                val_df,
+                scaler=train_data["scaler"],
+                le=train_data["label_encoder"],
+                verbose=False,
+            )
+            num_materials = train_data["num_materials"]
+
+            r2 = train_with_trial(trial, train_data, val_data, num_materials, device, space)
+            fold_scores.append(r2)
+            
+            # 如果前两折表现很差，提前终止
+            if fold_idx >= 1 and np.mean(fold_scores) < 0.1:
+                print(f"Early terminating cross-validation with mean R2: {np.mean(fold_scores):.4f}")
+                fold_scores.extend([0.0] * (n_splits - len(fold_scores)))
+                break
+
+        mean_score = float(np.mean(fold_scores))
+        print(f"Trial completed with mean R2: {mean_score:.4f}")
+        return mean_score
+    
+    except Exception as e:
+        print(f"Error in objective function: {e}")
+        return 0.0
+
+
+def run_hyperopt(
+    data_path: str = "3011916164精确材料性能数据.csv",
+    n_trials_stage1: int = 20,
+    n_trials_stage2: int = 10,
+    top_k: int = 3,
+    seed: int = 42,
+):
+    """
+    双阶段超参数搜索
+    Stage 1: 随机搜索进行粗略探索
+    Stage 2: TPE在promising区域精细搜索
+    """
+    # 设置随机种子
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    # 加载数据
+    try:
+        df = pd.read_csv(data_path)
+        print(f"Loaded dataset with {len(df)} samples")
+    except Exception as e:
+        print(f"Error loading data: {e}")
+        return None
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"Using device: {device}")
+
+    # 阶段1: 随机搜索
+    print(f"\nStarting Stage 1: Initial search with {n_trials_stage1} trials")
+    study1 = optuna.create_study(
+        direction="maximize",
+        sampler=optuna.samplers.RandomSampler(seed=seed),
+    )
+    
+    study1.optimize(
+        lambda trial: objective(trial, df, device, seed),
+        n_trials=n_trials_stage1,
+        timeout=3600,
+        show_progress_bar=True,
+        catch=(Exception,),
+    )
+    
+    # 获取第一阶段的最佳参数
+    completed_trials = [t for t in study1.trials if t.state == TrialState.COMPLETE]
+    if not completed_trials:
+        print("WARNING: No trials completed in Stage 1")
+        return study1
+        
+    # 根据阶段1结果定义收缩后的搜索空间
+    space = define_refined_space(completed_trials, top_k)
+
+    # 阶段2: TPE微调
+    print(f"\nStarting Stage 2: Fine-tuning with {n_trials_stage2} trials")
+    study2 = optuna.create_study(
+        direction="maximize", 
+        sampler=optuna.samplers.TPESampler(seed=seed)
+    )
+
+    study2.optimize(
+        lambda trial: objective(trial, df, device, seed, space),
+        n_trials=n_trials_stage2,
+        timeout=3600,
+        show_progress_bar=True,
+        catch=(Exception,),
+    )
+
+    # 选择最佳study
+    if study2.best_value > study1.best_value:
+        final_study = study2
+    else:
+        final_study = study1
+        
+    print_optimization_results(final_study)
+    
+    return final_study
+
+
+def define_refined_space(completed_trials, top_k):
+    """
+    根据第一阶段结果定义精细搜索空间
+    """
+    # 默认边界
+    global_bounds = {
+        "material_embed_dim": (8, 24),
+        "latent_dim": (32, 64),
+        "num_blocks": (2, 2),
+        "dropout_rate": (0.05, 0.15),
+        "lr": (5e-4, 2e-3),
+        "epochs": (100, 200),
+        "batch_size": [16, 32],
+        "weight_decay": (1e-5, 5e-4),
+        "lambda_complexity": (1e-6, 5e-5),
+        "lambda_physics": (0.01, 0.05),
+        "patience": (15, 25),
+        "augmentation": [True, False],
+        "optimizer": ["AdamW", "RMSprop"],
+    }
+    
+    # 获取最佳trials
+    top_trials = sorted(
+        completed_trials,
+        key=lambda t: t.value,
+        reverse=True,
+    )[:top_k]
+    
+    space = {}
+    for name, bounds in global_bounds.items():
+        if isinstance(bounds, tuple):
+            vals = [t.params.get(name, bounds[0]) for t in top_trials if name in t.params]
+            if vals:
+                low = max(bounds[0], min(vals))
+                high = min(bounds[1], max(vals))
+                span = high - low
+                if span > 0:
+                    space[name] = (
+                        max(bounds[0], low - span * 0.3),
+                        min(bounds[1], high + span * 0.3),
+                    )
+                else:
+                    space[name] = (low * 0.9, low * 1.1) if low > 0 else (low - 0.1, low + 0.1)
+            else:
+                space[name] = bounds
+        else:
+            vals = list({t.params.get(name) for t in top_trials if name in t.params})
+            space[name] = vals if vals else bounds
+            
+    return space
+
+
+def print_optimization_results(study):
+    """打印优化结果"""
+    print("\n" + "=" * 50)
+    print("优化完成!")
+    print("=" * 50)
+
+    if hasattr(study, 'best_value'):
+        print(f"\n最佳验证R²: {study.best_value:.4f}")
+        print("\n最佳超参数:")
+        for key, value in study.best_params.items():
+            print(f"  {key}: {value}")
+            
+        # 统计信息
+        completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
+        print(f"\n完成的trials: {len(completed_trials)}/{len(study.trials)}")
+        
+        # 超参数重要性
+        try:
+            importance = optuna.importance.get_param_importances(study)
+            print("\n超参数重要性:")
+            for key, value in sorted(importance.items(), key=lambda x: x[1], reverse=True):
+                print(f"  {key}: {value:.3f}")
+        except:
+            pass
+
+
+def retrain_with_best_params(
+    study, data_path="3011916164精确材料性能数据.csv", seed=42
+):
+    """
+    使用最佳超参数重新训练模型
+    在完整数据集上训练并在测试集上评估
+    """
+    # 获取最佳参数
+    if not hasattr(study, 'best_params'):
+        print("No best params found, using defaults")
+        return None, [], []
+        
+    best_params = study.best_params
+
+    # 读取数据
+    df = pd.read_csv(data_path)
+    train_df, test_df = train_test_split(df, test_size=0.2, random_state=seed)
+
+    train_data = prepare_material_data(train_df, verbose=False)
+    test_data = prepare_material_data(
+        test_df,
+        scaler=train_data["scaler"],
+        le=train_data["label_encoder"],
+        verbose=False,
+    )
+
+    # 创建模型
+    model = MaterialCrackPGNN(
+        num_materials=train_data["num_materials"],
+        material_embed_dim=best_params.get("material_embed_dim", 16),
+        latent_dim=best_params.get("latent_dim", 64),
+        dropout_rate=best_params.get("dropout_rate", 0.1),
+        num_blocks=best_params.get("num_blocks", 3),
+    )
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = model.to(device)
+
+    # 准备数据
+    use_augmentation = best_params.get("augmentation", True)
+    train_df_aug = train_df.copy()
+    
+    if use_augmentation:
+        train_df_aug = augment_dataset(train_df_aug)
+        
+    augmented_train_data = prepare_material_data(
+        train_df_aug,
+        scaler=train_data["scaler"],
+        le=train_data["label_encoder"],
+        verbose=False,
+    )
+
+    # DataLoader
+    batch_size = best_params.get("batch_size", 32)
+    train_dataset = TensorDataset(
+        torch.LongTensor(augmented_train_data["material_ids"]),
+        torch.FloatTensor(augmented_train_data["numeric_features"]),
+        torch.FloatTensor(augmented_train_data["numeric_raw"]),
+        torch.FloatTensor(augmented_train_data["target"]).unsqueeze(1),
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=False,
+        pin_memory=True,
+    )
+
+    test_materials = torch.LongTensor(test_data["material_ids"]).to(device)
+    test_features = torch.FloatTensor(test_data["numeric_features"]).to(device)
+    test_raw = torch.FloatTensor(test_data["numeric_raw"]).to(device)
+    test_target = torch.FloatTensor(test_data["target"]).unsqueeze(1).to(device)
+
+    # 优化器
+    lr = best_params.get("lr", 1e-3)
+    if best_params.get("optimizer", "AdamW") == "AdamW":
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=lr, weight_decay=best_params.get("weight_decay", 1e-4)
+        )
+    else:
+        optimizer = torch.optim.RMSprop(
+            model.parameters(), lr=lr, weight_decay=best_params.get("weight_decay", 1e-4)
+        )
+
+    # 学习率调度
+    epochs = best_params.get("epochs", 100)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode='max', factor=0.5, patience=5, verbose=True,
+        min_lr=1e-5, cooldown=5
+    )
+
+    # 损失函数
+    loss_fn = AdaptiveLoss(
+        lambda_complexity=best_params.get("lambda_complexity", 1e-5),
+        lambda_physics=best_params.get("lambda_physics", 0.05),
+    )
+    loss_fn.total_epochs = epochs
+    scaler = GradScaler()
+
+    # 训练
+    print("\n使用最佳超参数重新训练...")
+    train_losses = []
+    test_r2_history = []
+    best_model_wts, best_test_r2, patience_ctr = None, -1e9, 0
+    best_epoch = 0
+
+    for epoch in range(epochs):
+        loss_fn.update_epoch(epoch, epochs)
+
+        # 训练
+        model.train()
+        epoch_loss = 0
+
+        for batch_materials, batch_features, batch_raw, batch_target in train_loader:
+            batch_materials = batch_materials.to(device, non_blocking=True)
+            batch_features = batch_features.to(device, non_blocking=True)
+            batch_raw = batch_raw.to(device, non_blocking=True)
+            batch_target = batch_target.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+
+            try:
+                with autocast(device_type=device):
+                    pred, uncertainty, _, _ = model(
+                        batch_materials, batch_features, batch_raw
+                    )
+                    loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
+
+                # 检查NaN
+                if torch.isnan(loss) or torch.isinf(loss) or loss > 1000:
+                    print(f"NaN/Inf loss detected in epoch {epoch}")
+                    continue
+
+                # 反向传播
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+                scaler.step(optimizer)
+                scaler.update()
+
+                epoch_loss += loss.item() * batch_target.size(0)
+                
+            except Exception as e:
+                print(f"Error in batch training: {e}")
+                continue
+
+        epoch_loss /= len(train_dataset)
+        train_losses.append(epoch_loss)
+
+        # 评估
+        model.eval()
+        with torch.no_grad(), autocast(device_type=device):
+            test_pred, test_uncertainty, _, _ = model(
+                test_materials, test_features, test_raw
+            )
+            test_pred_np = test_pred.cpu().squeeze().numpy()
+            test_target_np = test_target.cpu().squeeze().numpy()
+
+            test_r2 = r2_score(test_target_np, test_pred_np)
+            test_rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
+            test_r2_history.append(test_r2)
+
+        if (epoch + 1) % 10 == 0 or epoch == 0:
+            current_lr = optimizer.param_groups[0]["lr"]
+            print(f"Epoch {epoch+1}: LR={current_lr:.6f}, "
+                  f"Test R²={test_r2:.4f}, RMSE={test_rmse:.4f}")
+
+        # 保存最佳模型
+        if test_r2 > best_test_r2:
+            best_test_r2 = test_r2
+            best_model_wts = copy.deepcopy(model.state_dict())
+            best_epoch = epoch + 1
+            patience_ctr = 0
+        else:
+            patience_ctr += 1
+
+        # 早停
+        patience = best_params.get("patience", 20)
+        if patience_ctr >= patience:
+            print(f"Early stopping at epoch {epoch+1}")
+            break
+
+        # 更新学习率
+        scheduler.step(test_r2)
+
+    # 恢复最佳权重
+    if best_model_wts is not None:
+        model.load_state_dict(best_model_wts)
+
+    # 最终评估
+    model.eval()
+    with torch.no_grad(), autocast(device_type=device):
+        test_pred, test_uncertainty, _, _ = model(
+            test_materials, test_features, test_raw
+        )
+        test_pred_np = test_pred.cpu().squeeze().numpy()
+        test_target_np = test_target.cpu().squeeze().numpy()
+
+        final_r2 = r2_score(test_target_np, test_pred_np)
+        final_rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
+
+    # MC Dropout预测
+    mc_pred, mc_unc, aleatoric_unc, epistemic_unc = model.predict_with_uncertainty(
+        test_materials, test_features, test_raw, n_samples=20
+    )
+    mc_pred_np = mc_pred.cpu().squeeze().numpy()
+    mc_r2 = r2_score(test_target_np, mc_pred_np)
+    mc_rmse = np.sqrt(mean_squared_error(test_target_np, mc_pred_np))
+
+    print(f"\n最终测试集性能:")
+    print(f"  标准预测 R²: {final_r2:.4f}, RMSE: {final_rmse:.4f}")
+    print(f"  MC预测 R²: {mc_r2:.4f}, RMSE: {mc_rmse:.4f}")
+    print(f"  最佳epoch: {best_epoch}")
+
+    return model, train_losses, test_r2_history

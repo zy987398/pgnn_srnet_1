@@ -127,7 +127,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
     """使用给定的超参数训练模型"""
     try:
         # 训练超参数 - 缩小学习率范围
-        lr = trial.suggest_float("lr", 5e-4, 1e-3)  # More narrow range
+        lr = trial.suggest_float("lr", 5e-4, 1e-2, log=True)  # More narrow range
         epochs = trial.suggest_int("epochs", 100, 300, step=50)  # 减小上下限
         batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
 
@@ -419,8 +419,8 @@ def objective(trial, df, device, seed, space=None):
 
 def run_hyperopt(
     data_path: str = "3011916164精确材料性能数据.csv",
-    n_trials_stage1: int = 20,  # 减少试验次数
-    n_trials_stage2: int = 10,  # 减少试验次数
+    n_trials_stage1: int = 20,  # stage1的试验次数
+    n_trials_stage2: int = 10,  # stage2的试验次数
     top_k: int = 3,
     seed: int = 42,
 ):

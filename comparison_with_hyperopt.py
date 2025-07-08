@@ -29,7 +29,7 @@ from sklearn.linear_model import ElasticNet
 from sklearn.neural_network import MLPRegressor
 
 # PGNN imports
-from material_crack_pgnn import (
+from improved_material_crack_pgnn import (
     MaterialCrackPGNN,
     PhysicsInformedLoss,
     prepare_material_data,
