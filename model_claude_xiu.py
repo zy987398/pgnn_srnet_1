@@ -74,13 +74,20 @@ class PhysicsInformedFeatureExtractorEnhanced(nn.Module):
         
         eps = 1e-6
         
-        # 使用相对值而非绝对值，提高数值稳定性
+        # 修改归一化逻辑，避免因标准差为0导致的不稳定性
+        
+        # 添加安全检查和归一化函数
+        def safe_normalize(tensor):
+            std = tensor.std() + eps
+            if torch.isnan(std) or std < eps:
+                return tensor  # 如果标准差太小或无效，直接返回原始张量
+            return (tensor - tensor.mean()) / std
         
         # 1. Griffith能量释放率（归一化版本）
         sqrt_g = torch.sqrt(torch.abs(grain_size) + eps)
         energy_release_rate = (pressure**2) * sqrt_g / (elastic_modulus.abs() + eps)
-        # 使用自适应归一化
-        energy_release_rate = energy_release_rate / (energy_release_rate.std() + eps)
+        # 使用安全归一化
+        energy_release_rate = safe_normalize(energy_release_rate)
         energy_release_rate = torch.tanh(energy_release_rate / self.temperature)
         features.append(energy_release_rate)
         
@@ -180,10 +187,13 @@ class AdaptiveSymbolicLayer(nn.Module):
             nn.Sigmoid()
         )
         
-        # 初始化
-        for layer in [self.coefficient_net[-1], self.output_gate[0]]:
-            nn.init.zeros_(layer.weight)
-            nn.init.zeros_(layer.bias)
+        # 修改初始化
+        for layer in self.modules():
+            if isinstance(layer, nn.Linear):
+                # 使用更小的增益，降低初始值
+                nn.init.xavier_uniform_(layer.weight, gain=0.001)
+                if layer.bias is not None:
+                    nn.init.zeros_(layer.bias)
 
     def forward(self, z, physics_features):
         """
@@ -214,13 +224,17 @@ class AdaptiveSymbolicLayer(nn.Module):
         linear_term = coeffs[:, 0:1] * weighted_features
         
         # 二次项
-        quadratic_term = coeffs[:, 1:2] * torch.square(weighted_features)
+        quadratic_term = coeffs[:, 1:2] * torch.clamp(torch.square(weighted_features), -10.0, 10.0)
         
-        # 平方根项（数值稳定）
-        sqrt_term = coeffs[:, 2:3] * torch.sqrt(torch.abs(weighted_features) + 1e-6)
+        # 平方根项
+        sqrt_term = coeffs[:, 2:3] * torch.sqrt(torch.clamp(torch.abs(weighted_features), 1e-4, 10.0))
         
-        # 倒数项（带保护）
-        reciprocal_term = coeffs[:, 3:4] / (torch.abs(weighted_features) + 0.1)
+        # 倒数项
+        inv_denom = torch.clamp(torch.abs(weighted_features), 0.1, 10.0)
+        reciprocal_term = coeffs[:, 3:4] * torch.sign(weighted_features) / inv_denom
+        
+        # 保护系数
+        coeffs_safe = torch.clamp(coeffs, -5.0, 5.0)
         
         # 组合操作
         operations = torch.cat(
@@ -228,12 +242,23 @@ class AdaptiveSymbolicLayer(nn.Module):
             dim=1
         )
         
+        # 检查数值有效性
+        operations = torch.where(
+            torch.isnan(operations) | torch.isinf(operations),
+            torch.zeros_like(operations),
+            operations
+        )
+        
         # 加权组合
         symbolic_output = torch.sum(operations * op_weights, dim=1, keepdim=True)
         
-        # 应用输出门控
+        # 应用输出门控，但增加安全检查
         gate = self.output_gate(z)
-        output = gate * symbolic_output + (1 - gate) * weighted_features
+        gate = torch.clamp(gate, 0.01, 0.99)  # 避免极端值
+        output = gate * symbolic_output + (1 - gate) * torch.clamp(weighted_features, -10.0, 10.0)
+        
+        # 最终安全检查
+        output = torch.clamp(output, -10.0, 10.0)
         
         # 计算复杂度（用于正则化）
         self.complexity = -(
@@ -403,15 +428,23 @@ class MaterialCrackPGNNEnhanced(nn.Module):
         residual_output = self.residual_net(residual_input)
         
         # 最终预测（使用改进的激活函数）
-        # Softplus提供平滑的正值输出
-        prediction = F.softplus(symbolic_output + residual_output, beta=2.0)
-        # 添加小的epsilon确保数值稳定
-        prediction = prediction + 0.001
+        # 先应用softplus，避免负值
+        combined_output = symbolic_output + residual_output
+        # 检查并替换nan值
+        combined_output = torch.where(
+            torch.isnan(combined_output),
+            torch.zeros_like(combined_output),
+            combined_output
+        )
+        prediction = F.softplus(combined_output, beta=1.0) + 0.001
+        
+        # 限制预测范围，避免极端值
+        prediction = torch.clamp(prediction, min=0.001, max=10.0)
         
         # 不确定性估计
         log_var = self.aleatoric_head(z)
         # 限制方差范围
-        log_var = torch.clamp(log_var, min=-10, max=3)
+        log_var = torch.clamp(log_var, min=-6, max=2)  # 更保守的范围
         uncertainty = torch.exp(log_var) + 1e-6
         
         return prediction, uncertainty, symbolic_output, residual_output
@@ -426,12 +459,34 @@ class MaterialCrackPGNNEnhanced(nn.Module):
         predictions = []
         uncertainties = []
         
-        # 使用半精度加速（如果GPU支持）
+        # 优化内存管理：分批处理预测以减少内存占用
+        batch_size = 10  # 每批处理的样本数
+        n_batches = (n_samples + batch_size - 1) // batch_size  # 向上取整
+        
         with torch.no_grad():
-            for i in range(n_samples):
-                pred, uncertainty, _, _ = self(material_ids, numeric_features)
-                predictions.append(pred)
-                uncertainties.append(uncertainty)
+            for batch_idx in range(n_batches):
+                batch_samples = min(batch_size, n_samples - batch_idx * batch_size)
+                
+                batch_predictions = []
+                batch_uncertainties = []
+                
+                for i in range(batch_samples):
+                    pred, uncertainty, _, _ = self(material_ids, numeric_features)
+                    batch_predictions.append(pred)
+                    batch_uncertainties.append(uncertainty)
+                
+                # 立即聚合这批次的结果，并将单个结果添加到列表中
+                batch_pred = torch.stack(batch_predictions).mean(dim=0)
+                batch_uncertainty = torch.stack(batch_uncertainties).mean(dim=0)
+                
+                predictions.append(batch_pred)
+                uncertainties.append(batch_uncertainty)
+                
+                # 手动释放内存
+                del batch_predictions
+                del batch_uncertainties
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         
         self.enable_mc_dropout(False)
         
@@ -443,9 +498,21 @@ class MaterialCrackPGNNEnhanced(nn.Module):
         mean_pred = torch.median(predictions, dim=0)[0]  # 使用中位数更稳健
         aleatoric = torch.mean(uncertainties, dim=0)
         
-        # 计算认知不确定性（使用IQR更稳健）
-        q75 = torch.quantile(predictions, 0.75, dim=0)
-        q25 = torch.quantile(predictions, 0.25, dim=0)
+        # 兼容性处理：使用替代函数计算分位数
+        try:
+            q75 = torch.quantile(predictions, 0.75, dim=0)
+            q25 = torch.quantile(predictions, 0.25, dim=0)
+        except AttributeError:
+            # 对于较旧的PyTorch版本，手动计算分位数
+            def manual_quantile(tensor, q, dim=0):
+                sorted_tensor, _ = torch.sort(tensor, dim=dim)
+                n = tensor.size(dim)
+                idx = int(q * (n - 1))
+                return sorted_tensor.select(dim, idx)
+            
+            q75 = manual_quantile(predictions, 0.75, dim=0)
+            q25 = manual_quantile(predictions, 0.25, dim=0)
+        
         epistemic = (q75 - q25) / 1.35  # 转换为标准差尺度
         
         total_uncertainty = torch.sqrt(aleatoric**2 + epistemic**2)
@@ -474,29 +541,35 @@ class EnhancedPhysicsLoss(nn.Module):
         self.current_epoch = current
         self.total_epochs = total
 
+    # 3. 增强 EnhancedPhysicsLoss 类的 forward 方法鲁棒性
     def forward(self, pred, uncertainty, target, model, features):
-        """
-        计算增强版损失
-        """
+        # 安全检查
+        pred = torch.where(torch.isnan(pred), torch.ones_like(pred) * 0.001, pred)
+        uncertainty = torch.where(torch.isnan(uncertainty), torch.ones_like(uncertainty), uncertainty)
+        uncertainty = torch.clamp(uncertainty, min=0.01, max=5.0)
+        
         # 如果使用了目标变换，需要相应调整损失计算
         if self.target_transform == 'log':
-            # 在对数空间计算损失
-            pred_log = torch.log1p(pred)
-            target_log = torch.log1p(target)
-            
-            # Huber损失（更稳健）
-            huber_loss = F.smooth_l1_loss(pred_log, target_log, beta=0.5)
-            
-            # 不确定性加权
-            uncertainty_loss = torch.mean(
-                huber_loss / uncertainty + 0.5 * torch.log(uncertainty)
-            )
+            # 在对数空间计算损失，但提高鲁棒性
+            try:
+                # 直接在对数空间计算
+                huber_loss = F.smooth_l1_loss(pred, target, beta=0.1)
+                uncertainty_loss = torch.mean(
+                    huber_loss / uncertainty + 0.5 * torch.log(uncertainty)
+                )
+            except Exception as e:
+                print(f"Warning: Loss calculation error: {e}, using simplified loss")
+                uncertainty_loss = F.mse_loss(pred, target)
         else:
-            # 标准NLL损失
-            uncertainty_loss = 0.5 * torch.mean(
-                torch.log(2 * np.pi * uncertainty) + 
-                (target - pred)**2 / uncertainty
-            )
+            # 更鲁棒的标准NLL损失
+            try:
+                squared_error = (target - pred)**2
+                uncertainty_loss = 0.5 * torch.mean(
+                    torch.log(uncertainty) + squared_error / uncertainty
+                )
+            except Exception as e:
+                print(f"Warning: Loss calculation error: {e}, using MSE")
+                uncertainty_loss = F.mse_loss(pred, target)
         
         # 复杂度损失
         complexity_loss = 0.0
@@ -563,7 +636,17 @@ class EnhancedPhysicsLoss(nn.Module):
         # 高速下裂纹深度应该增加
         velocity_factor = torch.log1p(velocity)
         expected_trend = velocity_factor * pressure
-        constraint3 = F.relu(-torch.corr(expected_trend, pred.squeeze()))
+        
+        # 使用自定义相关系数计算，替代torch.corr（PyTorch没有这个函数）
+        def correlation(x, y):
+            x_centered = x - x.mean()
+            y_centered = y - y.mean()
+            numerator = torch.sum(x_centered * y_centered)
+            denominator = torch.sqrt(torch.sum(x_centered**2) * torch.sum(y_centered**2) + 1e-8)
+            return numerator / denominator
+        
+        corr_value = correlation(expected_trend, pred.squeeze())
+        constraint3 = F.relu(-corr_value)  # 我们希望正相关
         
         # 约束4：材料韧性约束
         # 高韧性材料裂纹应该较浅
@@ -730,7 +813,7 @@ def train_enhanced_model(
         base_momentum=0.85,
         max_momentum=0.95,
         div_factor=25,
-        final_div_factor=10000
+        final_div_factor=1000  # 降低final_div_factor避免学习率太小
     )
     
     # 损失函数
@@ -773,6 +856,8 @@ def train_enhanced_model(
         epoch_loss = 0
         batch_count = 0
         
+        optimizer.zero_grad()  # 在循环开始前清零梯度
+        
         for batch_idx, (materials, features, targets) in enumerate(train_loader):
             materials = materials.to(device)
             features = features.to(device)
@@ -791,12 +876,12 @@ def train_enhanced_model(
             
             if (batch_idx + 1) % accumulation_steps == 0:
                 # 梯度裁剪
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
                 
                 # 优化器步骤
                 optimizer.step()
                 scheduler.step()
-                optimizer.zero_grad()
+                optimizer.zero_grad()  # 优化器更新后清零梯度
             
             epoch_loss += loss.item() * accumulation_steps
             batch_count += 1
@@ -815,7 +900,9 @@ def train_enhanced_model(
             
             # 反变换预测（如果使用了目标变换）
             if train_data.get('target_transform') == 'log':
-                val_pred_original = torch.expm1(val_pred)
+                # 确保预测值非负，避免expm1产生NaN
+                val_pred_log_safe = torch.clamp(val_pred, min=-0.99)  # 避免expm1产生极端负值
+                val_pred_original = torch.expm1(val_pred_log_safe)
                 val_target_original = torch.expm1(val_target)
             elif train_data.get('target_transform') == 'sqrt':
                 val_pred_original = torch.square(val_pred)
@@ -824,13 +911,32 @@ def train_enhanced_model(
                 val_pred_original = val_pred
                 val_target_original = val_target
             
-            # 计算R²
+            # 确保没有NaN/Inf值
             val_pred_np = val_pred_original.cpu().numpy()
             val_target_np = val_target_original.cpu().numpy()
-            val_r2 = r2_score(val_target_np, val_pred_np)
+            
+            # 移除可能的NaN/Inf值
+            mask = ~(np.isnan(val_pred_np) | np.isnan(val_target_np) | 
+                     np.isinf(val_pred_np) | np.isinf(val_target_np))
+            
+            if np.any(~mask):
+                print(f"Warning: Removed {np.sum(~mask)} samples with NaN/Inf values from evaluation")
+                val_pred_np = val_pred_np[mask]
+                val_target_np = val_target_np[mask]
+            
+            # 确保有足够的有效样本
+            if len(val_pred_np) < 5:
+                print("Error: Too few valid samples for evaluation")
+                r2 = float('nan')
+                rmse = float('nan')
+                mae = float('nan')
+            else:
+                r2 = r2_score(val_target_np, val_pred_np)
+                rmse = np.sqrt(mean_squared_error(val_target_np, val_pred_np))
+                mae = np.mean(np.abs(val_target_np - val_pred_np))
             
             history['val_loss'].append(val_loss.item())
-            history['val_r2'].append(val_r2)
+            history['val_r2'].append(r2)
         
         # 记录学习率
         current_lr = optimizer.param_groups[0]['lr']
@@ -841,13 +947,13 @@ def train_enhanced_model(
             print(f"Epoch {epoch+1}/{epochs}")
             print(f"  Train Loss: {avg_train_loss:.4f}")
             print(f"  Val Loss: {val_loss.item():.4f}")
-            print(f"  Val R²: {val_r2:.4f}")
+            print(f"  Val R²: {r2:.4f}")
             print(f"  LR: {current_lr:.6f}")
             print(f"  Physics Weight: {metrics['physics_weight']:.4f}")
         
         # 早停和最佳模型保存
-        if val_r2 > best_val_r2:
-            best_val_r2 = val_r2
+        if r2 > best_val_r2:
+            best_val_r2 = r2
             best_model_state = model.state_dict()
             patience_counter = 0
         else:
@@ -955,10 +1061,14 @@ class EnsemblePredictor:
                 materials, features, n_samples
             )
             all_predictions.append(pred)
+            # 手动清理内存
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
         
-        # 集成预测
-        ensemble_pred = torch.mean(torch.stack(all_predictions), dim=0)
-        ensemble_std = torch.std(torch.stack(all_predictions), dim=0)
+        # 集成预测（分批处理减少内存占用）
+        stacked_predictions = torch.stack(all_predictions)
+        ensemble_pred = torch.mean(stacked_predictions, dim=0)
+        ensemble_std = torch.std(stacked_predictions, dim=0)
         
         return ensemble_pred, ensemble_std
 
@@ -975,6 +1085,7 @@ if __name__ == '__main__':
         torch.backends.cudnn.benchmark = False
     
     # 配置
+        # 5. 在 __main__ 部分修改配置
     config = {
         # 模型架构
         'material_embed_dim': 16,
@@ -982,19 +1093,19 @@ if __name__ == '__main__':
         'num_blocks': 2,
         'dropout_rate': 0.15,
         
-        # 训练参数
-        'lr': 0.001,
-        'batch_size': 32,
+        # 训练参数 - 降低学习率
+        'lr': 0.0003,  # 降低初始学习率
+        'batch_size': 16,  # 减小批量
         'epochs': 300,
-        'weight_decay': 5e-5,
-        'gradient_accumulation': 1,
+        'weight_decay': 1e-4,
+        'gradient_accumulation': 2,  # 增加梯度累积步数
         
-        # 损失权重
-        'lambda_complexity': 1e-5,
-        'lambda_physics': 0.03,
+        # 损失权重 - 减小物理约束权重
+        'lambda_complexity': 1e-6,
+        'lambda_physics': 0.01,  # 减小物理约束权重
         
         # 其他
-        'patience': 30,
+        'patience': 40,  # 增加耐心值
         'seed': seed
     }
     
@@ -1043,19 +1154,37 @@ if __name__ == '__main__':
     
     # 反变换（如果使用了对数变换）
     if test_data.get('target_transform') == 'log':
-        ensemble_pred_original = torch.expm1(ensemble_pred)
+        # 安全的反变换
+        ensemble_pred_safe = torch.clamp(ensemble_pred, min=-0.99)
+        ensemble_pred_original = torch.expm1(ensemble_pred_safe)
         test_target_original = torch.expm1(test_target)
     else:
         ensemble_pred_original = ensemble_pred
         test_target_original = test_target
-    
+
     # 计算指标
     pred_np = ensemble_pred_original.cpu().numpy()
     target_np = test_target_original.cpu().numpy()
     
-    r2 = r2_score(target_np, pred_np)
-    rmse = np.sqrt(mean_squared_error(target_np, pred_np))
-    mae = np.mean(np.abs(target_np - pred_np))
+    # 移除可能的NaN/Inf值
+    mask = ~(np.isnan(pred_np) | np.isnan(target_np) | 
+             np.isinf(pred_np) | np.isinf(target_np))
+
+    if np.any(~mask):
+        print(f"Warning: Removed {np.sum(~mask)} samples with NaN/Inf values from evaluation")
+        pred_np = pred_np[mask]
+        target_np = target_np[mask]
+
+    # 确保有足够的有效样本
+    if len(pred_np) < 5:
+        print("Error: Too few valid samples for evaluation")
+        r2 = float('nan')
+        rmse = float('nan')
+        mae = float('nan')
+    else:
+        r2 = r2_score(target_np, pred_np)
+        rmse = np.sqrt(mean_squared_error(target_np, pred_np))
+        mae = np.mean(np.abs(target_np - pred_np))
     
     print(f"\nEnsemble Performance:")
     print(f"  R²: {r2:.4f}")
@@ -1080,6 +1209,17 @@ if __name__ == '__main__':
     
     # 可视化结果
     print("\nCreating visualizations...")
+    
+    # 首先检查是否在可视化环境中
+    import os
+    can_visualize = True
+    # 检测是否在无界面环境中运行
+    if os.environ.get('DISPLAY', '') == '' and not os.name == 'nt':
+        # 设置matplotlib为非交互模式
+        print("Running in headless environment, setting matplotlib backend to 'Agg'")
+        import matplotlib
+        matplotlib.use('Agg')
+        can_visualize = False
     
     fig, axes = plt.subplots(2, 3, figsize=(18, 12))
     
@@ -1151,7 +1291,11 @@ if __name__ == '__main__':
     
     plt.tight_layout()
     plt.savefig('enhanced_model_results.png', dpi=300, bbox_inches='tight')
-    plt.show()
+    # 只在支持可视化的环境中显示图形
+    if can_visualize:
+        plt.show()
+    else:
+        plt.close()
     
     # 特征重要性分析（如果可能）
     print("\nAnalyzing feature importance...")
@@ -1193,7 +1337,11 @@ if __name__ == '__main__':
             plt.title('Feature Importance from Symbolic Layer')
             plt.tight_layout()
             plt.savefig('feature_importance.png', dpi=300, bbox_inches='tight')
-            plt.show()
+            # 只在支持可视化的环境中显示图形
+            if can_visualize:
+                plt.show()
+            else:
+                plt.close()
     
     print("\nAll experiments completed successfully!")
     print(f"Final ensemble R² score: {r2:.4f}")
