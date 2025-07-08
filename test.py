@@ -70,7 +70,8 @@ def test_model_forward():
     for i, features in enumerate(test_features):
         try:
             with torch.no_grad():
-                pred, uncertainty, symbolic, residual = model(material_ids, features)
+                physics = PhysicsInformedFeatureExtractor()(features)
+                pred, uncertainty, symbolic, residual = model(material_ids, features, physics)
                 
                 # 检查所有输出
                 outputs = {"pred": pred, "uncertainty": uncertainty, 
@@ -103,10 +104,11 @@ def test_gradient_flow():
     # 创建测试数据
     material_ids = torch.LongTensor([0, 1, 2])
     features = torch.randn(3, 6)
+    physics = PhysicsInformedFeatureExtractor()(features)
     target = torch.randn(3, 1)
     
     try:
-        pred, uncertainty, _, _ = model(material_ids, features)
+        pred, uncertainty, _, _ = model(material_ids, features, physics)
         loss = torch.nn.functional.mse_loss(pred, target)
         loss.backward()
         
