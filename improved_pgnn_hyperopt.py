@@ -57,8 +57,8 @@ def reconstruct_df(data_dict):
     return df
 
 
-def augment_dataset(orig_df, noise_scale=0.05):
-    """在数值列上添加噪声的数据增强"""
+def augment_dataset(orig_df, noise_scale=0.04):
+    """在数值列上添加温和噪声的数据增强"""
     n_samples = len(orig_df)
     n_aug = n_samples // 4
     aug_indices = np.random.choice(n_samples, n_aug, replace=False)
@@ -127,7 +127,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
     """使用给定的超参数训练模型"""
     try:
         # 训练超参数 - 缩小学习率范围
-        lr = trial.suggest_float("lr", 5e-4, 1e-2, log=True)  # More narrow range
+        lr = trial.suggest_float("lr", 2e-3, 4e-3, log=True)
         epochs = trial.suggest_int("epochs", 100, 300, step=50)  # 减小上下限
         batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
 
@@ -136,7 +136,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
 
         # 损失函数超参数
         lambda_complexity = trial.suggest_float("lambda_complexity", 1e-6, 1e-4, log=True)
-        lambda_physics = trial.suggest_float("lambda_physics", 0.01, 0.05, step=0.01)
+        lambda_physics = trial.suggest_float("lambda_physics", 0.1, 0.3, step=0.05)
 
         # 早停参数 - 更敏感
         patience = trial.suggest_int("patience", 15, 30, step=5)
@@ -160,19 +160,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
                 model.parameters(), lr=lr, weight_decay=weight_decay
             )
 
-        # 学习率预热与调度
-        warmup_epochs = min(10, epochs // 10)  # 确保预热不超过总epochs的10%
 
-        def lr_lambda(epoch):
-            if epoch < warmup_epochs:
-                # 线性预热
-                return epoch / warmup_epochs
-            else:
-                # 余弦退火
-                progress = (epoch - warmup_epochs) / (epochs - warmup_epochs)
-                return 0.5 * (1 + np.cos(np.pi * progress))
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
         # SWA只在epochs较多时使用
         use_swa = epochs > 100
@@ -211,6 +199,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
         train_dataset = TensorDataset(
             torch.LongTensor(augmented_train_data["material_ids"]),
             torch.FloatTensor(augmented_train_data["numeric_features"]),
+            torch.FloatTensor(augmented_train_data["physics_features"]),
             torch.FloatTensor(augmented_train_data["numeric_raw"]),
             torch.FloatTensor(augmented_train_data["target"]).unsqueeze(1),
         )
@@ -220,11 +209,20 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
             shuffle=True,
             drop_last=False,
             pin_memory=True,
-            num_workers=0,
+            num_workers=4,
+        )
+
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=lr,
+            epochs=epochs,
+            steps_per_epoch=len(train_loader),
+            pct_start=0.3,
         )
 
         val_materials = torch.LongTensor(val_data["material_ids"]).to(device)
         val_features = torch.FloatTensor(val_data["numeric_features"]).to(device)
+        val_phys = torch.FloatTensor(val_data["physics_features"]).to(device)
         val_raw = torch.FloatTensor(val_data["numeric_raw"]).to(device)
         val_target = torch.FloatTensor(val_data["target"]).unsqueeze(1).to(device)
 
@@ -242,9 +240,10 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
             model.train()
             epoch_loss = 0
 
-            for batch_materials, batch_features, batch_raw, batch_target in train_loader:
+            for batch_materials, batch_features, batch_phys, batch_raw, batch_target in train_loader:
                 batch_materials = batch_materials.to(device, non_blocking=True)
                 batch_features = batch_features.to(device, non_blocking=True)
+                batch_phys = batch_phys.to(device, non_blocking=True)
                 batch_raw = batch_raw.to(device, non_blocking=True)
                 batch_target = batch_target.to(device, non_blocking=True)
 
@@ -253,7 +252,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
                 try:
                     with autocast(device_type=device):
                         pred, uncertainty, symbolic, residual = model(
-                            batch_materials, batch_features, batch_raw
+                            batch_materials, batch_features, batch_phys
                         )
                         loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
 
@@ -299,7 +298,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
             try:
                 with torch.no_grad(), autocast(device_type=device):
                     val_pred, val_uncertainty, _, _ = model(
-                        val_materials, val_features, val_raw
+                        val_materials, val_features, val_phys
                     )
                     val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
 
@@ -362,7 +361,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
         model.eval()
         try:
             with torch.no_grad(), autocast(device_type=device):
-                val_pred, _, _, _ = model(val_materials, val_features, val_raw)
+                val_pred, _, _, _ = model(val_materials, val_features, val_phys)
                 val_pred_np = val_pred.cpu().squeeze().numpy()
                 val_target_np = val_target.cpu().squeeze().numpy()
                 final_r2 = r2_score(val_target_np, val_pred_np)
@@ -419,8 +418,8 @@ def objective(trial, df, device, seed, space=None):
 
 def run_hyperopt(
     data_path: str = "3011916164精确材料性能数据.csv",
-    n_trials_stage1: int = 20,  # stage1的试验次数
-    n_trials_stage2: int = 10,  # stage2的试验次数
+    n_trials_stage1: int = 40,  # stage1的试验次数
+    n_trials_stage2: int = 40,  # stage2的试验次数
     top_k: int = 3,
     seed: int = 42,
 ):
@@ -482,12 +481,12 @@ def run_hyperopt(
         "latent_dim": (32, 64),  # 缩小上限
         "num_blocks": (2, 2),  # 使用固定值2避免复杂网络
         "dropout_rate": (0.05, 0.15),
-        "lr": (5e-4, 2e-3),  # 收窄范围
+        "lr": (2e-3, 4e-3),
         "epochs": (100, 200),  # 减少epoch上限
         "batch_size": [16, 32],  # 移除较大的batch size
         "weight_decay": (1e-5, 5e-4),
         "lambda_complexity": (1e-6, 5e-5),
-        "lambda_physics": (0.01, 0.05),
+        "lambda_physics": (0.1, 0.3),
         "patience": (15, 25),
         "augmentation": [True, False],
         "optimizer": ["AdamW", "RMSprop"],
@@ -546,12 +545,12 @@ def run_hyperopt(
             "latent_dim": 32, 
             "num_blocks": 2,
             "dropout_rate": (0.1, 0.1),
-            "lr": (1e-3, 1e-3),
+            "lr": (2e-3, 2e-3),
             "epochs": (100, 100),
             "batch_size": [32],
             "weight_decay": (1e-4, 1e-4),
             "lambda_complexity": (1e-5, 1e-5),
-            "lambda_physics": (0.05, 0.05),
+            "lambda_physics": (0.2, 0.2),
             "patience": (20, 20),
             "augmentation": [True],
             "optimizer": ["AdamW"],
@@ -605,15 +604,15 @@ def run_hyperopt(
         # 设置默认参数
         final_study.best_params = {
             "material_embed_dim": 16,
-            "latent_dim": 32,
+            "latent_dim": 64,
             "num_blocks": 3,
-            "dropout_rate": 0.05,
-            "lr": 1e-3,
+            "dropout_rate": 0.1,
+            "lr": 2e-3,
             "epochs": 100,
             "batch_size": 32,
             "weight_decay": 1e-4,
             "lambda_complexity": 1e-5,
-            "lambda_physics": 0.05,
+            "lambda_physics": 0.2,
             "patience": 20,
             "augmentation": True,
             "optimizer": "AdamW",
@@ -636,13 +635,13 @@ def retrain_with_best_params(
             "material_embed_dim": 16,
             "latent_dim": 64,
             "num_blocks": 3,
-            "dropout_rate": 0.05,
-            "lr": 1e-3,
+            "dropout_rate": 0.1,
+            "lr": 2e-3,
             "epochs": 100,
             "batch_size": 32,
             "weight_decay": 1e-4,
             "lambda_complexity": 1e-5,
-            "lambda_physics": 0.05,
+            "lambda_physics": 0.2,
             "patience": 20,
             "augmentation": True,
             "optimizer": "AdamW",
@@ -708,6 +707,7 @@ def retrain_with_best_params(
     train_dataset = TensorDataset(
         torch.LongTensor(augmented_train_data["material_ids"]),
         torch.FloatTensor(augmented_train_data["numeric_features"]),
+        torch.FloatTensor(augmented_train_data["physics_features"]),
         torch.FloatTensor(augmented_train_data["numeric_raw"]),
         torch.FloatTensor(augmented_train_data["target"]).unsqueeze(1),
     )
@@ -717,10 +717,12 @@ def retrain_with_best_params(
         shuffle=True,
         drop_last=False,
         pin_memory=True,
+        num_workers=4,
     )
 
     test_materials = torch.LongTensor(test_data["material_ids"]).to(device)
     test_features = torch.FloatTensor(test_data["numeric_features"]).to(device)
+    test_phys = torch.FloatTensor(test_data["physics_features"]).to(device)
     test_raw = torch.FloatTensor(test_data["numeric_raw"]).to(device)
     test_target = torch.FloatTensor(test_data["target"]).unsqueeze(1).to(device)
 
@@ -752,7 +754,7 @@ def retrain_with_best_params(
     # 损失函数
     loss_fn = AdaptiveLoss(
         lambda_complexity=best_params.get("lambda_complexity", 1e-5),
-        lambda_physics=best_params.get("lambda_physics", 0.05),
+        lambda_physics=best_params.get("lambda_physics", 0.2),
     )
     loss_fn.total_epochs = epochs
     scaler = GradScaler()
@@ -776,9 +778,10 @@ def retrain_with_best_params(
             model.train()
             epoch_loss = 0
 
-            for batch_materials, batch_features, batch_raw, batch_target in train_loader:
+            for batch_materials, batch_features, batch_phys, batch_raw, batch_target in train_loader:
                 batch_materials = batch_materials.to(device, non_blocking=True)
                 batch_features = batch_features.to(device, non_blocking=True)
+                batch_phys = batch_phys.to(device, non_blocking=True)
                 batch_raw = batch_raw.to(device, non_blocking=True)
                 batch_target = batch_target.to(device, non_blocking=True)
 
@@ -787,7 +790,7 @@ def retrain_with_best_params(
                 try:
                     with autocast(device_type=device):
                         pred, uncertainty, _, _ = model(
-                            batch_materials, batch_features, batch_raw
+                            batch_materials, batch_features, batch_phys
                         )
                         loss, metrics = loss_fn(pred, uncertainty, batch_target, model, batch_raw)
 
@@ -820,7 +823,7 @@ def retrain_with_best_params(
             try:
                 with torch.no_grad(), autocast(device_type=device):
                     test_pred, test_uncertainty, _, _ = model(
-                        test_materials, test_features, test_raw
+                        test_materials, test_features, test_phys
                     )
                     test_pred_np = test_pred.cpu().squeeze().numpy()
                     test_target_np = test_target.cpu().squeeze().numpy()
@@ -878,7 +881,7 @@ def retrain_with_best_params(
                 model.eval()
                 with torch.no_grad(), autocast(device_type=device):
                     test_pred, test_uncertainty, _, _ = model(
-                        test_materials, test_features, test_raw
+                        test_materials, test_features, test_phys
                     )
                     test_pred_np = test_pred.cpu().squeeze().numpy()
                     test_target_np = test_target.cpu().squeeze().numpy()
@@ -913,7 +916,7 @@ def retrain_with_best_params(
     # 标准预测
     with torch.no_grad(), autocast(device_type=device):
         test_pred, test_uncertainty, _, _ = model(
-            test_materials, test_features, test_raw
+            test_materials, test_features, test_phys
         )
         test_pred_np = test_pred.cpu().squeeze().numpy()
         test_target_np = test_target.cpu().squeeze().numpy()
@@ -923,7 +926,7 @@ def retrain_with_best_params(
 
     # MC Dropout预测
     mc_pred, mc_unc, aleatoric_unc, epistemic_unc = model.predict_with_uncertainty(
-        test_materials, test_features, test_raw, n_samples=20
+        test_materials, test_features, test_phys, n_samples=20
     )
     mc_pred_np = mc_pred.cpu().squeeze().numpy()
     mc_r2 = r2_score(test_target_np, mc_pred_np)
@@ -946,6 +949,7 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
     # 准备数据
     test_materials = torch.LongTensor(test_data["material_ids"]).to(device)
     test_features = torch.FloatTensor(test_data["numeric_features"]).to(device)
+    test_phys = torch.FloatTensor(test_data["physics_features"]).to(device)
     test_raw = torch.FloatTensor(test_data["numeric_raw"]).to(device)
     test_target = torch.FloatTensor(test_data["target"]).unsqueeze(1).to(device)
 
@@ -953,7 +957,7 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
     try:
         with torch.no_grad(), autocast(device_type=device):
             test_pred, test_uncertainty, symbolic_out, residual_out = model(
-                test_materials, test_features, test_raw
+                test_materials, test_features, test_phys
             )
 
             # 转换为NumPy
@@ -988,7 +992,7 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
     # MC Dropout预测
     try:
         mc_pred, mc_unc, aleatoric_unc, epistemic_unc = model.predict_with_uncertainty(
-            test_materials, test_features, test_raw, n_samples=30
+            test_materials, test_features, test_phys, n_samples=30
         )
         mc_pred_np = mc_pred.cpu().squeeze().numpy()
         mc_unc_np = mc_unc.cpu().squeeze().numpy()
