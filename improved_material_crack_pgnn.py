@@ -6,6 +6,8 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder, MinMaxScaler, Ro
 from typing import Dict, List, Tuple, Optional
 import pandas as pd
 from scipy.stats.mstats import winsorize
+from torch.utils.data import TensorDataset, DataLoader
+from torch.cuda.amp import GradScaler
 
 GRAD_CLIP = 5.0
 
@@ -375,20 +377,20 @@ class MaterialCrackPGNN(nn.Module):
     def __init__(
         self,
         num_materials,
-        material_embed_dim: int = 16,
-        latent_dim: int = 32,
+        material_embed_dim: int = 12,
+        latent_dim: int = 64,
         dropout_rate: float = 0.1,
-        num_blocks: int = 2,
+        num_blocks: int = 3,
     ):
         super().__init__()
         
         # 材料嵌入
         self.material_embedding = nn.Embedding(num_materials, material_embed_dim)
         nn.init.xavier_uniform_(self.material_embedding.weight, gain=0.5)
+        self.emb_dropout = nn.Dropout(0.1)
         
-        # 物理特征提取（使用原始尺度数据）
-        self.physics_extractor = PhysicsInformedFeatureExtractor()
-        physics_dim = 6 + 13  # 原始特征 + 物理特征
+        # 物理特征维度（已在数据准备阶段计算）
+        physics_dim = 6 + 13
         
         # 特征融合层
         # 注意：这里使用标准化后的特征维度 + 材料嵌入维度
@@ -426,14 +428,8 @@ class MaterialCrackPGNN(nn.Module):
             ) for _ in range(num_blocks)
         ])
         
-        # 简化的符号层
-        self.symbolic_layer = nn.Sequential(
-            nn.Linear(latent_dim, 32),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(32, 1),
-            nn.Tanh()  # 限制输出范围
-        )
+        # 符号层，提供复杂度度量
+        self.symbolic_layer = AdaptiveSymbolicLayer(latent_dim)
         
         # 残差预测头
         self.residual_head = nn.Sequential(
@@ -456,21 +452,20 @@ class MaterialCrackPGNN(nn.Module):
         self.mc_dropout_enabled = False
         self.max_grad = 0.0
 
-    def forward(self, material_ids, numeric_scaled, numeric_raw):
+    def forward(self, material_ids, numeric_scaled, physics_features):
         """
         material_ids: [batch_size] - 材料类别ID
         numeric_scaled: [batch_size, 6] - 标准化后的特征（主网络）
         numeric_raw: [batch_size, 6] - 原始尺度特征（物理约束）
         """
         # 1. 材料嵌入
-        material_embed = self.material_embedding(material_ids)
+        material_embed = self.emb_dropout(self.material_embedding(material_ids))
         
         # 2. 主网络特征处理（使用标准化数据）
         main_features = torch.cat([material_embed, numeric_scaled], dim=1)
         z_main = self.feature_projection(main_features)
         
-        # 3. 物理特征提取（使用原始数据）
-        physics_features = self.physics_extractor(numeric_raw)
+        # 3. 物理特征已在数据准备阶段计算
         z_physics = self.physics_projection(physics_features)
         
         # 4. 特征融合
@@ -482,7 +477,7 @@ class MaterialCrackPGNN(nn.Module):
             z = F.gelu(z)
         
         # 6. 符号输出
-        symbolic = self.symbolic_layer(z)
+        symbolic = self.symbolic_layer(z, physics_features)
         
         # 7. 残差预测
         residual_input = torch.cat([z, symbolic], dim=-1)
@@ -497,7 +492,7 @@ class MaterialCrackPGNN(nn.Module):
         
         return prediction, uncertainty, symbolic, residual
 
-    def predict_with_uncertainty(self, material_ids, num_scaled, num_raw, n_samples=10):
+    def predict_with_uncertainty(self, material_ids, num_scaled, physics_features, n_samples=10):
         """使用MC Dropout进行带不确定性的预测"""
         self.enable_mc_dropout(True)  # 启用MC Dropout
         self.train()  # 关键：保持train模式以激活Dropout
@@ -507,7 +502,7 @@ class MaterialCrackPGNN(nn.Module):
 
         with torch.no_grad():
             for _ in range(n_samples):
-                pred, uncertainty, _, _ = self(material_ids, num_scaled, num_raw)
+                pred, uncertainty, _, _ = self(material_ids, num_scaled, physics_features)
                 predictions.append(pred)
                 uncertainties.append(uncertainty)
 
@@ -548,7 +543,7 @@ class MaterialCrackPGNN(nn.Module):
 class PhysicsInformedLoss(nn.Module):
     """改进的物理信息损失函数"""
     
-    def __init__(self, lambda_complexity=1e-4, lambda_physics=1e-2):
+    def __init__(self, lambda_complexity=1e-3, lambda_physics=0.2):
         super().__init__()
         self.lambda_complexity = lambda_complexity
         self.lambda_physics = lambda_physics
@@ -574,18 +569,22 @@ class PhysicsInformedLoss(nn.Module):
         )
         nll_loss = (0.5 * torch.log(2 * np.pi * uncertainty) + huber_loss / uncertainty).mean()
         
-        # 2. 复杂度损失（简化）
-        complexity_loss = 0.0
+        # 2. 复杂度损失
+        complexity_loss = getattr(model.symbolic_layer, "complexity", 0.0)
         
         # 3. 物理约束（使用原始尺度数据）
         physics_loss = self.compute_physics_constraints(pred, numeric_raw)
         
         # 4. 动态权重调整
-        warm_progress = max(0.0, self.current_epoch - 30) / 20
-        physics_weight = self.lambda_physics * min(0.3, warm_progress)
+        progress = (self.current_epoch / max(1, self.total_epochs)) ** 0.5
+        physics_weight = min(self.lambda_physics, progress * self.lambda_physics)
         
         # 5. 总损失
-        total_loss = nll_loss + self.lambda_complexity * complexity_loss + physics_weight * physics_loss
+        total_loss = (
+            nll_loss
+            + self.lambda_complexity * complexity_loss
+            + physics_weight * physics_loss
+        )
         
         return total_loss, {
             "nll": nll_loss.item(),
@@ -675,41 +674,21 @@ class AdaptiveLoss(PhysicsInformedLoss):
         }
 
 
-def smart_augment(df: pd.DataFrame, model_predictions=None):
-    """根据预测误差进行mixup的数据增强"""
+def smart_augment(df: pd.DataFrame, noise_scale: float = 0.04):
+    """简单的高斯噪声增广"""
     df = df.copy()
-    features = df[[
+    numeric_cols = [
         "莫氏硬度",
         "弹性模量",
         "断裂韧性",
         "晶粒粒径",
         "压溃压力",
         "磨粒速度",
-    ]].values
-    targets = df["亚表面裂纹深度"].values
+    ]
 
-    if model_predictions is not None:
-        errors = np.abs(targets - model_predictions)
-        weights = errors / (errors.sum() + 1e-6)
-    else:
-        weights = np.ones(len(df)) / len(df)
-
-    shuffled_idx = np.random.permutation(len(df))
-    alpha = 0.2
-    lam = np.random.beta(alpha, alpha)
-    mixed_features = lam * features + (1 - lam) * features[shuffled_idx]
-    mixed_targets = lam * targets + (1 - lam) * targets[shuffled_idx]
-
-    aug_df = pd.DataFrame(mixed_features, columns=[
-        "莫氏硬度",
-        "弹性模量",
-        "断裂韧性",
-        "晶粒粒径",
-        "压溃压力",
-        "磨粒速度",
-    ])
-    aug_df["材料种类"] = df["材料种类"].values
-    aug_df["亚表面裂纹深度"] = mixed_targets
+    aug_df = df.sample(frac=0.5, replace=True).reset_index(drop=True)
+    noise = np.random.normal(0, noise_scale, size=aug_df[numeric_cols].shape)
+    aug_df[numeric_cols] *= 1 + noise
 
     return pd.concat([df, aug_df], ignore_index=True)
 
@@ -783,16 +762,23 @@ def prepare_material_data(
         scaler.fit(numeric_for_scaling)
     
     numeric_scaled = scaler.transform(numeric_for_scaling)
-    
+
     # 7. 最终安全检查
     numeric_scaled = np.clip(numeric_scaled, -10, 10)
-    
+
+    # 8. 预计算物理特征
+    extractor = PhysicsInformedFeatureExtractor()
+    with torch.no_grad():
+        physics_tensor = extractor(torch.from_numpy(numeric_raw))
+    physics_features = physics_tensor.numpy().astype(np.float32)
+
     target = df_clean["亚表面裂纹深度"].values.astype(np.float32)
     
     return {
         "material_ids": material_ids,
         "numeric_features": numeric_scaled,  # 标准化后的特征（主网络）
         "numeric_raw": numeric_raw,          # 原始特征（物理约束）
+        "physics_features": physics_features,
         "target": target,
         "label_encoder": le,
         "scaler": scaler,
@@ -811,49 +797,79 @@ def train_material_model(
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
     loss_fn = PhysicsInformedLoss()
     
-    # 准备数据 - 注意现在有两个输入
-    train_materials = torch.LongTensor(train_data["material_ids"]).to(device)
-    train_scaled = torch.FloatTensor(train_data["numeric_features"]).to(device)
-    train_raw = torch.FloatTensor(train_data["numeric_raw"]).to(device)
-    train_target = torch.FloatTensor(train_data["target"]).unsqueeze(1).to(device)
+    # 准备数据
+    train_dataset = TensorDataset(
+        torch.LongTensor(train_data["material_ids"]),
+        torch.FloatTensor(train_data["numeric_features"]),
+        torch.FloatTensor(train_data["physics_features"]),
+        torch.FloatTensor(train_data["numeric_raw"]),
+        torch.FloatTensor(train_data["target"]).unsqueeze(1),
+    )
+    val_dataset = TensorDataset(
+        torch.LongTensor(val_data["material_ids"]),
+        torch.FloatTensor(val_data["numeric_features"]),
+        torch.FloatTensor(val_data["physics_features"]),
+        torch.FloatTensor(val_data["numeric_raw"]),
+        torch.FloatTensor(val_data["target"]).unsqueeze(1),
+    )
+
+    train_loader = DataLoader(
+        train_dataset, batch_size=32, shuffle=True, num_workers=4, pin_memory=True
+    )
+    val_loader = DataLoader(
+        val_dataset, batch_size=32, shuffle=False, num_workers=4, pin_memory=True
+    )
     
-    val_materials = torch.LongTensor(val_data["material_ids"]).to(device)
-    val_scaled = torch.FloatTensor(val_data["numeric_features"]).to(device)
-    val_raw = torch.FloatTensor(val_data["numeric_raw"]).to(device)
-    val_target = torch.FloatTensor(val_data["target"]).unsqueeze(1).to(device)
-    
+    scaler = GradScaler()
     train_losses = []
     val_losses = []
-    
+
     for epoch in range(epochs):
         loss_fn.update_epoch(epoch, epochs)
-        
-        # 训练
-        model.train()
-        optimizer.zero_grad()
-        
-        # 前向传播 - 使用双输入
-        pred, uncertainty, _, _ = model(train_materials, train_scaled, train_raw)
-        loss, metrics = loss_fn(pred, uncertainty, train_target, model, train_raw)
-        
-        # 梯度裁剪
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
-        optimizer.step()
 
-        
-        train_losses.append(loss.item())
-        
-        # 验证
+        model.train()
+        epoch_loss = 0.0
+
+        for mat, feat, phys, raw, tgt in train_loader:
+            mat = mat.to(device, non_blocking=True)
+            feat = feat.to(device, non_blocking=True)
+            phys = phys.to(device, non_blocking=True)
+            raw = raw.to(device, non_blocking=True)
+            tgt = tgt.to(device, non_blocking=True)
+
+            optimizer.zero_grad(set_to_none=True)
+            with torch.cuda.amp.autocast():
+                pred, unc, _, _ = model(mat, feat, phys)
+                loss, _ = loss_fn(pred, unc, tgt, model, raw)
+
+            scaler.scale(loss).backward()
+            scaler.unscale_(optimizer)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
+            scaler.step(optimizer)
+            scaler.update()
+
+            epoch_loss += loss.item() * tgt.size(0)
+
+        train_losses.append(epoch_loss / len(train_loader.dataset))
+
         if epoch % 10 == 0:
             model.eval()
+            val_epoch_loss = 0.0
             with torch.no_grad():
-                val_pred, val_uncertainty, _, _ = model(val_materials, val_scaled, val_raw)
-                val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
-                val_losses.append(val_loss.item())
-                
-                print(f"Epoch {epoch}: Train Loss = {loss.item():.4f}, Val Loss = {val_loss.item():.4f}")
-        # 调整学习率在验证之后进行
+                for vm, vf, vp, vr, vt in val_loader:
+                    vm = vm.to(device, non_blocking=True)
+                    vf = vf.to(device, non_blocking=True)
+                    vp = vp.to(device, non_blocking=True)
+                    vr = vr.to(device, non_blocking=True)
+                    vt = vt.to(device, non_blocking=True)
+                    with torch.cuda.amp.autocast():
+                        vpred, vunc, _, _ = model(vm, vf, vp)
+                        vloss, _ = loss_fn(vpred, vunc, vt, model, vr)
+                    val_epoch_loss += vloss.item() * vt.size(0)
+            val_epoch_loss /= len(val_loader.dataset)
+            val_losses.append(val_epoch_loss)
+            print(f"Epoch {epoch}: Train Loss = {train_losses[-1]:.4f}, Val Loss = {val_epoch_loss:.4f}")
+
         scheduler.step()
-        
+
     return model, train_losses, val_losses
