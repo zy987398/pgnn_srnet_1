@@ -278,10 +278,6 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
                     scaler.step(optimizer)
                     scaler.update()
 
-                    # SWA update
-                    if use_swa and epoch >= swa_start:
-                        swa_model.update_parameters(model)
-                        swa_scheduler.step(val_r2)
 
                     epoch_loss += loss.item() * batch_target.size(0)
                 except RuntimeError as e:
@@ -331,6 +327,11 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
                 
                 # 调整学习率
                 scheduler.step()
+
+                # SWA 更新在获得验证指标后执行
+                if use_swa and epoch >= swa_start:
+                    swa_model.update_parameters(model)
+                    swa_scheduler.step()
 
                 # 剪枝逻辑 - 确保训练至少min_epochs_before_pruning轮后才考虑剪枝
                 if trial.should_prune() and epoch >= min_epochs_before_pruning:
@@ -803,10 +804,6 @@ def retrain_with_best_params(
                     scaler.step(optimizer)
                     scaler.update()
 
-                    # SWA更新 (如果启用)
-                    if use_swa and epoch >= swa_start:
-                        swa_model.update_parameters(model)
-                        swa_scheduler.step(test_r2)
 
                     epoch_loss += loss.item() * batch_target.size(0)
                 except Exception as e:
@@ -852,7 +849,12 @@ def retrain_with_best_params(
                     break
 
                 # 基于验证集性能更新学习率
-                scheduler.step()
+                scheduler.step(test_r2)
+
+                # 在获取测试指标后再执行SWA更新
+                if use_swa and epoch >= swa_start:
+                    swa_model.update_parameters(model)
+                    swa_scheduler.step()
             except Exception as e:
                 print(f"Error in evaluation: {e}")
                 continue

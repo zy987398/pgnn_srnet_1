@@ -840,7 +840,7 @@ def train_material_model(
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
         optimizer.step()
-        scheduler.step()
+
         
         train_losses.append(loss.item())
         
@@ -853,5 +853,7 @@ def train_material_model(
                 val_losses.append(val_loss.item())
                 
                 print(f"Epoch {epoch}: Train Loss = {loss.item():.4f}, Val Loss = {val_loss.item():.4f}")
-    
+        # 调整学习率在验证之后进行
+        scheduler.step()
+        
     return model, train_losses, val_losses
