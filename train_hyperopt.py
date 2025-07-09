@@ -694,3 +694,202 @@ def retrain_with_best_params(
     print(f"  最佳epoch: {best_epoch}")
 
     return model, train_losses, test_r2_history
+
+
+def main():
+    """
+    主函数：执行完整的超参数优化和最终训练流程
+    """
+    print("=" * 60)
+    print("材料裂纹预测PGNN模型超参数优化")
+    print("=" * 60)
+    
+    # 配置参数
+    DATA_PATH = "3011916164精确材料性能数据.csv"
+    N_TRIALS_STAGE1 = 2  # 第一阶段试验次数
+    N_TRIALS_STAGE2 = 1  # 第二阶段试验次数
+    TOP_K = 1  # 从第一阶段选择的最佳试验数量
+    SEED = 42
+    
+    print(f"数据路径: {DATA_PATH}")
+    print(f"第一阶段试验次数: {N_TRIALS_STAGE1}")
+    print(f"第二阶段试验次数: {N_TRIALS_STAGE2}")
+    print(f"随机种子: {SEED}")
+    print()
+    
+    # 检查数据文件是否存在
+    import os
+    if not os.path.exists(DATA_PATH):
+        print(f"错误: 数据文件 '{DATA_PATH}' 不存在!")
+        return
+    
+    # 检查GPU可用性
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"使用设备: {device}")
+    if device == "cuda":
+        print(f"GPU型号: {torch.cuda.get_device_name(0)}")
+        print(f"GPU内存: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    print()
+    
+    try:
+        # 第一步：运行超参数优化
+        print("开始超参数优化...")
+        study = run_hyperopt(
+            data_path=DATA_PATH,
+            n_trials_stage1=N_TRIALS_STAGE1,
+            n_trials_stage2=N_TRIALS_STAGE2,
+            top_k=TOP_K,
+            seed=SEED
+        )
+        
+        if study is None or not hasattr(study, 'best_params'):
+            print("超参数优化失败!")
+            return
+        
+        print("\n超参数优化完成!")
+        print(f"最佳交叉验证R²: {study.best_value:.4f}")
+        
+        # 第二步：使用最佳超参数重新训练
+        print("\n" + "=" * 50)
+        print("使用最佳超参数进行最终训练...")
+        print("=" * 50)
+        
+        model, train_losses, test_r2_history = retrain_with_best_params(
+            study, 
+            data_path=DATA_PATH, 
+            seed=SEED
+        )
+        
+        if model is None:
+            print("最终训练失败!")
+            return
+            
+        # 第三步：保存结果
+        print("\n保存模型和结果...")
+        
+        # 创建结果目录
+        os.makedirs("results", exist_ok=True)
+        
+        # 保存最佳模型
+        torch.save(model.state_dict(), "results/best_hyperopt_model.pth")
+        
+        # 保存超参数
+        import json
+        with open("results/best_hyperopt_params.json", "w", encoding="utf-8") as f:
+            json.dump(study.best_params, f, indent=2, ensure_ascii=False)
+        
+        # 保存训练历史
+        import pickle
+        with open("results/training_history.pkl", "wb") as f:
+            pickle.dump({
+                "train_losses": train_losses,
+                "test_r2_history": test_r2_history,
+                "best_cv_r2": study.best_value,
+                "best_params": study.best_params
+            }, f)
+        
+        # 第四步：生成可视化结果
+        try:
+            create_optimization_plots(study, train_losses, test_r2_history)
+        except Exception as e:
+            print(f"生成图表时出错: {e}")
+        
+        # 第五步：输出最终结果总结
+        print("\n" + "=" * 60)
+        print("训练完成! 结果总结:")
+        print("=" * 60)
+        print(f"最佳交叉验证R²: {study.best_value:.4f}")
+        print(f"最终测试集R²: {max(test_r2_history):.4f}")
+        print(f"训练轮次: {len(train_losses)}")
+        print("\n最佳超参数:")
+        for key, value in study.best_params.items():
+            print(f"  {key}: {value}")
+        
+        print(f"\n文件已保存到:")
+        print(f"  模型权重: results/best_hyperopt_model.pth")
+        print(f"  超参数: results/best_hyperopt_params.json")
+        print(f"  训练历史: results/training_history.pkl")
+        print(f"  优化图表: results/hyperopt_optimization_plots.png")
+        
+    except KeyboardInterrupt:
+        print("\n用户中断训练")
+    except Exception as e:
+        print(f"\n训练过程中出现错误: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def create_optimization_plots(study, train_losses, test_r2_history):
+    """
+    创建优化过程的可视化图表
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import matplotlib
+        matplotlib.use('Agg')  # 使用非交互式后端
+        
+        fig, axes = plt.subplots(2, 2, figsize=(15, 12))
+        
+        # 1. 优化历史
+        completed_trials = [t for t in study.trials if t.state == optuna.trial.TrialState.COMPLETE]
+        trial_values = [t.value for t in completed_trials]
+        trial_numbers = [t.number for t in completed_trials]
+        
+        axes[0, 0].plot(trial_numbers, trial_values, 'b-o', markersize=3)
+        axes[0, 0].axhline(y=study.best_value, color='r', linestyle='--', 
+                          label=f'Best: {study.best_value:.4f}')
+        axes[0, 0].set_xlabel('Trial Number')
+        axes[0, 0].set_ylabel('Validation R²')
+        axes[0, 0].set_title('Hyperparameter Optimization History')
+        axes[0, 0].legend()
+        axes[0, 0].grid(True, alpha=0.3)
+        
+        # 2. 训练损失
+        axes[0, 1].plot(train_losses, 'g-', linewidth=2)
+        axes[0, 1].set_xlabel('Epoch')
+        axes[0, 1].set_ylabel('Training Loss')
+        axes[0, 1].set_title('Training Loss History')
+        axes[0, 1].grid(True, alpha=0.3)
+        
+        # 3. 测试R²历史
+        axes[1, 0].plot(test_r2_history, 'r-', linewidth=2)
+        axes[1, 0].axhline(y=max(test_r2_history), color='b', linestyle='--',
+                          label=f'Best: {max(test_r2_history):.4f}')
+        axes[1, 0].set_xlabel('Epoch')
+        axes[1, 0].set_ylabel('Test R²')
+        axes[1, 0].set_title('Test R² History')
+        axes[1, 0].legend()
+        axes[1, 0].grid(True, alpha=0.3)
+        
+        # 4. 超参数重要性
+        try:
+            importance = optuna.importance.get_param_importances(study)
+            if importance:
+                params = list(importance.keys())[:8]  # 显示前8个重要参数
+                values = [importance[p] for p in params]
+                
+                y_pos = range(len(params))
+                axes[1, 1].barh(y_pos, values)
+                axes[1, 1].set_yticks(y_pos)
+                axes[1, 1].set_yticklabels(params)
+                axes[1, 1].set_xlabel('Importance')
+                axes[1, 1].set_title('Parameter Importance')
+        except:
+            axes[1, 1].text(0.5, 0.5, 'Parameter importance\nnot available', 
+                           ha='center', va='center', transform=axes[1, 1].transAxes)
+            axes[1, 1].set_title('Parameter Importance')
+        
+        plt.tight_layout()
+        plt.savefig('results/hyperopt_optimization_plots.png', dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print("优化图表已保存到: results/hyperopt_optimization_plots.png")
+        
+    except ImportError:
+        print("警告: matplotlib未安装，跳过图表生成")
+    except Exception as e:
+        print(f"生成图表时出错: {e}")
+
+
+if __name__ == "__main__":
+    main()
