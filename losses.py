@@ -94,8 +94,21 @@ class PhysicsInformedLoss(nn.Module):
         
         # 约束3：高脆性材料更容易产生裂纹
         brittleness = hardness / (fracture_toughness + 1e-6)
-        brittleness_normalized = (brittleness - brittleness.mean()) / (brittleness.std() + 1e-6)
-        high_brittleness_mask = (brittleness_normalized > 1.0).float()
+        brittleness_mean = brittleness.mean()
+        
+        # 安全计算标准差，处理批次大小为1的情况
+        if brittleness.size(0) <= 1:
+            # 批次大小为1时不能计算样本标准差，使用简单阈值
+            high_brittleness_mask = (brittleness > brittleness_mean).float()
+        else:
+            # 批次大小大于1时，正常计算标准差
+            brittleness_std = brittleness.std()
+            # 如果标准差接近于0，使用简单阈值而不是标准化
+            if brittleness_std < 1e-4:
+                high_brittleness_mask = (brittleness > brittleness_mean).float()
+            else:
+                brittleness_normalized = (brittleness - brittleness_mean) / (brittleness_std + 1e-6)
+                high_brittleness_mask = (brittleness_normalized > 1.0).float()
         expected_crack_depth = pred.mean()
         constraint3 = high_brittleness_mask * F.relu(expected_crack_depth - pred.squeeze())
         

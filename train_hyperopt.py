@@ -10,10 +10,17 @@ import torch.nn as nn
 import numpy as np
 import pandas as pd
 import copy
+import os
+import json
+import pickle
+import traceback
+import matplotlib.pyplot as plt
+import matplotlib
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import r2_score, mean_squared_error
 from torch.utils.data import TensorDataset, DataLoader
 from torch.amp import autocast, GradScaler
+from torch.optim.lr_scheduler import OneCycleLR
 
 from models import MaterialCrackPGNN, GRAD_CLIP
 from losses import AdaptiveLoss
@@ -72,6 +79,9 @@ def create_model(trial, num_materials, space=None):
         material_embed_dim=material_embed_dim,
         latent_dim=latent_dim,
         num_blocks=num_blocks,
+        # 可选参数
+        dropout_rate=0.1,  # 默认值，可以省略
+        use_advanced_symbolic=True  # 控制是否使用高级符号层，默认为True
     )
 
     # 动态调整dropout率
@@ -106,38 +116,6 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
         use_augmentation = trial.suggest_categorical("augmentation", [True, False])
         optimizer_name = trial.suggest_categorical("optimizer", ["AdamW", "RMSprop"])
 
-        # 创建模型
-        model = create_model(trial, num_materials, space).to(device)
-
-        # 创建优化器
-        if optimizer_name == "AdamW":
-            optimizer = torch.optim.AdamW(
-                model.parameters(), lr=lr, weight_decay=weight_decay
-            )
-        else:
-            optimizer = torch.optim.RMSprop(
-                model.parameters(), lr=lr, weight_decay=weight_decay
-            )
-
-        # 学习率调度
-        warmup_epochs = min(10, epochs // 10)
-        def lr_lambda(epoch):
-            if epoch < warmup_epochs:
-                return epoch / warmup_epochs
-            else:
-                progress = (epoch - warmup_epochs) / (epochs - warmup_epochs)
-                return 0.5 * (1 + np.cos(np.pi * progress))
-
-        scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
-
-        # 损失函数
-        loss_fn = AdaptiveLoss(
-            lambda_complexity=lambda_complexity,
-            lambda_physics=lambda_physics,
-        )
-        loss_fn.total_epochs = epochs
-        scaler = GradScaler()
-
         # 准备数据
         train_df = reconstruct_df(train_data)
         if use_augmentation:
@@ -165,6 +143,39 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
             pin_memory=True,
             num_workers=0,
         )
+        
+        # 创建模型
+        model = create_model(trial, num_materials, space).to(device)
+
+        # 创建优化器
+        if optimizer_name == "AdamW":
+            optimizer = torch.optim.AdamW(
+                model.parameters(), lr=lr, weight_decay=weight_decay
+            )
+        else:
+            optimizer = torch.optim.RMSprop(
+                model.parameters(), lr=lr, weight_decay=weight_decay
+            )
+
+        # 替换学习率调度 - 使用 OneCycleLR
+        total_steps = epochs * len(train_loader)
+        scheduler = OneCycleLR(
+            optimizer,
+            max_lr=lr,
+            total_steps=total_steps,
+            pct_start=0.3,      # 30% 的步数用于预热
+            div_factor=25.0,    # 初始学习率 = max_lr/25
+            final_div_factor=1e4,  # 最终学习率 = max_lr/(25*10000)
+            anneal_strategy='cos'
+        )
+
+        # 损失函数
+        loss_fn = AdaptiveLoss(
+            lambda_complexity=lambda_complexity,
+            lambda_physics=lambda_physics,
+        )
+        loss_fn.total_epochs = epochs
+        scaler = GradScaler()
 
         # 验证数据
         val_materials = torch.LongTensor(val_data["material_ids"]).to(device)
@@ -257,11 +268,12 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
                     break
 
                 # 向Optuna报告中间结果
-                trial.report(val_r2, epoch)
+                if not hasattr(trial, '_reported_epochs'):
+                    trial._reported_epochs = set()
+                if epoch not in trial._reported_epochs:
+                    trial.report(val_r2, epoch)
+                    trial._reported_epochs.add(epoch)
                 
-                # 更新学习率
-                scheduler.step()
-
                 # 剪枝检查
                 if trial.should_prune() and epoch >= min_epochs_before_pruning:
                     raise optuna.TrialPruned()
@@ -512,6 +524,7 @@ def retrain_with_best_params(
         latent_dim=best_params.get("latent_dim", 64),
         dropout_rate=best_params.get("dropout_rate", 0.1),
         num_blocks=best_params.get("num_blocks", 3),
+        use_advanced_symbolic=best_params.get("use_advanced_symbolic", True),  # 添加新参数
     )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -563,11 +576,17 @@ def retrain_with_best_params(
             model.parameters(), lr=lr, weight_decay=best_params.get("weight_decay", 1e-4)
         )
 
-    # 学习率调度
+    # 学习率调度 - 使用 OneCycleLR
     epochs = best_params.get("epochs", 100)
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='max', factor=0.5, patience=5, verbose=True,
-        min_lr=1e-5, cooldown=5
+    total_steps = epochs * len(train_loader)
+    scheduler = torch.optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        total_steps=total_steps,
+        pct_start=0.3,      # 30% 的步数用于预热
+        div_factor=25.0,    # 初始学习率 = max_lr/25
+        final_div_factor=1e4,  # 最终学习率 = max_lr/(25*10000)
+        anneal_strategy='cos'
     )
 
     # 损失函数
@@ -618,6 +637,9 @@ def retrain_with_best_params(
                 torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
                 scaler.step(optimizer)
                 scaler.update()
+                
+                # 更新学习率 (OneCycleLR在每个batch后调用)
+                scheduler.step()
 
                 epoch_loss += loss.item() * batch_target.size(0)
                 
@@ -661,8 +683,7 @@ def retrain_with_best_params(
             print(f"Early stopping at epoch {epoch+1}")
             break
 
-        # 更新学习率
-        scheduler.step(test_r2)
+        # OneCycleLR不需要在每个epoch结束时调用step，已经在每个batch后更新
 
     # 恢复最佳权重
     if best_model_wts is not None:
@@ -718,7 +739,6 @@ def main():
     print()
     
     # 检查数据文件是否存在
-    import os
     if not os.path.exists(DATA_PATH):
         print(f"错误: 数据文件 '{DATA_PATH}' 不存在!")
         return
@@ -774,12 +794,10 @@ def main():
         torch.save(model.state_dict(), "results/best_hyperopt_model.pth")
         
         # 保存超参数
-        import json
         with open("results/best_hyperopt_params.json", "w", encoding="utf-8") as f:
             json.dump(study.best_params, f, indent=2, ensure_ascii=False)
         
         # 保存训练历史
-        import pickle
         with open("results/training_history.pkl", "wb") as f:
             pickle.dump({
                 "train_losses": train_losses,
@@ -815,7 +833,6 @@ def main():
         print("\n用户中断训练")
     except Exception as e:
         print(f"\n训练过程中出现错误: {e}")
-        import traceback
         traceback.print_exc()
 
 
@@ -824,8 +841,6 @@ def create_optimization_plots(study, train_losses, test_r2_history):
     创建优化过程的可视化图表
     """
     try:
-        import matplotlib.pyplot as plt
-        import matplotlib
         matplotlib.use('Agg')  # 使用非交互式后端
         
         fig, axes = plt.subplots(2, 2, figsize=(15, 12))
