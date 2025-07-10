@@ -7,44 +7,83 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
-
+import traceback
+import matplotlib.pyplot as plt
+import numpy as np
 # 全局梯度裁剪阈值
 GRAD_CLIP = 5.0
+# 全局安全常量
+MAX_SAFE_VAL = 1e4      # 降低最大安全值
+MIN_SAFE_EPS = 1e-6     # 确保最小安全值
+SQRT_MAX = 1e3          # 开方最大值
+LOG_MAX = 1e3           # 对数最大值
+EXP_MAX = 4.0           # 指数最大值，e^4 ≈ 54.6，比e^10小得多
 
 # ===== 安全数值操作函数 =====
-def safe_division(numerator, denominator, eps=1e-6, max_val=1e6):
+def safe_division(numerator, denominator, eps=MIN_SAFE_EPS, max_val=MAX_SAFE_VAL):
     """安全除法，防止除零和数值爆炸"""
+    # 预处理分子，避免过大值
+    numerator = torch.clamp(numerator, min=-max_val, max=max_val)
+    # 确保分母不为零且不过大
     denominator = torch.clamp(torch.abs(denominator) + eps, min=eps, max=max_val)
+    # 计算结果并再次限制范围
     result = numerator / denominator
-    return torch.clamp(result, min=-max_val, max=max_val)
+    return torch.clamp(result, min=-max_val/10, max=max_val/10)  # 额外限制结果范围
 
-def safe_sqrt(x, eps=1e-8):
+def safe_sqrt(x, eps=MIN_SAFE_EPS):
     """安全开方运算"""
-    return torch.sqrt(torch.clamp(torch.abs(x) + eps, min=eps, max=1e6))
+    # 确保输入为非负且有合理上限
+    x_safe = torch.clamp(torch.abs(x) + eps, min=eps, max=SQRT_MAX)
+    return torch.sqrt(x_safe)
 
-def safe_log(x, eps=1e-8):
+def safe_log(x, eps=MIN_SAFE_EPS):
     """安全对数运算"""
-    return torch.log(torch.clamp(torch.abs(x) + eps, min=eps, max=1e6))
+    # 确保输入严格为正且有合理上限
+    x_safe = torch.clamp(torch.abs(x) + eps, min=eps, max=LOG_MAX)
+    return torch.log(x_safe)
 
-def safe_exp(x, max_val=10):
-    """安全指数运算"""
-    return torch.exp(torch.clamp(x, min=-max_val, max=max_val))
+def safe_exp(x, max_val=EXP_MAX):
+    """安全指数运算，输出范围更加有限"""
+    # 严格限制输入范围，避免e^x爆炸
+    x_safe = torch.clamp(x, min=-max_val, max=max_val)
+    return torch.exp(x_safe)
+
+def safe_power(x, power, max_val=MAX_SAFE_VAL):
+    """安全幂运算，预处理输入防止数值爆炸"""
+    if power > 1:
+        # 对于大于1的幂，需要更严格的限制
+        # 使用n次根计算安全范围：x^n ≤ max_val => x ≤ max_val^(1/n)
+        safe_range = max_val ** (1.0/power)
+        x_safe = torch.clamp(x, min=-safe_range, max=safe_range)
+    else:
+        # 对于小于等于1的幂，使用标准限制
+        x_safe = torch.clamp(x, min=-max_val/2, max=max_val/2)
+    
+    # 对于非整数幂，确保输入为正
+    if power != int(power):
+        x_safe = torch.abs(x_safe) + MIN_SAFE_EPS
+    
+    # 计算幂并限制结果
+    result = x_safe ** power
+    return torch.clamp(result, min=-max_val, max=max_val)
 
 def check_and_fix_tensor(tensor, name="tensor"):
     """检查并修复tensor中的NaN和Inf"""
     if torch.isnan(tensor).any() or torch.isinf(tensor).any():
         print(f"Warning: NaN/Inf detected in {name}, replacing with safe values")
-        tensor = torch.nan_to_num(tensor, nan=0.0, posinf=1.0, neginf=-1.0)
-    return torch.clamp(tensor, min=-1e6, max=1e6)
+        tensor = torch.nan_to_num(tensor, nan=0.0, posinf=MAX_SAFE_VAL/100, neginf=-MAX_SAFE_VAL/100)
+    return torch.clamp(tensor, min=-MAX_SAFE_VAL, max=MAX_SAFE_VAL)
 
 
 # ===== 基础组件 =====
 class MaterialEmbedding(nn.Module):
     """材料种类嵌入层"""
-    def __init__(self, num_materials, embedding_dim=16):
+    def __init__(self, num_materials, embedding_dim=16, init_gain=0.5):
         super().__init__()
         self.embedding = nn.Embedding(num_materials, embedding_dim)
-
+        # 保持与原始代码相同的初始化方式
+        nn.init.xavier_uniform_(self.embedding.weight, gain=init_gain)
+    
     def forward(self, material_ids):
         return self.embedding(material_ids)
 
@@ -53,22 +92,19 @@ class ResidualBlock(nn.Module):
     """残差连接块，提高训练稳定性"""
     def __init__(self, dim, dropout_rate=0.1):
         super().__init__()
-        self.layer_norm1 = nn.LayerNorm(dim)
-        self.fc1 = nn.Linear(dim, dim * 2)
+        # 修改为与主类中相同的结构
+        self.linear = nn.Linear(dim, dim)
+        self.layer_norm = nn.LayerNorm(dim)
         self.act = nn.GELU()
-        self.layer_norm2 = nn.LayerNorm(dim * 2)
         self.dropout = nn.Dropout(dropout_rate)
-        self.fc2 = nn.Linear(dim * 2, dim)
 
     def forward(self, x):
-        residual = x
-        out = self.layer_norm1(x)
-        out = self.fc1(out)
+        # 注意：不在这里应用额外的GELU，因为主类会在残差连接后应用
+        out = self.linear(x)
+        out = self.layer_norm(out)
         out = self.act(out)
-        out = self.layer_norm2(out)
         out = self.dropout(out)
-        out = self.fc2(out)
-        return out + residual
+        return out + x  # 残差连接
 
 
 # ===== 物理特征提取器 =====
@@ -91,15 +127,15 @@ class PhysicsInformedFeatureExtractor(nn.Module):
         features = [x]
         
         # 提取各个特征（原始尺度）
-        hardness = x[:, 0:1]
+        hardness = x[:, 0:1].clamp(min=0.0)  # 硬度应为正值
         elastic_modulus = x[:, 1:2].clamp(min=1.0)
         fracture_toughness = x[:, 2:3].clamp(min=0.1)
         grain_size = x[:, 3:4].clamp(min=0.001)
         pressure = x[:, 4:5]
-        velocity = x[:, 5:6]
+        velocity = x[:, 5:6].clamp(min=0.0, max=1e3) 
         
         eps = 1e-6
-        
+        # 各种物理特征计算
         # 1. Griffith能量释放率 G = σ²πa/E
         energy_release = (pressure ** 2 * np.pi * grain_size) / (elastic_modulus + eps)
         energy_release = torch.tanh(energy_release / 100) * self.feature_scales[0]
@@ -171,26 +207,54 @@ class PhysicsInformedFeatureExtractor(nn.Module):
 # ===== 符号层（复杂版本） =====
 class AdaptiveSymbolicLayer(nn.Module):
     """
-    自适应符号层
-    使用注意力机制和多种数学操作符生成符号表达式
+    自适应符号层 - 完整版
+    整合物理特征提取器，使用完整的Transformer架构（双残差连接）
+    实现交叉注意力机制从物理特征中提取与潜在表示相关的信息
     """
     def __init__(self, latent_dim: int = 32):
         super().__init__()
         
-        self.num_features = 19
+        # 内置物理特征提取器
+        self.physics_extractor = PhysicsInformedFeatureExtractor()
+        
         # 确保注意力头数能整除latent_dim
         self.num_heads = max(1, (latent_dim // 8) * 2)
         if latent_dim % self.num_heads != 0:
             self.num_heads = 1
-            
-        self.attention = nn.MultiheadAttention(
-            latent_dim, num_heads=self.num_heads, batch_first=True
+        
+        # --- Transformer架构组件 ---
+        # 1. 输入投影
+        self.query_proj = nn.Linear(latent_dim, latent_dim)
+        self.key_proj = nn.Linear(1, latent_dim)
+        self.value_proj = nn.Linear(1, latent_dim)
+        
+        # 2. 多头交叉注意力层
+        self.cross_attention = nn.MultiheadAttention(
+            embed_dim=latent_dim,
+            num_heads=self.num_heads,
+            batch_first=True,
+            dropout=0.1
         )
+        
+        # 3. 第一个残差连接后的层归一化
         self.attn_norm = nn.LayerNorm(latent_dim)
         
+        # 4. 前馈神经网络（Transformer标准组件）
+        self.feed_forward = nn.Sequential(
+            nn.Linear(latent_dim, latent_dim * 4),  # 扩展维度
+            nn.GELU(),
+            nn.Dropout(0.1),
+            nn.Linear(latent_dim * 4, latent_dim)   # 恢复维度
+        )
+        
+        # 5. 第二个残差连接后的层归一化
+        self.ffn_norm = nn.LayerNorm(latent_dim)
+        
+        # --- 符号表达式生成组件 ---
         self.operators = ["*", "/", "^2", "^3", "sqrt", "log", "exp", "sin"]
         self.num_operators = len(self.operators)
 
+        # 特征选择器（哪些物理特征重要）
         self.variable_selector = nn.Sequential(
             nn.Linear(latent_dim, 64),
             nn.GELU(),
@@ -199,14 +263,17 @@ class AdaptiveSymbolicLayer(nn.Module):
             nn.Linear(64, 8),
         )
 
+        # 运算符选择器（使用什么数学运算）
         self.operator_selector = nn.Sequential(
             nn.Linear(latent_dim, 32),
             nn.GELU(),
             nn.LayerNorm(32),
-            nn.Dropout(0.1),
+            nn.Dropout(0.2),
             nn.Linear(32, self.num_operators),
+            nn.Tanh(),  # 添加Tanh限制输出范围
         )
 
+        # 系数生成网络（多项式系数）
         self.coefficient_net = nn.Sequential(
             nn.Linear(latent_dim, 32),
             nn.GELU(),
@@ -215,37 +282,89 @@ class AdaptiveSymbolicLayer(nn.Module):
             nn.Linear(32, 4),
         )
 
+        # 门控机制（平衡多项式与运算符表达式）
         self.gate = nn.Sequential(
             nn.Linear(latent_dim, 1), 
             nn.Sigmoid()
         )
+        
+        # 用于可解释性分析的属性
+        self.last_attn_weights = None
+        self.last_var_weights = None
+        self.last_op_weights = None
+        self.last_coeffs = None
+        self.complexity = 0.0
 
-    def forward(self, z: torch.Tensor, physics_features: torch.Tensor) -> torch.Tensor:
+    def forward(self, z: torch.Tensor, numeric_raw: torch.Tensor) -> torch.Tensor:
+        """
+        前向传播
+        z: [batch_size, latent_dim] - 潜在表示
+        numeric_raw: [batch_size, 6] - 原始尺度的物理特征
+        """
         # 输入检查
         z = check_and_fix_tensor(z, "symbolic_z")
-        physics_features = check_and_fix_tensor(physics_features, "symbolic_physics_features")
+        numeric_raw = check_and_fix_tensor(numeric_raw, "symbolic_numeric_raw")
         
-        # 注意力机制
+        # 1. 提取物理特征
+        physics_features = self.physics_extractor(numeric_raw)
+        physics_features = check_and_fix_tensor(physics_features, "extracted_physics_features")
+        
+        # 2. 准备交叉注意力的输入
+        # z作为query
+        query = self.query_proj(z).unsqueeze(1)  # [B, 1, latent_dim]
+        
+        # 物理特征作为key和value - 每个特征单独编码
+        batch_size = physics_features.size(0)
+        phys_features_seq = physics_features.unsqueeze(2)  # [B, num_features, 1]
+        key = self.key_proj(phys_features_seq)    # [B, num_features, latent_dim]
+        value = self.value_proj(phys_features_seq)  # [B, num_features, latent_dim]
+        
+        # 3. 应用交叉注意力（第一个Transformer块）
         try:
-            attn_out, _ = self.attention(z.unsqueeze(1), z.unsqueeze(1), z.unsqueeze(1))
-            z = attn_out.squeeze(1)
-            z = self.attn_norm(z)
-            z = check_and_fix_tensor(z, "attention_output")
+            attn_output, attn_weights = self.cross_attention(
+                query=query,
+                key=key,
+                value=value,
+                need_weights=True
+            )
+            
+            # 保存注意力权重用于可解释性分析
+            self.last_attn_weights = attn_weights
+            
+            # 提取注意力输出
+            attn_output = attn_output.squeeze(1)
+            
+            # 第一个残差连接 + 层归一化
+            z_attn = z + attn_output  # 残差连接 1
+            z_attn = self.attn_norm(z_attn)
+            z_attn = check_and_fix_tensor(z_attn, "attention_output")
+            
+            # 4. 前馈网络（第二个Transformer块）
+            ffn_output = self.feed_forward(z_attn)
+            
+            # 第二个残差连接 + 层归一化
+            z = z_attn + ffn_output  # 残差连接 2
+            z = self.ffn_norm(z)
+            z = check_and_fix_tensor(z, "ffn_output")
+            
         except Exception as e:
-            print(f"Warning: Attention failed ({e}), using original z")
-            z = check_and_fix_tensor(z, "attention_fallback")
+            print(f"Warning: Transformer processing failed ({e}), using original z")
+            traceback.print_exc()
+            z = check_and_fix_tensor(z, "transformer_fallback")
 
-        # 特征选择权重
+        # 5. 特征选择权重
         var_weights = F.softmax(torch.clamp(self.variable_selector(z), -5, 5), dim=-1)
         op_weights = F.softmax(torch.clamp(self.operator_selector(z), -5, 5), dim=-1)
         coeffs = torch.clamp(self.coefficient_net(z), -5, 5)
         
-        # 特征降维处理
-        batch_size = physics_features.size(0)
-        feature_dim = physics_features.size(1)
+        # 保存权重用于可解释性
+        self.last_var_weights = var_weights
+        self.last_op_weights = op_weights
+        self.last_coeffs = coeffs
         
-        pool_size = min(8, feature_dim)
-        if feature_dim > pool_size:
+        # 6. 获取一个池化版本的物理特征用于符号表达式
+        pool_size = min(8, physics_features.size(1))
+        if physics_features.size(1) > pool_size:
             pooled_features = F.adaptive_avg_pool1d(
                 physics_features.unsqueeze(1), pool_size
             ).squeeze(1)
@@ -258,23 +377,23 @@ class AdaptiveSymbolicLayer(nn.Module):
         
         pooled_features = check_and_fix_tensor(pooled_features, "pooled_features")
         
-        # 加权特征组合
+        # 7. 加权特征组合
         selected_features = (var_weights * pooled_features).sum(dim=1, keepdim=True)
         selected_features = check_and_fix_tensor(selected_features, "selected_features")
 
-        # 符号表达式计算
+        # 8.符号表达式计算
         expressions = []
         expressions.append(coeffs[:, 0:1] * selected_features)
-        expressions.append(coeffs[:, 1:2] * (selected_features ** 2))
-        expressions.append(coeffs[:, 2:3] * (selected_features ** 3))
+        expressions.append(coeffs[:, 1:2] * safe_power(selected_features, 2))
+        expressions.append(coeffs[:, 2:3] * safe_power(selected_features, 3))
         expressions.append(coeffs[:, 3:4] * safe_sqrt(selected_features))
 
-        # 算子操作
+        # 9算子操作
         ops = [
             selected_features,
             safe_division(torch.ones_like(selected_features), selected_features),
-            selected_features ** 2,
-            selected_features ** 3,
+            safe_power(selected_features, 2),
+            safe_power(selected_features, 3),
             safe_sqrt(selected_features),
             safe_log(selected_features),
             safe_exp(torch.clamp(selected_features, -5, 5)),
@@ -283,7 +402,7 @@ class AdaptiveSymbolicLayer(nn.Module):
         
         ops = [check_and_fix_tensor(op, f"op_{i}") for i, op in enumerate(ops)]
         
-        # 算子组合
+        # 10. 算子组合
         try:
             op_stack = torch.stack(ops, dim=1).squeeze(-1)
             op_stack = check_and_fix_tensor(op_stack, "op_stack")
@@ -293,25 +412,67 @@ class AdaptiveSymbolicLayer(nn.Module):
             print(f"Warning: Operator combination failed ({e}), using fallback")
             op_comb = selected_features
 
-        # 最终输出
+        # 11. 最终输出
         gate_value = self.gate(z)
         gate_value = check_and_fix_tensor(gate_value, "gate_value")
-        
+
         symbolic_output = sum(expressions) * gate_value + op_comb
         symbolic_output = check_and_fix_tensor(symbolic_output, "symbolic_output")
 
-        # 复杂度计算
+        # 确保输出形状正确 [batch_size, 1]
+        batch_size = symbolic_output.size(0)
+        symbolic_output = symbolic_output.reshape(batch_size, -1)
+        if symbolic_output.size(1) != 1:
+            symbolic_output = symbolic_output[:, :1]
+
+        # 12. 复杂度计算
         try:
             self.complexity = -torch.sum(
                 var_weights * safe_log(var_weights), dim=-1
             ).mean()
-            self.complexity = check_and_fix_tensor(
-                torch.tensor(self.complexity), "complexity"
-            ).item()
+            if isinstance(self.complexity, torch.Tensor):
+                self.complexity = float(self.complexity.detach().item())
+            else:
+                self.complexity = float(self.complexity)
         except:
             self.complexity = 0.0
 
         return symbolic_output
+    
+    def get_interpretation(self):
+        """返回符号层的可解释性信息"""
+        interpretation = {
+            "attention_weights": self.last_attn_weights.detach().cpu() if self.last_attn_weights is not None else None,
+            "variable_weights": self.last_var_weights.detach().cpu() if hasattr(self, 'last_var_weights') else None,
+            "operator_weights": self.last_op_weights.detach().cpu() if hasattr(self, 'last_op_weights') else None,
+            "coefficients": self.last_coeffs.detach().cpu() if hasattr(self, 'last_coeffs') else None,
+            "complexity": self.complexity if hasattr(self, 'complexity') else 0.0,
+            "operators": self.operators
+        }
+        return interpretation
+    
+    def visualize_attention(self, feature_names=None):
+        """可视化注意力权重"""
+        if self.last_attn_weights is None:
+            print("No attention weights available yet. Run forward pass first.")
+            return None
+
+        
+        # 默认物理特征名称
+        if feature_names is None:
+            feature_names = [f"Feature {i}" for i in range(self.last_attn_weights.shape[-1])]
+
+        # 绘制热力图
+        plt.figure(figsize=(10, 4))
+        plt.imshow(self.last_attn_weights.detach().cpu().numpy().squeeze(), cmap='viridis')
+        plt.colorbar(label='Attention Weight')
+        plt.xlabel('Physical Features')
+        plt.ylabel('Query')
+        plt.title('Cross-Attention Weights')
+        plt.xticks(np.arange(len(feature_names)), feature_names, rotation=90)
+        plt.tight_layout()
+        
+        return plt
 
 
 # ===== 主模型 =====
@@ -327,12 +488,16 @@ class MaterialCrackPGNN(nn.Module):
         latent_dim: int = 32,
         dropout_rate: float = 0.1,
         num_blocks: int = 2,
+        use_advanced_symbolic: bool = True,  # 增加参数控制是否使用高级符号层
     ):
         super().__init__()
         
         # 材料嵌入
-        self.material_embedding = nn.Embedding(num_materials, material_embed_dim)
-        nn.init.xavier_uniform_(self.material_embedding.weight, gain=0.5)
+        self.material_embedding = MaterialEmbedding(
+            num_materials, 
+            embedding_dim=material_embed_dim,
+            init_gain=0.5 
+        )
         
         # 物理特征提取（使用原始尺度数据）
         self.physics_extractor = PhysicsInformedFeatureExtractor()
@@ -365,22 +530,22 @@ class MaterialCrackPGNN(nn.Module):
         
         # 残差块
         self.blocks = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(latent_dim, latent_dim),
-                nn.LayerNorm(latent_dim),
-                nn.GELU(),
-                nn.Dropout(dropout_rate)
-            ) for _ in range(num_blocks)
+            ResidualBlock(latent_dim, dropout_rate) 
+            for _ in range(num_blocks)
         ])
         
-        # 简化的符号层
-        self.symbolic_layer = nn.Sequential(
-            nn.Linear(latent_dim, 32),
-            nn.GELU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(32, 1),
-            nn.Tanh()  # 限制输出范围
-        )
+        # 符号层 - 选择使用高级符号层或简化符号层
+        self.use_advanced_symbolic = use_advanced_symbolic
+        if use_advanced_symbolic:
+            self.symbolic_layer = AdaptiveSymbolicLayer(latent_dim=latent_dim)
+        else:
+            self.symbolic_layer = nn.Sequential(
+                nn.Linear(latent_dim, 32),
+                nn.GELU(),
+                nn.Dropout(dropout_rate),
+                nn.Linear(32, 1),
+                nn.Tanh()  # 限制输出范围
+            )
         
         # 残差预测头
         self.residual_head = nn.Sequential(
@@ -426,11 +591,26 @@ class MaterialCrackPGNN(nn.Module):
         
         # 5. 通过残差块
         for block in self.blocks:
-            z = z + block(z)  # 残差连接
-            z = F.gelu(z)
+            z = block(z)  # 使用ResidualBlock类
+            z = F.gelu(z)  # 额外的GELU激活
         
-        # 6. 符号输出
-        symbolic = self.symbolic_layer(z)
+        # 6. 符号输出 - 根据使用的符号层类型调用不同的前向传播
+        if self.use_advanced_symbolic:
+            # 高级符号层需要潜在向量z和原始物理特征
+            symbolic = self.symbolic_layer(z, numeric_raw)
+            
+            # 检查并修复维度问题
+            if symbolic.dim() > 2:
+                # 保留批次维度，展平其他维度
+                batch_size = symbolic.size(0)
+                symbolic = symbolic.reshape(batch_size, -1)
+                
+            # 确保是 [batch_size, 1] 形状
+            if symbolic.size(1) != 1:
+                symbolic = symbolic[:, :1]
+        else:
+            # 简化符号层只需要潜在向量z
+            symbolic = self.symbolic_layer(z)
         
         # 7. 残差预测
         residual_input = torch.cat([z, symbolic], dim=-1)
@@ -444,6 +624,23 @@ class MaterialCrackPGNN(nn.Module):
         uncertainty = torch.exp(log_var) + 0.01
         
         return prediction, uncertainty, symbolic, residual
+    
+    # 获取符号层的解释性信息（如果使用高级符号层）
+    def get_symbolic_interpretation(self):
+        """获取符号层的解释性信息"""
+        if self.use_advanced_symbolic:
+            return self.symbolic_layer.get_interpretation()
+        else:
+            return {"message": "使用的是简化符号层，没有可解释性信息"}
+    
+    # 可视化注意力权重（如果使用高级符号层）
+    def visualize_symbolic_attention(self, feature_names=None):
+        """可视化符号层的注意力权重"""
+        if self.use_advanced_symbolic:
+            return self.symbolic_layer.visualize_attention(feature_names)
+        else:
+            print("使用的是简化符号层，没有注意力权重可视化")
+            return None
 
     def predict_with_uncertainty(self, material_ids, num_scaled, num_raw, n_samples=10):
         """使用MC Dropout进行带不确定性的预测"""
