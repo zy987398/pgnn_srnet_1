@@ -95,13 +95,24 @@ def augment_dataset(orig_df, noise_scale=0.05):
         return orig_df  # 出错时返回原始数据
 
 
-def create_model(trial, num_materials):
-    """根据trial创建模型"""
+def create_model(trial, num_materials, fixed_params=None):
+    """根据trial创建模型，支持固定参数"""
+    fixed_params = fixed_params or {}
+    
     # 模型架构超参数
-    material_embed_dim = trial.suggest_int(
-        "material_embed_dim", 8, 32, step=8
-    )  # 缩小范围
-    latent_dim = trial.suggest_int("latent_dim", 16, 64, step=16)  # 缩小范围
+    if "material_embed_dim" in fixed_params:
+        material_embed_dim = fixed_params["material_embed_dim"]
+        print(f"  使用预设材料嵌入维度: {material_embed_dim}")
+    else:
+        material_embed_dim = trial.suggest_int(
+            "material_embed_dim", 8, 32, step=8
+        )  # 缩小范围
+    
+    if "latent_dim" in fixed_params:
+        latent_dim = fixed_params["latent_dim"]
+        print(f"  使用预设潜在维度: {latent_dim}")
+    else:
+        latent_dim = trial.suggest_int("latent_dim", 16, 64, step=16)  # 缩小范围
 
     # 创建模型并修改部分架构
     model = MaterialCrackPGNN(
@@ -110,10 +121,15 @@ def create_model(trial, num_materials):
         latent_dim=latent_dim,
     )
 
-    # 动态调整dropout率 - 提高范围以增强正则化
-    dropout_rate = trial.suggest_float(
-        "dropout_rate", 0.2, 0.4, step=0.05
-    )  # 更高的dropout范围
+    # 动态调整dropout率
+    if "dropout_rate" in fixed_params:
+        dropout_rate = fixed_params["dropout_rate"]
+        print(f"  使用预设Dropout率: {dropout_rate}")
+    else:
+        dropout_rate = trial.suggest_float(
+            "dropout_rate", 0.3, 0.4, step=0.05
+        )  # 更高的dropout范围
+        
     for module in model.modules():
         if isinstance(module, nn.Dropout):
             module.p = dropout_rate
@@ -121,40 +137,84 @@ def create_model(trial, num_materials):
     return model
 
 
-def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
-    """使用给定的超参数训练模型"""
+def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
+                fixed_params=None):
+    """使用给定的超参数训练模型，支持固定参数（用于第二阶段）"""
     try:
         # 记录开始时间
         start_time = time.time()
         trial_num = trial.number if hasattr(trial, 'number') else '?'
         
-        # 训练超参数 - 调整以提高泛化性能
-        lr = trial.suggest_float("lr", 0.0005, 0.003, log=True)  # 更窄的学习率范围
-        epochs = trial.suggest_int("epochs", 200, 500, step=50)  # 减小上限
-        batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+        # 初始化固定参数字典
+        fixed_params = fixed_params or {}
+        
+        # 训练超参数 - 使用固定值或试验建议
+        if "lr" in fixed_params:
+            lr = fixed_params["lr"]
+            print(f"  使用预设学习率: {lr:.1e}")
+        else:
+            lr = trial.suggest_float("lr", 0.0005, 0.003, log=True)  # 更窄的学习率范围
+            
+        if "epochs" in fixed_params:
+            epochs = fixed_params["epochs"]
+            print(f"  使用预设训练周期: {epochs}")
+        else:
+            epochs = trial.suggest_int("epochs", 200, 500, step=50)  # 减小上限
+        
+        # 批次大小 (类别参数)
+        if "batch_size" in fixed_params:
+            batch_size = fixed_params["batch_size"]
+            print(f"  使用预设批次大小: {batch_size}")
+        else:
+            batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
 
-        # 权重衰减 - 增强正则化
-        weight_decay = trial.suggest_float("weight_decay", 1e-4, 5e-3, log=True)  # 提高范围
+        # 权重衰减
+        if "weight_decay" in fixed_params:
+            weight_decay = fixed_params["weight_decay"]
+            print(f"  使用预设权重衰减: {weight_decay:.1e}")
+        else:
+            weight_decay = trial.suggest_float("weight_decay", 3e-3, 1e-2, log=True)  # 提高范围
 
-        # 损失函数超参数 - 增强正则化
-        lambda_complexity = trial.suggest_float("lambda_complexity", 1e-5, 1e-3, log=True)  # 提高符号表达式约束
-        lambda_physics = trial.suggest_float("lambda_physics", 0.1, 0.5, step=0.05)  # 提高物理约束
+        # 损失函数超参数
+        if "lambda_complexity" in fixed_params:
+            lambda_complexity = fixed_params["lambda_complexity"]
+            print(f"  使用预设复杂度权重: {lambda_complexity:.1e}")
+        else:
+            lambda_complexity = trial.suggest_float("lambda_complexity", 1e-5, 1e-3, log=True)  # 提高符号表达式约束
+            
+        if "lambda_physics" in fixed_params:
+            lambda_physics = fixed_params["lambda_physics"]
+            print(f"  使用预设物理权重: {lambda_physics}")
+        else:
+            lambda_physics = trial.suggest_float("lambda_physics", 0.1, 0.5, step=0.05)  # 提高物理约束
 
-        # 早停参数 - 更敏感
-        patience = trial.suggest_int("patience", 20, 40, step=5)
+        # 早停参数
+        if "patience" in fixed_params:
+            patience = fixed_params["patience"]
+            print(f"  使用预设早停耐心值: {patience}")
+        else:
+            patience = trial.suggest_int("patience", 20, 40, step=5)
 
-        # 数据增强
-        use_augmentation = trial.suggest_categorical("augmentation", [True, False])
+        # 数据增强 (类别参数)
+        if "augmentation" in fixed_params:
+            use_augmentation = fixed_params["augmentation"]
+            print(f"  使用预设数据增强: {use_augmentation}")
+        else:
+            use_augmentation = trial.suggest_categorical("augmentation", [True, False])
 
-        # 优化器选择
-        optimizer_name = trial.suggest_categorical("optimizer", 
+        # 优化器选择 (类别参数)
+        if "optimizer" in fixed_params:
+            optimizer_name = fixed_params["optimizer"]
+            print(f"  使用预设优化器: {optimizer_name}")
+        else:
+            optimizer_name = trial.suggest_categorical("optimizer", 
                                              ["AdamW", "RMSprop", "Adam", "RAdam", "SGD", "NAdam"])
 
         print(f"\nTrial {trial_num}: 开始训练 (LR={lr:.1e}, 批次大小={batch_size}, "
               f"权重衰减={weight_decay:.1e}, 优化器={optimizer_name}, 增强数据={use_augmentation})")
               
-        # 创建模型
-        model = create_model(trial, num_materials).to(device)
+        # 创建模型 - 传递固定参数
+        model = create_model(trial, num_materials, fixed_params).to(device)
         
         # 打印模型参数总数
         total_params = sum(p.numel() for p in model.parameters())
@@ -376,15 +436,23 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
         return best_val_r2 if best_val_r2 > -float("inf") else -1.0
 
 
-def objective(trial, df, device, seed, space=None):
+def objective(trial, df, device, seed, space=None, fixed_params=None):
     """Optuna目标函数，5折交叉验证，支持第二阶段精细搜索"""
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
     fold_scores = []
     
-    # 如果提供了搜索空间，根据搜索空间约束试验参数
+    # 初始化固定参数字典
+    fixed_params = fixed_params or {}
+    
+    # 如果提供了搜索空间，根据搜索空间约束创建新的参数
+    # 但不重新定义已经固定的参数
     if space is not None:
-        # 应用搜索空间约束 - 不再使用内部API _suggest，改为使用公开API
+        # 应用搜索空间约束，只对非固定参数使用suggest API
         for param_name, bounds in space.items():
+            # 跳过已经固定的参数
+            if param_name in fixed_params:
+                continue
+                
             if isinstance(bounds, tuple) and len(bounds) == 2:
                 if param_name == "lr" or param_name == "weight_decay" or param_name == "lambda_complexity" or param_name == "lambda_physics":
                     # 对数均匀分布
@@ -407,8 +475,8 @@ def objective(trial, df, device, seed, space=None):
                 else:
                     # 均匀分布
                     trial.suggest_float(param_name, bounds[0], bounds[1])
-            elif isinstance(bounds, list):
-                # 类别分布
+            elif isinstance(bounds, list) and param_name not in fixed_params:
+                # 只有非固定的类别参数才使用suggest
                 trial.suggest_categorical(param_name, bounds)
     
     # 进行5折交叉验证
@@ -424,7 +492,15 @@ def objective(trial, df, device, seed, space=None):
         )
         num_materials = train_data["num_materials"]
 
-        r2 = train_with_trial(trial, train_data, val_data, num_materials, device)
+        # 使用更新后的train_with_trial函数，传递所有固定参数
+        r2 = train_with_trial(
+            trial, 
+            train_data, 
+            val_data, 
+            num_materials, 
+            device,
+            fixed_params=fixed_params
+        )
         fold_scores.append(r2)
 
     return float(np.mean(fold_scores))
@@ -507,6 +583,14 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_st
         print(f"  {key}: {value}")
 
     # 阶段2: TPE微调 - 在有希望的区域进行精细搜索
+    # 从第一阶段获取所有最佳参数作为固定值
+    fixed_params = {}
+    if completed_trials:
+        # 所有阶段1的最佳参数都固定在阶段2中
+        for param_name, param_value in study1.best_params.items():
+            fixed_params[param_name] = param_value
+            print(f"第2阶段将使用固定 {param_name} = {param_value}")
+    
     print(f"\n开始第2阶段: 精细TPE搜索 ({n_trials_stage2}次试验)")
     study2 = optuna.create_study(
         direction="maximize", 
@@ -515,7 +599,7 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_st
     )
 
     study2.optimize(
-        lambda trial: objective(trial, df, device, seed, space),
+        lambda trial: objective(trial, df, device, seed, space, fixed_params),
         n_trials=n_trials_stage2,
         show_progress_bar=True,
         catch=(Exception,),
@@ -630,18 +714,39 @@ def retrain_with_best_params(
 
     # 创建模型
     best_params = study.best_params
+    
+    # 如果第二阶段全部使用固定参数，那么best_params可能是空的
+    # 在这种情况下，我们从study.trials中获取最佳trial的值
+    if not best_params and study.trials:
+        best_trial = study.best_trial
+        # 使用_values属性获取固定参数
+        fixed_values = best_trial._values
+        # 检查用户属性来获取架构参数
+        if hasattr(best_trial, "user_attrs") and best_trial.user_attrs:
+            for key, value in best_trial.user_attrs.items():
+                if key not in best_params:
+                    best_params[key] = value
+        
+        # 固定参数
+        fixed_params = {
+            "material_embed_dim": 8,
+            "latent_dim": 64,
+            "dropout_rate": 0.4
+        }
+        best_params.update(fixed_params)
+    
     model = MaterialCrackPGNN(
         num_materials=train_data["num_materials"],
-        material_embed_dim=best_params["material_embed_dim"],
-        latent_dim=best_params["latent_dim"],
-        dropout_rate=best_params["dropout_rate"],
+        material_embed_dim=best_params.get("material_embed_dim", 16),  # 提供默认值
+        latent_dim=best_params.get("latent_dim", 32),  # 提供默认值
+        dropout_rate=best_params.get("dropout_rate", 0.3),  # 提供默认值
     )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model = model.to(device)
 
     # 使用最佳参数准备增强数据
-    use_augmentation = best_params.get("augmentation", False)
+    use_augmentation = best_params.get("augmentation", True)  # 默认使用数据增强
     train_df_for_aug = train_df.copy()
     
     # 显式应用数据增强（如果启用）
@@ -680,16 +785,21 @@ def retrain_with_best_params(
     test_target = torch.FloatTensor(test_data["target"]).unsqueeze(1).to(device)
 
     # 优化器
-    lr = best_params["lr"]
-    if best_params.get("optimizer", "AdamW") == "AdamW":
+    lr = best_params.get("lr", 1.5e-3)  # 提供默认学习率
+    optimizer_name = best_params.get("optimizer", "AdamW")
+    if optimizer_name == "AdamW":
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=lr, weight_decay=best_params.get("weight_decay", 0)
+            model.parameters(), lr=lr, weight_decay=best_params.get("weight_decay", 8.9e-3)
         )
+    elif optimizer_name == "RMSprop":
+        optimizer = torch.optim.RMSprop(model.parameters(), lr=lr, weight_decay=best_params.get("weight_decay", 8.9e-3))
+    elif optimizer_name == "RAdam":
+        optimizer = torch.optim.RAdam(model.parameters(), lr=lr, weight_decay=best_params.get("weight_decay", 8.9e-3))
     else:
-        optimizer = torch.optim.RMSprop(model.parameters(), lr=lr)
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=best_params.get("weight_decay", 8.9e-3))
 
     # 学习率调度
-    epochs = best_params["epochs"]
+    epochs = best_params.get("epochs", 400)  # 提供默认训练轮数
     
     # 使用 OneCycleLR 学习率调度
     total_steps = epochs * len(train_loader)
@@ -705,8 +815,8 @@ def retrain_with_best_params(
 
     # 损失函数
     loss_fn = PhysicsInformedLoss(
-        lambda_complexity=best_params["lambda_complexity"],
-        lambda_physics=best_params["lambda_physics"],
+        lambda_complexity=best_params.get("lambda_complexity", 1.2e-5),  # 提供默认复杂度权重
+        lambda_physics=best_params.get("lambda_physics", 0.2),  # 提供默认物理权重
         weight_decay=0.0,
     )
     loss_fn.total_epochs = epochs
@@ -997,9 +1107,9 @@ if __name__ == "__main__":
         top_k = 1
         log_message("[警告] 调试模式: 仅运行少量试验", log_file)  # 移除emoji
     else:
-        n_trials_stage1 = 4
-        n_trials_stage2 = 2
-        top_k = 1
+        n_trials_stage1 = 30
+        n_trials_stage2 = 15
+        top_k = 3
         log_message("正式模式: 运行完整优化过程", log_file)
     
     try:
