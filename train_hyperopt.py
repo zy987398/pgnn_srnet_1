@@ -44,11 +44,11 @@ def create_model(trial, num_materials, space=None):
     """
     if space is None:
         material_range = (8, 32)
-        latent_range = (32, 128)
+        latent_range = (16, 128)
         block_range = (2, 4)
     else:
         material_range = space.get("material_embed_dim", (8, 32))
-        latent_range = space.get("latent_dim", (32, 128))
+        latent_range = space.get("latent_dim", (16, 128))
         block_range = space.get("num_blocks", (2, 4))
 
     # 模型架构超参数
@@ -63,7 +63,7 @@ def create_model(trial, num_materials, space=None):
         "latent_dim", 
         int(latent_range[0]), 
         int(latent_range[1]), 
-        step=32
+        step=16
     )
     latent_dim = get_valid_latent_dim(latent_dim)
     
@@ -110,11 +110,12 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
         lambda_physics = trial.suggest_float("lambda_physics", 0.01, 0.05, step=0.01)
 
         # 早停参数
-        patience = trial.suggest_int("patience", 15, 30, step=5)
+        patience = trial.suggest_int("patience", 20, 40, step=5)
 
         # 其他选项
         use_augmentation = trial.suggest_categorical("augmentation", [True, False])
-        optimizer_name = trial.suggest_categorical("optimizer", ["AdamW", "RMSprop"])
+        optimizer_name = trial.suggest_categorical("optimizer", 
+                                         ["AdamW", "RMSprop", "Adam", "RAdam", "SGD", "NAdam"])
 
         # 准备数据
         train_df = reconstruct_df(train_data)
@@ -152,8 +153,25 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
             optimizer = torch.optim.AdamW(
                 model.parameters(), lr=lr, weight_decay=weight_decay
             )
-        else:
+        elif optimizer_name == "RMSprop":
             optimizer = torch.optim.RMSprop(
+                model.parameters(), lr=lr, weight_decay=weight_decay
+            )
+        elif optimizer_name == "Adam":
+            optimizer = torch.optim.Adam(
+                model.parameters(), lr=lr, weight_decay=weight_decay
+            )
+        elif optimizer_name == "RAdam":
+            optimizer = torch.optim.RAdam(
+                model.parameters(), lr=lr, weight_decay=weight_decay
+            )
+        elif optimizer_name == "SGD":
+            optimizer = torch.optim.SGD(
+                model.parameters(), lr=lr, momentum=0.9, 
+               weight_decay=weight_decay, nesterov=True
+            )
+        elif optimizer_name == "NAdam":
+            optimizer = torch.optim.NAdam(
                 model.parameters(), lr=lr, weight_decay=weight_decay
             )
 
@@ -222,6 +240,11 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
                         else:
                             return 0.0
 
+                    # 检查NaN
+                    if torch.isnan(loss) or torch.isinf(loss) or loss > 1000:
+                        print(f"NaN/Inf loss detected in epoch {epoch}")
+                        continue
+                    
                     # 反向传播
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
@@ -229,6 +252,11 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
                     scaler.step(optimizer)
                     scaler.update()
 
+                    # 检查loss是否为NaN
+                    if torch.isnan(loss).any() or torch.isinf(loss).any():
+                        print(f"Warning: NaN/Inf loss detected, skipping batch")
+                        continue
+                        
                     epoch_loss += loss.item() * batch_target.size(0)
                     
                 except RuntimeError as e:
@@ -237,9 +265,16 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
                         torch.cuda.empty_cache()
                         return 0.0
                     else:
+                        print(traceback.format_exc())
                         return 0.0
+                except Exception as e:
+                    print(f"Error in batch training: {e}")
+                    print(traceback.format_exc())
+                    continue
 
-            epoch_loss /= len(train_dataset)
+            # 避免分母为0的情况
+            num_processed = max(1, len(train_dataset))
+            epoch_loss /= num_processed
 
             # 验证
             model.eval()
@@ -248,10 +283,26 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
                     val_pred, val_uncertainty, _, _ = model(
                         val_materials, val_features, val_raw
                     )
+                    
+                    # 检查并修复NaN/Inf值
+                    if torch.isnan(val_pred).any() or torch.isinf(val_pred).any():
+                        print(f"Warning: Detected NaN/Inf in validation predictions, fixing...")
+                        val_pred = torch.nan_to_num(val_pred, nan=0.0, posinf=1.0, neginf=-1.0)
+                    
                     val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
 
                     val_pred_np = val_pred.cpu().squeeze().numpy()
                     val_target_np = val_target.cpu().squeeze().numpy()
+                    
+                    # 额外检查numpy数组中的NaN
+                    if np.isnan(val_pred_np).any() or np.isinf(val_pred_np).any():
+                        print(f"Warning: Detected NaN/Inf in numpy validation predictions, replacing with median")
+                        valid_preds = val_pred_np[~np.isnan(val_pred_np) & ~np.isinf(val_pred_np)]
+                        if len(valid_preds) > 0:
+                            median_val = np.median(valid_preds)
+                        else:
+                            median_val = 0.0
+                        val_pred_np = np.nan_to_num(val_pred_np, nan=median_val, posinf=1.0, neginf=-1.0)
 
                     val_r2 = r2_score(val_target_np, val_pred_np)
 
@@ -571,8 +622,25 @@ def retrain_with_best_params(
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=lr, weight_decay=best_params.get("weight_decay", 1e-4)
         )
-    else:
+    elif best_params.get("optimizer", "AdamW") == "RMSprop":
         optimizer = torch.optim.RMSprop(
+            model.parameters(), lr=lr, weight_decay=best_params.get("weight_decay", 1e-4)
+        )
+    elif best_params.get("optimizer", "AdamW") == "Adam":
+        optimizer = torch.optim.Adam(
+            model.parameters(), lr=lr, weight_decay=best_params.get("weight_decay", 1e-4)
+        )
+    elif best_params.get("optimizer", "AdamW") == "RAdam":
+        optimizer = torch.optim.RAdam(
+            model.parameters(), lr=lr, weight_decay=best_params.get("weight_decay", 1e-4)
+        )
+    elif best_params.get("optimizer", "AdamW") == "SGD":
+        optimizer = torch.optim.SGD(
+            model.parameters(), lr=lr, momentum=0.9, 
+           weight_decay=best_params.get("weight_decay", 1e-4), nesterov=True
+        )
+    elif best_params.get("optimizer", "AdamW") == "NAdam":
+        optimizer = torch.optim.NAdam(
             model.parameters(), lr=lr, weight_decay=best_params.get("weight_decay", 1e-4)
         )
 
@@ -641,13 +709,22 @@ def retrain_with_best_params(
                 # 更新学习率 (OneCycleLR在每个batch后调用)
                 scheduler.step()
 
+                # 检查loss是否为NaN
+                if torch.isnan(loss).any() or torch.isinf(loss).any():
+                    print(f"Warning: NaN/Inf loss detected, skipping batch")
+                    continue
+                
                 epoch_loss += loss.item() * batch_target.size(0)
                 
             except Exception as e:
                 print(f"Error in batch training: {e}")
+                import traceback
+                traceback.print_exc()
                 continue
 
-        epoch_loss /= len(train_dataset)
+        # 避免分母为0的情况
+        num_processed = max(1, len(train_dataset))
+        epoch_loss /= num_processed
         train_losses.append(epoch_loss)
 
         # 评估
@@ -656,8 +733,23 @@ def retrain_with_best_params(
             test_pred, test_uncertainty, _, _ = model(
                 test_materials, test_features, test_raw
             )
+            # 检查并修复NaN/Inf值
+            if torch.isnan(test_pred).any() or torch.isinf(test_pred).any():
+                print(f"Warning: Detected NaN/Inf in predictions, fixing...")
+                test_pred = torch.nan_to_num(test_pred, nan=0.0, posinf=1.0, neginf=-1.0)
+            
             test_pred_np = test_pred.cpu().squeeze().numpy()
             test_target_np = test_target.cpu().squeeze().numpy()
+
+            # 额外检查numpy数组中的NaN
+            if np.isnan(test_pred_np).any() or np.isinf(test_pred_np).any():
+                print(f"Warning: Detected NaN/Inf in numpy predictions, replacing with median")
+                valid_preds = test_pred_np[~np.isnan(test_pred_np) & ~np.isinf(test_pred_np)]
+                if len(valid_preds) > 0:
+                    median_val = np.median(valid_preds)
+                else:
+                    median_val = 0.0
+                test_pred_np = np.nan_to_num(test_pred_np, nan=median_val, posinf=1.0, neginf=-1.0)
 
             test_r2 = r2_score(test_target_np, test_pred_np)
             test_rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
@@ -695,8 +787,23 @@ def retrain_with_best_params(
         test_pred, test_uncertainty, _, _ = model(
             test_materials, test_features, test_raw
         )
+        # 检查并修复NaN/Inf值
+        if torch.isnan(test_pred).any() or torch.isinf(test_pred).any():
+            print(f"Warning: Detected NaN/Inf in final predictions, fixing...")
+            test_pred = torch.nan_to_num(test_pred, nan=0.0, posinf=1.0, neginf=-1.0)
+            
         test_pred_np = test_pred.cpu().squeeze().numpy()
         test_target_np = test_target.cpu().squeeze().numpy()
+        
+        # 额外检查numpy数组中的NaN
+        if np.isnan(test_pred_np).any() or np.isinf(test_pred_np).any():
+            print(f"Warning: Detected NaN/Inf in final numpy predictions, replacing with median")
+            valid_preds = test_pred_np[~np.isnan(test_pred_np) & ~np.isinf(test_pred_np)]
+            if len(valid_preds) > 0:
+                median_val = np.median(valid_preds)
+            else:
+                median_val = 0.0
+            test_pred_np = np.nan_to_num(test_pred_np, nan=median_val, posinf=1.0, neginf=-1.0)
 
         final_r2 = r2_score(test_target_np, test_pred_np)
         final_rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))

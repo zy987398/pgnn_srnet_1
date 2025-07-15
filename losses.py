@@ -47,10 +47,22 @@ class PhysicsInformedLoss(nn.Module):
         nll_loss = (0.5 * torch.log(2 * np.pi * uncertainty) + 
                    huber_loss / uncertainty).mean()
         
-        # 2. 复杂度损失（如果模型有符号层）
+        # 复杂度损失
         complexity_loss = 0.0
-        if hasattr(model, 'symbolic_layer') and hasattr(model.symbolic_layer, 'complexity'):
-            complexity_loss = model.symbolic_layer.complexity
+        if hasattr(model, 'symbolic_layer'):
+            if hasattr(model.symbolic_layer, 'compute_complexity'):
+                # 优先使用带梯度的复杂度计算方法
+                complexity_loss = model.symbolic_layer.compute_complexity()
+            elif hasattr(model.symbolic_layer, 'complexity'):
+                # 向后兼容，但这种方式不会传播梯度
+                complexity_loss = model.symbolic_layer.complexity
+                
+            # 确保 complexity_loss 是张量
+            if not isinstance(complexity_loss, torch.Tensor):
+                complexity_loss = torch.tensor(complexity_loss, 
+                                            device=pred.device,
+                                            dtype=pred.dtype,
+                                            requires_grad=True)
         
         # 3. 物理约束（使用原始尺度数据）
         physics_loss = self.compute_physics_constraints(pred, numeric_raw)
@@ -148,8 +160,20 @@ class AdaptiveLoss(PhysicsInformedLoss):
         
         # 复杂度损失
         complexity_loss = 0.0
-        if hasattr(model, 'symbolic_layer') and hasattr(model.symbolic_layer, 'complexity'):
-            complexity_loss = model.symbolic_layer.complexity
+        if hasattr(model, 'symbolic_layer'):
+            if hasattr(model.symbolic_layer, 'compute_complexity'):
+                # 优先使用带梯度的复杂度计算方法
+                complexity_loss = model.symbolic_layer.compute_complexity()
+            elif hasattr(model.symbolic_layer, 'complexity'):
+                # 向后兼容，但这种方式不会传播梯度
+                complexity_loss = model.symbolic_layer.complexity
+                
+            # 确保 complexity_loss 是张量
+            if not isinstance(complexity_loss, torch.Tensor):
+                complexity_loss = torch.tensor(complexity_loss, 
+                                            device=pred.device,
+                                            dtype=pred.dtype,
+                                            requires_grad=True)
         
         # 数值安全检查
         nll_loss = self.safety_check(nll_loss)
