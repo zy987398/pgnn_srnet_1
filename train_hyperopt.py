@@ -93,28 +93,72 @@ def create_model(trial, num_materials, space=None):
     return model
 
 
-def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", space=None):
+def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", space=None, fixed_params=None):
     """
     使用给定的超参数训练模型
     返回验证集R²分数
+    
+    参数:
+        trial: Optuna trial对象
+        train_data: 训练数据
+        val_data: 验证数据
+        num_materials: 材料种类数量
+        device: 训练设备
+        space: 自定义搜索空间
+        fixed_params: 从第一阶段固定的参数
     """
+    if fixed_params is None:
+        fixed_params = {}
+        
     try:
-        # 训练超参数
-        lr = trial.suggest_float("lr", 5e-4, 1e-2, log=True)
-        epochs = trial.suggest_int("epochs", 100, 300, step=50)
-        batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
-        weight_decay = trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True)
+        # 训练超参数 - 使用fixed_params中的值或从trial中获取
+        if "lr" in fixed_params:
+            lr = fixed_params["lr"]
+        else:
+            lr = trial.suggest_float("lr", 5e-4, 1e-2, log=True)
+            
+        if "epochs" in fixed_params:
+            epochs = fixed_params["epochs"]
+        else:
+            epochs = trial.suggest_int("epochs", 100, 300, step=50)
+            
+        if "batch_size" in fixed_params:
+            batch_size = fixed_params["batch_size"]
+        else:
+            batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+            
+        if "weight_decay" in fixed_params:
+            weight_decay = fixed_params["weight_decay"]
+        else:
+            weight_decay = trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True)
 
         # 损失函数超参数
-        lambda_complexity = trial.suggest_float("lambda_complexity", 1e-6, 1e-4, log=True)
-        lambda_physics = trial.suggest_float("lambda_physics", 0.01, 0.05, step=0.01)
+        if "lambda_complexity" in fixed_params:
+            lambda_complexity = fixed_params["lambda_complexity"]
+        else:
+            lambda_complexity = trial.suggest_float("lambda_complexity", 1e-6, 1e-4, log=True)
+            
+        if "lambda_physics" in fixed_params:
+            lambda_physics = fixed_params["lambda_physics"]
+        else:
+            lambda_physics = trial.suggest_float("lambda_physics", 0.01, 0.05, step=0.01)
 
         # 早停参数
-        patience = trial.suggest_int("patience", 20, 40, step=5)
+        if "patience" in fixed_params:
+            patience = fixed_params["patience"]
+        else:
+            patience = trial.suggest_int("patience", 20, 40, step=5)
 
         # 其他选项
-        use_augmentation = trial.suggest_categorical("augmentation", [True, False])
-        optimizer_name = trial.suggest_categorical("optimizer", 
+        if "augmentation" in fixed_params:
+            use_augmentation = fixed_params["augmentation"]
+        else:
+            use_augmentation = trial.suggest_categorical("augmentation", [True, False])
+            
+        if "optimizer" in fixed_params:
+            optimizer_name = fixed_params["optimizer"]
+        else:
+            optimizer_name = trial.suggest_categorical("optimizer", 
                                          ["AdamW", "RMSprop", "Adam", "RAdam", "SGD", "NAdam"])
 
         # 准备数据
@@ -344,11 +388,23 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
         return 0.0
 
 
-def objective(trial, df, device, seed, space=None):
+def objective(trial, df, device, seed, space=None, fixed_params=None):
     """
     Optuna目标函数，使用交叉验证
+    
+    参数:
+        trial: Optuna trial对象
+        df: 数据集
+        device: 训练设备
+        seed: 随机种子
+        space: 自定义搜索空间
+        fixed_params: 从第一阶段固定的参数，避免在第二阶段重新定义
     """
     try:
+        # 应用固定参数（如果有）
+        if fixed_params is None:
+            fixed_params = {}
+            
         n_splits = 3  # 3折交叉验证
         skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=seed)
         fold_scores = []
@@ -367,11 +423,11 @@ def objective(trial, df, device, seed, space=None):
             )
             num_materials = train_data["num_materials"]
 
-            r2 = train_with_trial(trial, train_data, val_data, num_materials, device, space)
+            r2 = train_with_trial(trial, train_data, val_data, num_materials, device, space, fixed_params)
             fold_scores.append(r2)
             
             # 如果前两折表现很差，提前终止
-            if fold_idx >= 1 and np.mean(fold_scores) < 0.1:
+            if fold_idx >= 1 and np.mean(fold_scores) < 0.2:
                 print(f"Early terminating cross-validation with mean R2: {np.mean(fold_scores):.4f}")
                 fold_scores.extend([0.0] * (n_splits - len(fold_scores)))
                 break
@@ -437,6 +493,20 @@ def run_hyperopt(
         
     # 根据阶段1结果定义收缩后的搜索空间
     space = define_refined_space(completed_trials, top_k)
+    
+    # 获取第一阶段最佳试验
+    best_trial = study1.best_trial
+    fixed_params = {}
+    categorical_params = ["batch_size", "augmentation", "optimizer"]
+    
+    # 将分类参数固定为第一阶段最佳值，避免在第二阶段重新定义
+    for param in categorical_params:
+        if param in best_trial.params:
+            fixed_params[param] = best_trial.params[param]
+            print(f"固定参数 {param} = {fixed_params[param]} (来自第一阶段最佳试验)")
+            # 从搜索空间中移除已固定的参数
+            if param in space:
+                del space[param]
 
     # 阶段2: TPE微调
     print(f"\nStarting Stage 2: Fine-tuning with {n_trials_stage2} trials")
@@ -446,17 +516,23 @@ def run_hyperopt(
     )
 
     study2.optimize(
-        lambda trial: objective(trial, df, device, seed, space),
+        lambda trial: objective(trial, df, device, seed, space, fixed_params),
         n_trials=n_trials_stage2,
         timeout=3600,
         show_progress_bar=True,
         catch=(Exception,),
     )
 
+    # 保存两个阶段的study对象，以便后续可以访问
+    final_study = study2
+    final_study._study1 = study1
+    final_study._study2 = study2
+
     # 选择最佳study
     if study2.best_value > study1.best_value:
-        final_study = study2
+        print(f"阶段2获得更好的结果: {study2.best_value:.4f} > {study1.best_value:.4f}")
     else:
+        print(f"阶段1获得更好的结果: {study1.best_value:.4f} > {study2.best_value:.4f}")
         final_study = study1
         
     print_optimization_results(final_study)
@@ -550,11 +626,35 @@ def retrain_with_best_params(
     在完整数据集上训练并在测试集上评估
     """
     # 获取最佳参数
-    if not hasattr(study, 'best_params'):
+    if not hasattr(study, 'best_params') or not study.best_params:
         print("No best params found, using defaults")
-        return None, [], []
+        best_params = {
+            "material_embed_dim": 16,
+            "latent_dim": 64,
+            "dropout_rate": 0.1,
+            "num_blocks": 3,
+            "lr": 1e-3,
+            "epochs": 150,
+            "batch_size": 32,
+            "weight_decay": 1e-4,
+            "lambda_complexity": 1e-5,
+            "lambda_physics": 0.05,
+            "patience": 25,
+            "augmentation": True,
+            "optimizer": "AdamW",
+            "use_advanced_symbolic": True,
+        }
+    else:
+        best_params = study.best_params
         
-    best_params = study.best_params
+    # 如果有两个阶段的study，尝试从另一个阶段获取可能缺失的参数
+    if hasattr(study, '_study1') and hasattr(study, '_study2'):
+        other_study = study._study1 if study == study._study2 else study._study2
+        if hasattr(other_study, 'best_params'):
+            for param, value in other_study.best_params.items():
+                if param not in best_params:
+                    best_params[param] = value
+                    print(f"从另一阶段获取缺失参数: {param} = {value}")
 
     # 读取数据
     df = pd.read_csv(data_path)
@@ -834,9 +934,9 @@ def main():
     
     # 配置参数
     DATA_PATH = "3011916164精确材料性能数据.csv"
-    N_TRIALS_STAGE1 = 2  # 第一阶段试验次数
-    N_TRIALS_STAGE2 = 1  # 第二阶段试验次数
-    TOP_K = 1  # 从第一阶段选择的最佳试验数量
+    N_TRIALS_STAGE1 = 10  # 第一阶段试验次数
+    N_TRIALS_STAGE2 = 5  # 第二阶段试验次数
+    TOP_K = 3  # 从第一阶段选择的最佳试验数量
     SEED = 42
     
     print(f"数据路径: {DATA_PATH}")
