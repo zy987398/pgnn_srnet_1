@@ -1,22 +1,36 @@
+import os
+import time
+import warnings
+import traceback
+import copy
+import joblib
+import datetime
 import optuna
 from optuna.trial import TrialState
 import torch
 import torch.nn as nn
+from torch.optim.lr_scheduler import OneCycleLR
 import numpy as np
 import pandas as pd
-import copy
+import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import r2_score, mean_squared_error
-import warnings
-
-warnings.filterwarnings("ignore")
 from torch.utils.data import TensorDataset, DataLoader
 
-from improved_material_crack_pgnn import (
-    MaterialCrackPGNN,
-    PhysicsInformedLoss,
-    prepare_material_data,
-)
+# 忽略警告
+warnings.filterwarnings("ignore")
+
+# 导入自定义模块
+try:
+    from improved_material_crack_pgnn import (
+        MaterialCrackPGNN,
+        PhysicsInformedLoss,
+        prepare_material_data,
+        augment_dataset,
+    )
+except ImportError:
+    print("警告: 无法导入'improved_material_crack_pgnn'模块中的一些函数")
+    # 如果缺少augment_dataset，我们自己定义了一个
 
 
 def reconstruct_df(data_dict):
@@ -41,25 +55,44 @@ def reconstruct_df(data_dict):
 
 def augment_dataset(orig_df, noise_scale=0.05):
     """在数值列上添加噪声的数据增强"""
-    n_samples = len(orig_df)
-    n_aug = n_samples // 4
-    aug_indices = np.random.choice(n_samples, n_aug, replace=False)
-    aug_df = orig_df.iloc[aug_indices].copy()
+    if orig_df is None or len(orig_df) == 0:
+        print("警告：传入的数据框为空，无法进行数据增强")
+        return orig_df
+        
+    try:
+        n_samples = len(orig_df)
+        n_aug = max(1, n_samples // 4)  # 确保至少增强一个样本
+        aug_indices = np.random.choice(n_samples, n_aug, replace=False)
+        aug_df = orig_df.iloc[aug_indices].copy()
 
-    numeric_cols = [
-        "莫氏硬度",
-        "弹性模量",
-        "断裂韧性",
-        "晶粒粒径",
-        "压溃压力",
-        "磨粒速度",
-        "亚表面裂纹深度",
-    ]
-    aug_df[numeric_cols] *= 1 + np.random.normal(
-        0, noise_scale, aug_df[numeric_cols].shape
-    )
+        numeric_cols = [
+            "莫氏硬度",
+            "弹性模量",
+            "断裂韧性",
+            "晶粒粒径",
+            "压溃压力",
+            "磨粒速度",
+            "亚表面裂纹深度",
+        ]
+        
+        # 检查所有列是否都存在
+        missing_cols = [col for col in numeric_cols if col not in aug_df.columns]
+        if missing_cols:
+            print(f"警告：以下列在数据中不存在: {missing_cols}")
+            numeric_cols = [col for col in numeric_cols if col in aug_df.columns]
+            
+        if not numeric_cols:
+            print("警告：没有可用于增强的数值列")
+            return orig_df
+            
+        aug_df[numeric_cols] *= 1 + np.random.normal(
+            0, noise_scale, aug_df[numeric_cols].shape
+        )
 
-    return pd.concat([orig_df, aug_df], ignore_index=True)
+        return pd.concat([orig_df, aug_df], ignore_index=True)
+    except Exception as e:
+        print(f"数据增强过程出错: {str(e)}")
+        return orig_df  # 出错时返回原始数据
 
 
 def create_model(trial, num_materials):
@@ -77,10 +110,10 @@ def create_model(trial, num_materials):
         latent_dim=latent_dim,
     )
 
-    # 动态调整dropout率
+    # 动态调整dropout率 - 提高范围以增强正则化
     dropout_rate = trial.suggest_float(
-        "dropout_rate", 0.05, 0.2, step=0.05
-    )  # 更窄的范围
+        "dropout_rate", 0.2, 0.4, step=0.05
+    )  # 更高的dropout范围
     for module in model.modules():
         if isinstance(module, nn.Dropout):
             module.p = dropout_rate
@@ -90,52 +123,110 @@ def create_model(trial, num_materials):
 
 def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
     """使用给定的超参数训练模型"""
+    try:
+        # 记录开始时间
+        start_time = time.time()
+        trial_num = trial.number if hasattr(trial, 'number') else '?'
+        
+        # 训练超参数 - 调整以提高泛化性能
+        lr = trial.suggest_float("lr", 0.0005, 0.003, log=True)  # 更窄的学习率范围
+        epochs = trial.suggest_int("epochs", 200, 500, step=50)  # 减小上限
+        batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
 
-    # 训练超参数 - 缩小学习率范围
-    lr = trial.suggest_float("lr", 0.0005, 0.003, log=True)  # 更窄的范围
-    epochs = trial.suggest_int("epochs", 200, 500, step=50)  # 减小上限
-    batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
+        # 权重衰减 - 增强正则化
+        weight_decay = trial.suggest_float("weight_decay", 1e-4, 5e-3, log=True)  # 提高范围
 
-    # 权重衰减 - 新增
-    weight_decay = trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True)
+        # 损失函数超参数 - 增强正则化
+        lambda_complexity = trial.suggest_float("lambda_complexity", 1e-5, 1e-3, log=True)  # 提高符号表达式约束
+        lambda_physics = trial.suggest_float("lambda_physics", 0.1, 0.5, step=0.05)  # 提高物理约束
 
-    # 损失函数超参数
-    lambda_complexity = trial.suggest_float("lambda_complexity", 1e-6, 1e-4, log=True)
-    lambda_physics = trial.suggest_float("lambda_physics", 0.05, 0.20, step=0.01)
+        # 早停参数 - 更敏感
+        patience = trial.suggest_int("patience", 20, 40, step=5)
 
-    # 早停参数 - 更敏感
-    patience = trial.suggest_int("patience", 20, 40, step=5)
+        # 数据增强
+        use_augmentation = trial.suggest_categorical("augmentation", [True, False])
 
-    # 数据增强
-    use_augmentation = trial.suggest_categorical("augmentation", [True, False])
+        # 优化器选择
+        optimizer_name = trial.suggest_categorical("optimizer", 
+                                             ["AdamW", "RMSprop", "Adam", "RAdam", "SGD", "NAdam"])
 
-    # 优化器选择
-    optimizer_name = trial.suggest_categorical("optimizer", ["AdamW", "RMSprop"])
+        print(f"\nTrial {trial_num}: 开始训练 (LR={lr:.1e}, 批次大小={batch_size}, "
+              f"权重衰减={weight_decay:.1e}, 优化器={optimizer_name}, 增强数据={use_augmentation})")
+              
+        # 创建模型
+        model = create_model(trial, num_materials).to(device)
+        
+        # 打印模型参数总数
+        total_params = sum(p.numel() for p in model.parameters())
+        print(f"  模型参数总数: {total_params:,}")
+    except Exception as e:
+        print(f"Trial {trial_num} 初始化模型出错: {str(e)}")
+        traceback.print_exc()
+        return -1.0
 
-    # 创建模型
-    model = create_model(trial, num_materials).to(device)
+    # 准备数据 - 可选数据增强
+    train_df = reconstruct_df(train_data)
+    original_size = len(train_df)
+    
+    # 显式应用数据增强
+    if use_augmentation:
+        train_df = augment_dataset(train_df)
+        # 记录增强前后的大小变化，便于调试
+        if len(train_df) > original_size:
+            print(f"  Trial {trial.number}: 应用数据增强 {original_size} -> {len(train_df)} 样本")
+
+    augmented_train_data = prepare_material_data(
+        train_df,
+        scaler=train_data["scaler"],
+        le=train_data["label_encoder"],
+        # augment参数在函数内部未实际使用，保持为False
+        augment=False,
+    )
+
+    # 创建DataLoader
+    train_dataset = TensorDataset(
+        torch.LongTensor(augmented_train_data["material_ids"]),
+        torch.FloatTensor(augmented_train_data["numeric_features"]),
+        torch.FloatTensor(augmented_train_data["numeric_raw"]),
+        torch.FloatTensor(augmented_train_data["target"]).unsqueeze(1),
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=batch_size,
+        shuffle=True,
+        drop_last=False,  # 改为False以使用所有数据
+        pin_memory=True,  # 加速数据传输
+        num_workers=0,  # 单进程加载避免额外开销
+    )
 
     # 创建优化器
     if optimizer_name == "AdamW":
         optimizer = torch.optim.AdamW(
             model.parameters(), lr=lr, weight_decay=weight_decay
         )
-    else:
-        optimizer = torch.optim.RMSprop(model.parameters(), lr=lr)
+    elif optimizer_name == "RMSprop":
+        optimizer = torch.optim.RMSprop(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif optimizer_name == "Adam":
+        optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif optimizer_name == "RAdam":
+        optimizer = torch.optim.RAdam(model.parameters(), lr=lr, weight_decay=weight_decay)
+    elif optimizer_name == "SGD":
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, 
+                                   weight_decay=weight_decay, nesterov=True)
+    elif optimizer_name == "NAdam":
+        optimizer = torch.optim.NAdam(model.parameters(), lr=lr, weight_decay=weight_decay)
 
-    # 学习率预热与调度
-    warmup_epochs = 10
-
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            # 线性预热
-            return epoch / warmup_epochs
-        else:
-            # 余弦退火
-            progress = (epoch - warmup_epochs) / (epochs - warmup_epochs)
-            return 0.5 * (1 + np.cos(np.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    # 使用 OneCycleLR 学习率调度
+    total_steps = epochs * len(train_loader)
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        total_steps=total_steps,
+        pct_start=0.3,      # 30% 的步数用于预热
+        div_factor=25.0,    # 初始学习率 = max_lr/25
+        final_div_factor=1e4,  # 最终学习率 = max_lr/(25*10000)
+        anneal_strategy='cos'
+    )
 
     # 损失函数
     loss_fn = PhysicsInformedLoss(
@@ -147,13 +238,20 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
 
     # 准备数据 - 可选数据增强
     train_df = reconstruct_df(train_data)
+    original_size = len(train_df)
+    
+    # 显式应用数据增强
     if use_augmentation:
         train_df = augment_dataset(train_df)
+        # 记录增强前后的大小变化，便于调试
+        if len(train_df) > original_size:
+            print(f"  Trial {trial.number}: 应用数据增强 {original_size} -> {len(train_df)} 样本")
 
     augmented_train_data = prepare_material_data(
         train_df,
         scaler=train_data["scaler"],
         le=train_data["label_encoder"],
+        # augment参数在函数内部未实际使用，保持为False
         augment=False,
     )
 
@@ -211,6 +309,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
             # 更严格的梯度裁剪
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
+            scheduler.step()  # OneCycleLR 需要在每个批次后更新，而不是每个epoch
 
             epoch_loss += loss.item() * batch_target.size(0)
 
@@ -227,9 +326,6 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
 
             val_r2 = r2_score(val_target_np, val_pred_np)
             val_rmse = np.sqrt(mean_squared_error(val_target_np, val_pred_np))
-
-        # 更新学习率
-        scheduler.step()
 
         # 早停检查
         if val_r2 > best_val_r2:
@@ -251,26 +347,71 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda"):
             raise optuna.TrialPruned()
 
     # 恢复最佳模型状态进行最终评估
-    if best_model_wts is not None:
-        model.load_state_dict(best_model_wts)
-        model = model.to(device)
+    try:
+        if best_model_wts is not None:
+            model.load_state_dict(best_model_wts)
+            model = model.to(device)
 
-        # 再次计算R²
-        model.eval()
-        with torch.no_grad():
-            val_pred, _, _, _ = model(val_materials, val_raw)
-            val_pred_np = val_pred.cpu().squeeze().numpy()
-            final_r2 = r2_score(val_target_np, val_pred_np)
+            # 再次计算R²
+            model.eval()
+            with torch.no_grad():
+                val_pred, _, _, _ = model(val_materials, val_raw)
+                val_pred_np = val_pred.cpu().squeeze().numpy()
+                final_r2 = r2_score(val_target_np, val_pred_np)
+                
+            # 输出训练时间和最终结果
+            duration = time.time() - start_time
+            print(f"  Trial {trial.number} 完成: 验证R² = {final_r2:.4f}, 用时 {duration:.1f}秒, "
+                  f"优化器 = {optimizer_name}, 早停 = {patience}, 学习率 = {lr:.1e}")
 
-        return final_r2
+            return final_r2
+        
+        print(f"  Trial {trial.number} 完成但无最佳模型状态, 返回最佳验证R² = {best_val_r2:.4f}")
+        return best_val_r2
+        
+    except Exception as e:
+        print(f"  Trial {trial.number} 评估时出错: {str(e)}")
+        traceback.print_exc()
+        # 如果已经有一个最佳值，返回它，否则返回一个很小的值
+        return best_val_r2 if best_val_r2 > -float("inf") else -1.0
 
-    return best_val_r2
 
-
-def objective(trial, df, device, seed):
-    """Optuna目标函数，5折交叉验证"""
+def objective(trial, df, device, seed, space=None):
+    """Optuna目标函数，5折交叉验证，支持第二阶段精细搜索"""
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=seed)
     fold_scores = []
+    
+    # 如果提供了搜索空间，根据搜索空间约束试验参数
+    if space is not None:
+        # 应用搜索空间约束 - 不再使用内部API _suggest，改为使用公开API
+        for param_name, bounds in space.items():
+            if isinstance(bounds, tuple) and len(bounds) == 2:
+                if param_name == "lr" or param_name == "weight_decay" or param_name == "lambda_complexity" or param_name == "lambda_physics":
+                    # 对数均匀分布
+                    trial.suggest_float(param_name, bounds[0], bounds[1], log=True)
+                elif param_name == "dropout_rate":
+                    # 离散均匀分布
+                    trial.suggest_float(param_name, bounds[0], bounds[1], step=0.05)
+                elif param_name == "material_embed_dim":
+                    # 整数分布，步长为8
+                    trial.suggest_int(param_name, int(bounds[0]), int(bounds[1]), step=8)
+                elif param_name == "latent_dim":
+                    # 整数分布，步长为16
+                    trial.suggest_int(param_name, int(bounds[0]), int(bounds[1]), step=16)
+                elif param_name == "epochs":
+                    # 整数分布，步长为50
+                    trial.suggest_int(param_name, int(bounds[0]), int(bounds[1]), step=50)
+                elif param_name == "patience":
+                    # 整数分布，步长为5
+                    trial.suggest_int(param_name, int(bounds[0]), int(bounds[1]), step=5)
+                else:
+                    # 均匀分布
+                    trial.suggest_float(param_name, bounds[0], bounds[1])
+            elif isinstance(bounds, list):
+                # 类别分布
+                trial.suggest_categorical(param_name, bounds)
+    
+    # 进行5折交叉验证
     for train_idx, val_idx in skf.split(df, df["材料种类"]):
         train_df = df.iloc[train_idx]
         val_df = df.iloc[val_idx]
@@ -289,8 +430,8 @@ def objective(trial, df, device, seed):
     return float(np.mean(fold_scores))
 
 
-def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials=100, seed=42):
-    """运行超参数优化"""
+def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_stage1=30, n_trials_stage2=20, top_k=5, seed=42):
+    """运行双阶段超参数优化"""
 
     # 设置随机种子
     torch.manual_seed(seed)
@@ -298,52 +439,176 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials=10
 
     # 读取数据
     df = pd.read_csv(data_path)
-
     num_materials = df["材料种类"].nunique()
 
     # 设备
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
 
-    # 创建study - 使用更好的搜索策略
-    study = optuna.create_study(
+    # 阶段1: 随机搜索 - 广泛探索超参数空间
+    print(f"\n开始第1阶段: 初始随机搜索 ({n_trials_stage1}次试验)")
+    study1 = optuna.create_study(
         direction="maximize",
+        sampler=optuna.samplers.RandomSampler(seed=seed),
         pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=30),
+    )
+    
+    study1.optimize(
+        lambda trial: objective(trial, df, device, seed),
+        n_trials=n_trials_stage1,
+        show_progress_bar=True,
+        catch=(Exception,),
+    )
+    
+    # 根据阶段1结果定义收缩后的搜索空间
+    completed_trials = [t for t in study1.trials if t.state == TrialState.COMPLETE]
+    
+    # 打印阶段1结果
+    print("\n" + "=" * 50)
+    print("阶段1随机搜索完成!")
+    print("=" * 50)
+    
+    # 检查是否有完成的试验
+    if not completed_trials:
+        print("\n警告: 阶段1没有成功完成的试验。使用默认参数继续...")
+        # 使用默认参数定义搜索空间
+        default_params = {
+            "material_embed_dim": 16,
+            "latent_dim": 32,
+            "dropout_rate": 0.15,
+            "lr": 0.001,
+            "epochs": 300,
+            "batch_size": 32,
+            "weight_decay": 0.001,
+            "lambda_complexity": 1e-4,
+            "lambda_physics": 0.2,
+            "patience": 30,
+            "augmentation": True,
+            "optimizer": "AdamW",
+        }
+        # 创建一个虚拟的完成试验
+        dummy_trial = optuna.trial.create_trial(
+            params=default_params,
+            distributions={},
+            value=0.0,  # 占位值
+            state=TrialState.COMPLETE,
+        )
+        completed_trials = [dummy_trial]
+        space = define_refined_space(completed_trials, 1)
+    else:
+        space = define_refined_space(completed_trials, top_k)
+        print(f"\n阶段1最佳验证R²: {study1.best_value:.4f}")
+        print("\n阶段1最佳超参数:")
+        for key, value in study1.best_params.items():
+            print(f"  {key}: {value}")
+    
+    print("\n精细搜索空间:")
+    for key, value in space.items():
+        print(f"  {key}: {value}")
+
+    # 阶段2: TPE微调 - 在有希望的区域进行精细搜索
+    print(f"\n开始第2阶段: 精细TPE搜索 ({n_trials_stage2}次试验)")
+    study2 = optuna.create_study(
+        direction="maximize", 
         sampler=optuna.samplers.TPESampler(seed=seed, n_startup_trials=5),
+        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=15),
     )
 
-    # 优化
-    study.optimize(
-        lambda trial: objective(trial, df, device, seed),
-        n_trials=n_trials,
+    study2.optimize(
+        lambda trial: objective(trial, df, device, seed, space),
+        n_trials=n_trials_stage2,
         show_progress_bar=True,
         catch=(Exception,),
     )
 
-    # 打印结果
+    # 选择最佳study
+    completed_trials1 = len([t for t in study1.trials if t.state == TrialState.COMPLETE])
+    completed_trials2 = len([t for t in study2.trials if t.state == TrialState.COMPLETE])
+    
+    # 检查两个阶段是否有完成的试验
+    has_study1_result = completed_trials1 > 0
+    has_study2_result = completed_trials2 > 0
+    
+    if has_study2_result and has_study1_result:
+        if study2.best_value > study1.best_value:
+            final_study = study2
+            print("\n阶段2搜索找到了更好的参数!")
+        else:
+            final_study = study1
+            print("\n阶段1搜索的参数更优!")
+    elif has_study2_result:
+        final_study = study2
+        print("\n只有阶段2有完成的试验。使用阶段2最佳参数。")
+    elif has_study1_result:
+        final_study = study1
+        print("\n只有阶段1有完成的试验。使用阶段1最佳参数。")
+    else:
+        # 如果两个阶段都没有完成的试验，创建一个默认study
+        print("\n两个阶段都没有完成的试验。使用默认参数。")
+        default_study = optuna.create_study(direction="maximize")
+        default_trial = optuna.trial.create_trial(
+            params={
+                "material_embed_dim": 16,
+                "latent_dim": 32,
+                "dropout_rate": 0.15,
+                "lr": 0.001,
+                "epochs": 300,
+                "batch_size": 32,
+                "weight_decay": 0.001,
+                "lambda_complexity": 1e-4,
+                "lambda_physics": 0.2,
+                "patience": 30,
+                "augmentation": True,
+                "optimizer": "AdamW",
+            },
+            distributions={},
+            value=0.0,
+            state=TrialState.COMPLETE,
+        )
+        default_study.add_trial(default_trial)
+        final_study = default_study
+    
+    # 为了可视化，在final_study中保存两个阶段的study对象
+    final_study._study1 = study1
+    final_study._study2 = study2
+        
+    # 打印最终结果
     print("\n" + "=" * 50)
-    print("优化完成!")
+    print("双阶段优化完成!")
     print("=" * 50)
 
-    print(f"\n最佳验证R²: {study.best_value:.4f}")
-    print("\n最佳超参数:")
-    for key, value in study.best_params.items():
+    print(f"\n最终最佳验证R²: {final_study.best_value:.4f}")
+    print("\n最终最佳超参数:")
+    for key, value in final_study.best_params.items():
         print(f"  {key}: {value}")
 
     # 统计信息
-    completed_trials = [t for t in study.trials if t.state == TrialState.COMPLETE]
-    print(f"\n完成的trials: {len(completed_trials)}/{n_trials}")
+    completed_trials1 = len([t for t in study1.trials if t.state == TrialState.COMPLETE])
+    completed_trials2 = len([t for t in study2.trials if t.state == TrialState.COMPLETE])
+    print(f"\n阶段1完成的trials: {completed_trials1}/{n_trials_stage1}")
+    print(f"阶段2完成的trials: {completed_trials2}/{n_trials_stage2}")
+    print(f"总完成trials: {completed_trials1 + completed_trials2}/{n_trials_stage1 + n_trials_stage2}")
 
     # 超参数重要性
     try:
-        importance = optuna.importance.get_param_importances(study)
+        importance = optuna.importance.get_param_importances(final_study)
         print("\n超参数重要性:")
         for key, value in sorted(importance.items(), key=lambda x: x[1], reverse=True):
             print(f"  {key}: {value:.3f}")
-    except:
-        pass
+    except Exception as e:
+        print(f"\n计算超参数重要性时出错: {str(e)}")
+    
+    # 确保结果目录存在
+    os.makedirs("results", exist_ok=True)
+    
+    # 保存study对象，以便后续可以恢复
+    try:
+        joblib.dump(final_study, "results/best_hyperopt_study.pkl")
+        print("成功保存study对象到results/best_hyperopt_study.pkl")
+    except Exception as e:
+        print(f"保存study对象时出错: {str(e)}")
 
-    return study
+    return final_study
 
 
 # 使用最佳超参数重新训练
@@ -377,13 +642,19 @@ def retrain_with_best_params(
 
     # 使用最佳参数准备增强数据
     use_augmentation = best_params.get("augmentation", False)
-    train_df_aug = train_df.copy()
+    train_df_for_aug = train_df.copy()
+    
+    # 显式应用数据增强（如果启用）
     if use_augmentation:
-        train_df_aug = augment_dataset(train_df_aug)
+        print("应用数据增强...")
+        train_df_for_aug = augment_dataset(train_df_for_aug)
+        print(f"数据集大小: {len(train_df)} -> {len(train_df_for_aug)} (增加 {len(train_df_for_aug)-len(train_df)} 个样本)")
+    
     augmented_train_data = prepare_material_data(
-        train_df_aug,
+        train_df_for_aug,  # 使用可能已增强的数据
         scaler=train_data["scaler"],
         le=train_data["label_encoder"],
+        # augment参数在函数内部未使用，保持为False
         augment=False,
     )
 
@@ -419,16 +690,18 @@ def retrain_with_best_params(
 
     # 学习率调度
     epochs = best_params["epochs"]
-    warmup_epochs = 10
-
-    def lr_lambda(epoch):
-        if epoch < warmup_epochs:
-            return epoch / warmup_epochs
-        else:
-            progress = (epoch - warmup_epochs) / (epochs - warmup_epochs)
-            return 0.5 * (1 + np.cos(np.pi * progress))
-
-    scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    
+    # 使用 OneCycleLR 学习率调度
+    total_steps = epochs * len(train_loader)
+    scheduler = OneCycleLR(
+        optimizer,
+        max_lr=lr,
+        total_steps=total_steps,
+        pct_start=0.3,      # 30% 的步数用于预热
+        div_factor=25.0,    # 初始学习率 = max_lr/25
+        final_div_factor=1e4,  # 最终学习率 = max_lr/(25*10000)
+        anneal_strategy='cos'
+    )
 
     # 损失函数
     loss_fn = PhysicsInformedLoss(
@@ -444,6 +717,10 @@ def retrain_with_best_params(
     test_r2_history = []
     best_model_wts, best_test_r2, patience_ctr = None, -1e9, 0
     best_epoch = 0
+    
+    # 使用搜索到的耐心值
+    patience = best_params.get("patience", 25)
+    print(f"早停耐心值: {patience}")
 
     for epoch in range(epochs):
         # 更新当前epoch
@@ -467,14 +744,13 @@ def retrain_with_best_params(
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
             optimizer.step()
+            scheduler.step()  # OneCycleLR 需要在每个批次后更新，而不是每个epoch
 
             epoch_loss += loss.item() * batch_target.size(0)
 
         epoch_loss /= len(train_dataset)
         train_losses.append(epoch_loss)
 
-        # 更新学习率
-        scheduler.step()
         current_lr = scheduler.get_last_lr()[0]
 
         # 评估
@@ -501,8 +777,8 @@ def retrain_with_best_params(
         else:
             patience_ctr += 1
 
-        if patience_ctr >= 25:
-            print("Early-stop triggered.")
+        if patience_ctr >= patience:
+            print(f"Early-stop triggered at epoch {epoch+1} with patience {patience}.")
             break
 
     if best_model_wts is not None:
@@ -635,78 +911,308 @@ def evaluate_model_detailed(model, test_data, device="cuda"):
     return results
 
 
+def define_refined_space(completed_trials, top_k):
+    """根据第一阶段结果定义精细搜索空间"""
+    # 默认边界 - 调整以提高泛化性能
+    global_bounds = {
+        "material_embed_dim": (8, 32),  # 降低上限以简化模型
+        "latent_dim": (16, 64),         # 降低上限以简化模型
+        "dropout_rate": (0.1, 0.3),     # 提高范围以增强正则化
+        "lr": (5e-4, 3e-3),
+        "epochs": (200, 500),
+        "batch_size": [16, 32, 64],
+        "weight_decay": (1e-4, 5e-3),   # 提高范围以增强正则化
+        "lambda_complexity": (1e-5, 1e-3), # 提高范围以增强符号表达式约束
+        "lambda_physics": (0.1, 0.5),      # 提高范围以增强物理约束
+        "patience": (20, 40),
+        "augmentation": [True, False],
+        "optimizer": ["AdamW", "RMSprop", "Adam", "RAdam", "SGD", "NAdam"],
+    }
+    
+    # 获取最佳trials
+    top_trials = sorted(
+        completed_trials,
+        key=lambda t: t.value,
+        reverse=True,
+    )[:top_k]
+    
+    space = {}
+    for name, bounds in global_bounds.items():
+        if isinstance(bounds, tuple):
+            vals = [t.params.get(name, bounds[0]) for t in top_trials if name in t.params]
+            if vals:
+                low = max(bounds[0], min(vals))
+                high = min(bounds[1], max(vals))
+                span = high - low
+                if span > 0:
+                    space[name] = (
+                        max(bounds[0], low - span * 0.3),
+                        min(bounds[1], high + span * 0.3),
+                    )
+                else:
+                    space[name] = (low * 0.9, low * 1.1) if low > 0 else (low - 0.1, low + 0.1)
+            else:
+                space[name] = bounds
+        else:
+            vals = list({t.params.get(name) for t in top_trials if name in t.params})
+            space[name] = vals if vals else bounds
+            
+    return space
+
+
+def log_message(message, log_file=None):
+    """记录带时间戳的消息，可选写入日志文件"""
+    timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_msg = f"[{timestamp}] {message}"
+    print(log_msg)
+    
+    if log_file:
+        with open(log_file, 'a', encoding='utf-8') as f:  # 添加utf-8编码
+            f.write(log_msg + "\n")
+
 if __name__ == "__main__":
-    import matplotlib.pyplot as plt
+    # 确保结果目录存在
+    os.makedirs("results", exist_ok=True)
+    
+    # 设置日志文件
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_file = f"results/hyperopt_run_{timestamp}.log"
+    
+    log_message(f"开始执行双阶段超参数优化 - {timestamp}", log_file)
+    
+    # 检查CUDA可用性
+    cuda_available = torch.cuda.is_available()
+    if cuda_available:
+        device_name = torch.cuda.get_device_name(0)
+        log_message(f"CUDA可用: {device_name}", log_file)
+        torch.backends.cudnn.benchmark = True
+    else:
+        log_message("CUDA不可用，将使用CPU（训练可能较慢）", log_file)
+    
+    # 设置不同调试级别的试验次数
+    debug_mode = False  # 切换调试模式
+    if debug_mode:
+        n_trials_stage1 = 2
+        n_trials_stage2 = 1
+        top_k = 1
+        log_message("[警告] 调试模式: 仅运行少量试验", log_file)  # 移除emoji
+    else:
+        n_trials_stage1 = 4
+        n_trials_stage2 = 2
+        top_k = 1
+        log_message("正式模式: 运行完整优化过程", log_file)
+    
+    try:
+        # 运行双阶段超参数优化
+        log_message(f"开始双阶段超参数优化 (阶段1: {n_trials_stage1}次, 阶段2: {n_trials_stage2}次, 前{top_k}个最佳结果)", log_file)
+        study = run_hyperopt(n_trials_stage1=n_trials_stage1, n_trials_stage2=n_trials_stage2, top_k=top_k)
+    except Exception as e:
+        log_message(f"超参数优化过程出错: {str(e)}", log_file)
+        log_message(f"错误详情: {traceback.format_exc()}", log_file)
+        
+        # 尝试加载之前的结果（如果有）
+        try:
+            if os.path.exists("results/best_hyperopt_study.pkl"):
+                study = joblib.load("results/best_hyperopt_study.pkl")
+                log_message("已加载之前保存的study对象继续运行", log_file)
+            else:
+                raise FileNotFoundError("未找到已保存的study文件")
+        except Exception as load_err:
+            log_message(f"无法加载之前的study对象: {str(load_err)}，将创建默认参数", log_file)
+            # 创建一个默认study用于继续运行
+            study = optuna.create_study(direction="maximize")
+            default_params = {
+                "material_embed_dim": 16,
+                "latent_dim": 32,
+                "dropout_rate": 0.2,
+                "lr": 1e-3,
+                "epochs": 300,
+                "batch_size": 32,
+                "weight_decay": 1e-3,
+                "lambda_complexity": 1e-4,
+                "lambda_physics": 0.2,
+                "patience": 30,
+                "augmentation": True,
+                "optimizer": "AdamW"
+            }
+            log_message("使用默认参数:", log_file)
+            for k, v in default_params.items():
+                log_message(f"  {k}: {v}", log_file)
+            study.enqueue_trial(default_params)
 
-    # 运行超参数优化
-    study = run_hyperopt(n_trials=50)  # 可以增加trials获得更好结果
+    try:
+        # 使用最佳参数重新训练
+        log_message("\n开始使用最佳超参数重新训练模型...", log_file)
+        model, train_losses, test_r2_history = retrain_with_best_params(study)
+        
+        # 详细评估
+        log_message("\n开始详细评估模型...", log_file)
+        df = pd.read_csv("3011916164精确材料性能数据.csv")
+        train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+        train_data = prepare_material_data(train_df)
+        test_data = prepare_material_data(
+            test_df,
+            scaler=train_data["scaler"],
+            le=train_data["label_encoder"],
+        )
 
-    # 使用最佳参数重新训练
-    model, train_losses, test_r2_history = retrain_with_best_params(study)
+        results = evaluate_model_detailed(model, test_data)
+        
+        # 保存模型
+        try:
+            torch.save(model.state_dict(), "results/improved_model.pth")
+            log_message("模型已保存至 results/improved_model.pth", log_file)
+            
+            # 保存训练历史
+            history_dict = {
+                "train_losses": train_losses,
+                "test_r2_history": test_r2_history,
+                "best_params": study.best_params,
+                "best_value": study.best_value,
+            }
+            joblib.dump(history_dict, "results/training_history.pkl")
+            log_message("训练历史已保存至 results/training_history.pkl", log_file)
+            
+        except Exception as save_err:
+            log_message(f"保存模型时出错: {str(save_err)}", log_file)
+            
+    except Exception as e:
+        log_message(f"训练或评估过程中出错: {str(e)}", log_file)
+        log_message(f"错误详情: {traceback.format_exc()}", log_file)
+        model = None
+        train_losses = []
+        test_r2_history = []
+        results = None
 
-    # 详细评估
-    df = pd.read_csv("3011916164精确材料性能数据.csv")
-    train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
-    train_data = prepare_material_data(train_df)
-    test_data = prepare_material_data(
-        test_df,
-        scaler=train_data["scaler"],
-        le=train_data["label_encoder"],
-    )
+    try:
+        log_message("\n生成可视化图表...", log_file)
+        # 可视化优化历史 - 双阶段
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
-    results = evaluate_model_detailed(model, test_data)
+        # 优化历史 - 分阶段显示
+        if hasattr(study, "_study1") and hasattr(study, "_study2"):
+            # 如果study对象有保存两个阶段的study
+            values1 = [t.value for t in study._study1.trials if t.value is not None]
+            values2 = [t.value for t in study._study2.trials if t.value is not None]
+            
+            if values1:  # 只有当有值时才绘制阶段1
+                ax1.plot(range(len(values1)), values1, 'b-', alpha=0.7, label='阶段1 - 随机搜索')
+            
+            if values2:  # 只有当有值时才绘制阶段2
+                ax1.plot(range(len(values1), len(values1) + len(values2)), values2, 'r-', alpha=0.7, label='阶段2 - TPE精细搜索')
+            
+            if values1 or values2:  # 只有当至少有一个阶段有值时才添加分隔线和图例
+                if values1:  # 只有当阶段1有值时才添加分隔线
+                    ax1.axvline(x=len(values1), color='k', linestyle='--', alpha=0.5)
+                ax1.legend()
+        else:
+            # 兼容旧版本
+            values = [t.value for t in study.trials if t.value is not None]
+            if values:  # 只有当有值时才绘制
+                ax1.plot(values)
+            else:
+                ax1.text(0.5, 0.5, '没有有效的优化结果', horizontalalignment='center', verticalalignment='center')
+        
+        ax1.set_xlabel("Trial")
+        ax1.set_ylabel("Validation R²")
+        ax1.set_title("双阶段超参数优化历史")
+        ax1.grid(True, alpha=0.3)
 
-    # 可视化优化历史
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+        # 训练损失
+        if train_losses:
+            ax2.plot(train_losses)
+            ax2.set_yscale("log")
+        else:
+            ax2.text(0.5, 0.5, '没有训练损失数据', horizontalalignment='center', verticalalignment='center')
+            
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("Loss")
+        ax2.set_title("Training Loss with Best Hyperparameters")
+        ax2.grid(True, alpha=0.3)
 
-    # 优化历史
-    ax1.plot([t.value for t in study.trials if t.value is not None])
-    ax1.set_xlabel("Trial")
-    ax1.set_ylabel("Validation R²")
-    ax1.set_title("Hyperparameter Optimization History")
-    ax1.grid(True, alpha=0.3)
+        plt.tight_layout()
+        plt.savefig("results/improved_hyperopt_results.png", dpi=300)
+        plt.close(fig)
 
-    # 训练损失
-    ax2.plot(train_losses)
-    ax2.set_xlabel("Epoch")
-    ax2.set_ylabel("Loss")
-    ax2.set_title("Training Loss with Best Hyperparameters")
-    ax2.set_yscale("log")
-    ax2.grid(True, alpha=0.3)
+        if results:  # 只有在有结果时才可视化预测
+            # 预测vs真实值可视化
+            fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
-    plt.tight_layout()
-    plt.savefig("results/improved_hyperopt_results.png", dpi=300)
+            # 标准预测
+            ax1.scatter(
+                results["predictions"]["y_true"], results["predictions"]["y_pred"], alpha=0.6
+            )
+            ax1.plot([0, 10], [0, 10], "r--")  # 理想线
+            ax1.set_xlabel("True Crack Depth")
+            ax1.set_ylabel("Predicted Crack Depth")
+            ax1.set_title(f'Standard Prediction (R² = {results["standard"]["r2"]:.4f})')
+            ax1.grid(True, alpha=0.3)
 
-    # 预测vs真实值可视化
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
+            # MC Dropout预测
+            scatter = ax2.scatter(
+                results["predictions"]["y_true"],
+                results["predictions"]["y_mc_pred"],
+                c=results["predictions"]["mc_uncertainty"],
+                cmap="viridis",
+                alpha=0.6,
+            )
+            ax2.plot([0, 10], [0, 10], "r--")  # 理想线
+            ax2.set_xlabel("True Crack Depth")
+            ax2.set_ylabel("MC Prediction")
+            ax2.set_title(f'MC Dropout Prediction (R² = {results["mc_dropout"]["r2"]:.4f})')
+            ax2.grid(True, alpha=0.3)
+            cbar = plt.colorbar(scatter, ax=ax2)
+            cbar.set_label("Predictive Uncertainty")
 
-    # 标准预测
-    ax1.scatter(
-        results["predictions"]["y_true"], results["predictions"]["y_pred"], alpha=0.6
-    )
-    ax1.plot([0, 10], [0, 10], "r--")  # 理想线
-    ax1.set_xlabel("True Crack Depth")
-    ax1.set_ylabel("Predicted Crack Depth")
-    ax1.set_title(f'Standard Prediction (R² = {results["standard"]["r2"]:.4f})')
-    ax1.grid(True, alpha=0.3)
-
-    # MC Dropout预测
-    scatter = ax2.scatter(
-        results["predictions"]["y_true"],
-        results["predictions"]["y_mc_pred"],
-        c=results["predictions"]["mc_uncertainty"],
-        cmap="viridis",
-        alpha=0.6,
-    )
-    ax2.plot([0, 10], [0, 10], "r--")  # 理想线
-    ax2.set_xlabel("True Crack Depth")
-    ax2.set_ylabel("MC Prediction")
-    ax2.set_title(f'MC Dropout Prediction (R² = {results["mc_dropout"]["r2"]:.4f})')
-    ax2.grid(True, alpha=0.3)
-    cbar = plt.colorbar(scatter, ax=ax2)
-    cbar.set_label("Predictive Uncertainty")
-
-    plt.tight_layout()
-    plt.savefig("results/predictions_visualization.png", dpi=300)
-
-    plt.show()
+            plt.tight_layout()
+            plt.savefig("results/predictions_visualization.png", dpi=300)
+            plt.close(fig)
+            
+            # 不确定性可视化
+            try:
+                fig, ax = plt.subplots(figsize=(10, 6))
+                
+                # 按误差大小排序
+                errors = np.abs(results["predictions"]["y_mc_pred"] - results["predictions"]["y_true"])
+                sorted_indices = np.argsort(errors)
+                
+                ax.errorbar(
+                    range(len(sorted_indices)),
+                    results["predictions"]["y_mc_pred"][sorted_indices],
+                    yerr=np.sqrt(results["predictions"]["mc_uncertainty"][sorted_indices]),
+                    fmt='o',
+                    alpha=0.6,
+                    ecolor='r',
+                    capsize=2
+                )
+                ax.scatter(
+                    range(len(sorted_indices)),
+                    results["predictions"]["y_true"][sorted_indices],
+                    marker='x',
+                    color='k',
+                    label='True Values'
+                )
+                
+                ax.set_xlabel('Sample Index (sorted by error)')
+                ax.set_ylabel('Crack Depth')
+                ax.set_title('Predictions with Uncertainty Intervals')
+                ax.legend()
+                ax.grid(True, alpha=0.3)
+                
+                plt.tight_layout()
+                plt.savefig("results/uncertainty_visualization.png", dpi=300)
+                plt.close(fig)
+            except Exception as e:
+                log_message(f"绘制不确定性可视化时出错: {str(e)}", log_file)
+                
+        log_message("可视化图表已保存到results文件夹", log_file)
+            
+    except Exception as e:
+        log_message(f"生成可视化过程出错: {str(e)}", log_file)
+        log_message(f"错误详情: {traceback.format_exc()}", log_file)
+        
+    log_message("\n优化和训练过程完成!", log_file)
+    
+    # 运行结束时间
+    end_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    log_message(f"运行结束时间: {end_timestamp}", log_file)
