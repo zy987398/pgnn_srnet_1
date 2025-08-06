@@ -26,7 +26,6 @@ try:
         MaterialCrackPGNN,
         PhysicsInformedLoss,
         prepare_material_data,
-        augment_dataset,
     )
 except ImportError:
     print("警告: 无法导入'improved_material_crack_pgnn'模块中的一些函数")
@@ -105,14 +104,14 @@ def create_model(trial, num_materials, fixed_params=None):
         print(f"  使用预设材料嵌入维度: {material_embed_dim}")
     else:
         material_embed_dim = trial.suggest_int(
-            "material_embed_dim", 8, 32, step=8
+            "material_embed_dim", 8, 24, step=8
         )  # 缩小范围
     
     if "latent_dim" in fixed_params:
         latent_dim = fixed_params["latent_dim"]
         print(f"  使用预设潜在维度: {latent_dim}")
     else:
-        latent_dim = trial.suggest_int("latent_dim", 16, 64, step=16)  # 缩小范围
+        latent_dim = trial.suggest_int("latent_dim", 16, 48, step=16)  # 缩小范围
 
     # 创建模型并修改部分架构
     model = MaterialCrackPGNN(
@@ -193,7 +192,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda",
             patience = fixed_params["patience"]
             print(f"  使用预设早停耐心值: {patience}")
         else:
-            patience = trial.suggest_int("patience", 20, 40, step=5)
+            patience = trial.suggest_int("patience", 40, 60, step=5)
 
         # 数据增强 (类别参数)
         if "augmentation" in fixed_params:
@@ -506,7 +505,7 @@ def objective(trial, df, device, seed, space=None, fixed_params=None):
     return float(np.mean(fold_scores))
 
 
-def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_stage1=30, n_trials_stage2=20, top_k=5, seed=42):
+def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_stage1=30, n_trials_stage2=20, top_k=5, seed=66):
     """运行双阶段超参数优化"""
 
     # 设置随机种子
@@ -697,7 +696,7 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_st
 
 # 使用最佳超参数重新训练
 def retrain_with_best_params(
-    study, data_path="3011916164精确材料性能数据.csv", seed=42
+    study, data_path="3011916164精确材料性能数据.csv", seed=66
 ):
     """使用最佳超参数重新训练并评估"""
 
@@ -1107,9 +1106,9 @@ if __name__ == "__main__":
         top_k = 1
         log_message("[警告] 调试模式: 仅运行少量试验", log_file)  # 移除emoji
     else:
-        n_trials_stage1 = 30
-        n_trials_stage2 = 15
-        top_k = 3
+        n_trials_stage1 = 40
+        n_trials_stage2 = 20
+        top_k = 5
         log_message("正式模式: 运行完整优化过程", log_file)
     
     try:
@@ -1158,7 +1157,7 @@ if __name__ == "__main__":
         # 详细评估
         log_message("\n开始详细评估模型...", log_file)
         df = pd.read_csv("3011916164精确材料性能数据.csv")
-        train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+        train_df, test_df = train_test_split(df, test_size=0.2, random_state=66)
         train_data = prepare_material_data(train_df)
         test_data = prepare_material_data(
             test_df,

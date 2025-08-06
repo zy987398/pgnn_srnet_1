@@ -10,67 +10,10 @@ import numpy as np
 import traceback
 import matplotlib.pyplot as plt
 from utils import (safe_division, safe_log, safe_sqrt, safe_power, 
-                  safe_exp, adaptive_scale, check_and_fix_tensor,
-                  MIN_SAFE_EPS, MAX_SAFE_VAL, SQRT_MAX, LOG_MAX, EXP_MAX)
+                  adaptive_scale,)
 
 # 全局梯度裁剪阈值 - 降低以增加稳定性
 GRAD_CLIP = 3.0
-
-def safe_sqrt(x, eps=MIN_SAFE_EPS):
-    """安全开方运算"""
-    # 确保输入为非负且有合理上限
-    x_safe = torch.clamp(torch.abs(x) + eps, min=eps, max=SQRT_MAX)
-    return torch.sqrt(x_safe)
-
-def safe_log(x, eps=MIN_SAFE_EPS):
-    """安全对数运算"""
-    # 确保输入严格为正且有合理上限
-    x_safe = torch.clamp(torch.abs(x) + eps, min=eps, max=LOG_MAX)
-    result = torch.log(x_safe)
-    # 额外检查结果
-    if torch.isnan(result).any() or torch.isinf(result).any():
-        print("Warning: NaN/Inf detected in safe_log output, replacing")
-        result = torch.nan_to_num(result, nan=0.0, posinf=10.0, neginf=-10.0)
-    return torch.clamp(result, min=-20.0, max=20.0)
-
-def safe_exp(x, max_val=EXP_MAX):
-    """安全指数运算，输出范围更加有限"""
-    # 使用更严格的输入范围限制
-    x_safe = torch.clamp(x, min=-max_val/2, max=max_val/2)
-    # 尝试计算指数
-    try:
-        result = torch.exp(x_safe)
-        # 额外检查并处理可能的数值异常
-        if torch.isnan(result).any() or torch.isinf(result).any():
-            print("Warning: NaN/Inf detected in safe_exp output, replacing")
-            result = torch.nan_to_num(result, nan=1.0, posinf=1e6, neginf=1e-6)
-        # 应用更严格的上限
-        return torch.clamp(result, min=0.0, max=1e6)
-    except Exception as e:
-        print(f"Error in safe_exp: {e}")
-        # 失败时返回安全值
-        return torch.ones_like(x)
-
-def safe_power(x, power, max_val=MAX_SAFE_VAL):
-    """安全幂运算，预处理输入防止数值爆炸"""
-    if power > 1:
-        # 对于大于1的幂，需要更严格的限制
-        # 使用n次根计算安全范围：x^n ≤ max_val => x ≤ max_val^(1/n)
-        safe_range = max_val ** (1.0/power)
-        x_safe = torch.clamp(x, min=-safe_range, max=safe_range)
-    else:
-        # 对于小于等于1的幂，使用标准限制
-        x_safe = torch.clamp(x, min=-max_val/2, max=max_val/2)
-    
-    # 对于非整数幂，确保输入为正
-    if power != int(power):
-        x_safe = torch.abs(x_safe) + MIN_SAFE_EPS
-    
-    # 计算幂并限制结果
-    result = x_safe ** power
-    return torch.clamp(result, min=-max_val, max=max_val)
-
-# check_and_fix_tensor函数已移至utils.py
 
 
 # ===== 基础组件 =====
@@ -110,6 +53,7 @@ class PhysicsInformedFeatureExtractor(nn.Module):
     """
     物理特征提取器
     基于材料科学原理提取物理意义明确的特征
+    使用改进的物理特征计算和归一化方法
     """
     def __init__(self, input_dim=6):
         super().__init__()
@@ -121,143 +65,153 @@ class PhysicsInformedFeatureExtractor(nn.Module):
         """
         输入x: [batch_size, 6] - 原始尺度的特征
         返回: [batch_size, 18] - 原始特征(6) + 物理特征(12) = 总共18个特征
+        使用更优化的计算方法和归一化策略
         """
         # 首先检查输入
         if torch.isnan(x).any() or torch.isinf(x).any():
             print("Warning: NaN/Inf in physics extractor input, fixing")
             x = torch.nan_to_num(x, nan=0.0, posinf=1e3, neginf=0.0)
         
-        # 首先进行自适应缩放，确保数据在合理范围内
+        # 在输入处进行一次自适应缩放，确保数据在合理范围内
         x = adaptive_scale(x, target_max=1e6, name="physics_extractor_input")
         
         # 保存原始特征用于输出
         features = [x]
         
-        # -------- 基本变量与安全裁剪 - 使用更保守的限制 --------
+        # -------- 基本变量与安全裁剪 --------
         try:
-            # 使用更严格的范围约束
-            hardness         = x[:, 0:1].clamp(min=1.0, max=1e7)        # Pa
-            elastic_modulus  = x[:, 1:2].clamp(min=1.0, max=1e9)        # Pa
-            fracture_tough   = x[:, 2:3].clamp(min=0.1, max=1e7)        # Pa·√m
-            grain_size       = x[:, 3:4].clamp(min=1e-9, max=1e-4)      # m
-            stress           = x[:, 4:5].clamp(min=0.0, max=1e7)        # Pa
-            velocity         = x[:, 5:6].clamp(min=0.0, max=1e2)        # m·s⁻¹
+            # 提取各个原始特征
+            hardness = x[:, 0:1]          # 莫氏硬度
+            elastic_modulus = x[:, 1:2]   # 弹性模量
+            fracture_tough = x[:, 2:3]    # 断裂韧性
+            grain_size = x[:, 3:4]        # 晶粒粒径
+            stress = x[:, 4:5]            # 压溃压力
+            velocity = x[:, 5:6]          # 磨粒速度
             
-            # 额外的自适应缩放确保数值稳定
-            hardness = adaptive_scale(hardness, target_max=1e6, name="hardness")
-            elastic_modulus = adaptive_scale(elastic_modulus, target_max=1e8, name="elastic_modulus")
-            fracture_tough = adaptive_scale(fracture_tough, target_max=1e6, name="fracture_tough")
-            stress = adaptive_scale(stress, target_max=1e6, name="stress")
-
             # 增加数值稳定性的常数
             eps = 1e-6
-            π = 3.14159  # 使用常数而不是torch.pi，避免自动微分带来的额外复杂性
-            feats = []
-        except Exception as e:
-            print(f"Error in physics feature extraction (variable setup): {e}")
-            # 创建安全的默认值
-            hardness = torch.ones_like(x[:, 0:1]) * 1e6
-            elastic_modulus = torch.ones_like(x[:, 1:2]) * 1e10
-            fracture_tough = torch.ones_like(x[:, 2:3]) * 1e6
-            grain_size = torch.ones_like(x[:, 3:4]) * 1e-6
-            stress = torch.ones_like(x[:, 4:5]) * 1e6
-            velocity = torch.ones_like(x[:, 5:6]) * 10.0
-            eps = 1e-6
             π = 3.14159
+            
+            # 计算12个物理特征
             feats = []
-
-        # 计算物理特征，使用更安全的方式
-        try:
-            # 1. Griffith 能量释放率  G = σ² π d / E       [ J·m⁻² ]
-            stress_squared = torch.clamp(stress**2, max=1e12)  # 限制平方值
-            G = safe_division(stress_squared * π * grain_size, elastic_modulus, eps=eps, max_val=1e6)
-            # 使用更小的缩放以避免大值
+            
+            # 1. Griffith 能量释放率 G = σ² π d / E [J·m⁻²]
+            stress_squared = torch.clamp(stress**2, max=1e12)
+            G = stress_squared * π * grain_size / (elastic_modulus + eps)
             G_scaled = torch.tanh(torch.clamp(G / 1e3, -10, 10))
             feats.append(G_scaled * self.feature_scales[0])
-
-            # 2. 应力强度比  K/Kc = σ √(π d) / K_IC       [ — ]
+            
+            # 2. 应力强度比 K/Kc = σ √(π d) / K_IC [—]
             sqrt_term = torch.sqrt(torch.clamp(π * grain_size, min=eps, max=1.0))
-            k_ratio = safe_division(stress * sqrt_term, fracture_tough, eps=eps, max_val=10.0)
+            k_ratio = stress * sqrt_term / (fracture_tough + eps)
             feats.append(torch.tanh(torch.clamp(k_ratio, -10, 10)) * self.feature_scales[1])
-
-            # 3. Hall-Petch 尺度项  d^{-1/2}               [ m^{-½} ]
-            hall_petch = torch.rsqrt(torch.clamp(grain_size + eps, min=eps, max=1.0))  # 使用rsqrt更稳定
-            hall_petch = torch.clamp(hall_petch, max=1e6)  # 额外限制
+            
+            # 3. Hall-Petch 尺度项 d^{-1/2} [m^{-½}]
+            hall_petch = torch.rsqrt(torch.clamp(grain_size + eps, min=eps, max=1.0))
+            hall_petch = torch.clamp(hall_petch, max=1e6)
             feats.append(torch.tanh(torch.clamp(hall_petch / 1e3, -10, 10)) * self.feature_scales[2])
-
-            # 4. 裂纹屏蔽因子  χ = (K_IC / E) √d          [ m ]
-            k_ic_over_e = safe_division(fracture_tough, elastic_modulus, eps=eps, max_val=1.0)
+            
+            # 4. 裂纹屏蔽因子 χ = (K_IC / E) √d [m]
+            k_ic_over_e = fracture_tough / (elastic_modulus + eps)
             sqrt_grain = torch.sqrt(torch.clamp(grain_size, min=eps, max=1.0))
             shielding = k_ic_over_e * sqrt_grain
-            shielding = torch.clamp(shielding, max=1e-2)  # 限制最大值
+            shielding = torch.clamp(shielding, max=1e-2)
             feats.append(torch.tanh(torch.clamp(shielding / 1e-4, -10, 10)) * self.feature_scales[3])
-
-            # 5. 载荷-强度比  ρ₁ = σ / H                  [ — ]
-            rho1 = safe_division(stress, hardness, eps=eps, max_val=1.0)
-            feats.append(torch.tanh(torch.clamp(rho1, -10, 10)) * self.feature_scales[4])
-        
-        except Exception as e:
-            print(f"Error in physics feature extraction (features 1-5): {e}")
-            # 添加安全默认值
-            for i in range(5):
-                feats.append(torch.zeros_like(hardness) * self.feature_scales[i])
-
-        try:
-            # 6. 功率-强度比  ρ₂ = σ V / H               [ m·s⁻¹ ]
-            rho2 = safe_division(stress * velocity, hardness, eps=eps, max_val=100.0)
-            feats.append(torch.tanh(torch.clamp(rho2 / 10, -10, 10)) * self.feature_scales[5])
-
-            # 7. 延-脆转临界深度  d_c = η (E/H) (K_IC/H)²   [ m ]  (η≈0.15)
+            
+            # 5. 载荷-强度比 ρ₁ = σ / H [—]
+            rho1 = stress / (hardness + eps)
+            # 使用Min-Max缩放代替tanh，保留更多信息
+            rho1_min = torch.min(rho1)
+            rho1_max = torch.max(rho1)
+            rho1_range = rho1_max - rho1_min + eps
+            rho1_norm = (rho1 - rho1_min) / rho1_range
+            feats.append(rho1_norm * self.feature_scales[4])
+            
+            # 6. 功率-强度比 ρ₂ = σ V / H [m·s⁻¹]
+            rho2 = stress * velocity / (hardness + eps)
+            # 使用Min-Max缩放
+            rho2_min = torch.min(rho2)
+            rho2_max = torch.max(rho2)
+            rho2_range = rho2_max - rho2_min + eps
+            rho2_norm = (rho2 - rho2_min) / rho2_range
+            feats.append(rho2_norm * self.feature_scales[5])
+            
+            # 7. 延-脆转临界深度 d_c = η (E/H) (K_IC/H)² [m] (η≈0.15)
             eta = 0.15
-            e_over_h = safe_division(elastic_modulus, hardness, eps=eps, max_val=100.0)
-            k_over_h = safe_division(fracture_tough, hardness, eps=eps, max_val=10.0)
-            k_over_h_squared = torch.clamp(k_over_h**2, max=100.0)
+            e_over_h = elastic_modulus / (hardness + eps)
+            k_over_h = fracture_tough / (hardness + eps)
+            k_over_h_squared = k_over_h**2  # 移除过度截断
             d_c = eta * e_over_h * k_over_h_squared
-            d_c = torch.clamp(d_c, max=1e-3)  # 限制最大值
-            feats.append(torch.tanh(torch.clamp(d_c / 1e-5, -10, 10)) * self.feature_scales[6])
+            # 使用标准化缩放而非tanh
+            d_c_mean = torch.mean(d_c)
+            d_c_std = torch.std(d_c, unbiased=False) + eps  # 添加unbiased=False
+            d_c_norm = (d_c - d_c_mean) / d_c_std * 0.3 + 0.5
 
-            # 8. 临界裂纹长度比  a_c / d,  a_c = (K_IC/σ)² / π   [ — ]
-            k_over_s = safe_division(fracture_tough, stress, eps=eps, max_val=10.0)
-            k_over_s_squared = torch.clamp(k_over_s**2, max=100.0)
+            feats.append(torch.clamp(d_c_norm, 0, 1) * self.feature_scales[6])
+            
+            # 8. 临界裂纹长度比 a_c / d, a_c = (K_IC/σ)² / π [—]
+            k_over_s = fracture_tough / (stress + eps)
+            k_over_s_squared = k_over_s**2  # 移除过度截断
             a_c = k_over_s_squared / π
-            ac_over_d = safe_division(a_c, grain_size, eps=eps, max_val=100.0)
-            feats.append(torch.tanh(torch.clamp(ac_over_d, -10, 10)) * self.feature_scales[7])
+            ac_over_d = a_c / (grain_size + eps)
+            # 对数缩放后再标准化
+            ac_log = torch.log1p(torch.clamp(ac_over_d, min=eps))
+            ac_log_mean = torch.mean(ac_log)
+            ac_log_std = torch.std(ac_log, unbiased=False) + eps  # 添加unbiased=False
+            ac_norm = (ac_log - ac_log_mean) / ac_log_std * 0.3 + 0.5
 
-            # 9. 塑性区尺寸比  r_p / d,  r_p = (K_IC / H)² / (2π) [ — ]
-            k_over_h = safe_division(fracture_tough, hardness, eps=eps, max_val=10.0)
-            k_over_h_squared = torch.clamp(k_over_h**2, max=100.0)
+            feats.append(torch.clamp(ac_norm, 0, 1) * self.feature_scales[7])
+            
+            # 9. 塑性区尺寸比 r_p / d, r_p = (K_IC / H)² / (2π) [—]
             r_p = k_over_h_squared / (2.0 * π)
-            rp_over_d = safe_division(r_p, grain_size, eps=eps, max_val=100.0)
-            feats.append(torch.tanh(torch.clamp(rp_over_d, -10, 10)) * self.feature_scales[8])
-
-            # 10. 脆性指数  B = H / K_IC                    [ √m⁻¹ ]
-            B = safe_division(hardness, fracture_tough, eps=eps, max_val=100.0)
+            rp_over_d = r_p / (grain_size + eps)
+            # 对数缩放后再使用Min-Max归一化
+            rp_log = torch.log1p(torch.clamp(rp_over_d, min=eps))
+            rp_log_min = torch.min(rp_log)
+            rp_log_max = torch.max(rp_log)
+            rp_log_range = rp_log_max - rp_log_min + eps
+            rp_norm = (rp_log - rp_log_min) / rp_log_range
+            feats.append(rp_norm * self.feature_scales[8])
+            
+            # 10. 脆性指数 B = H / K_IC [√m⁻¹]
+            B = hardness / (fracture_tough + eps)
+            # 使用Min-Max缩放代替tanh，避免信息损失
+            B_min = torch.min(B)
+            B_max = torch.max(B)
+            B_range = B_max - B_min + eps
+            B_norm = (B - B_min) / B_range
+            feats.append(B_norm * self.feature_scales[9])
+            
+            # 11. 初-剖比 K_IC / E [√m]
+            ki_over_e = fracture_tough / (elastic_modulus + eps)
+            # 使用标准化归一化
+            ki_over_e_mean = torch.mean(ki_over_e)
+            ki_over_e_std = torch.std(ki_over_e, unbiased=False) + eps  # 添加unbiased=False
+            ki_over_e_norm = (ki_over_e - ki_over_e_mean) / ki_over_e_std * 0.3 + 0.5  # 缩放到大约[0.2-0.8]范围
+            feats.append(torch.clamp(ki_over_e_norm, 0, 1) * self.feature_scales[10])
+            
+            # 12. 弹性应变能密度 U = 0.5 σ² / E [J·m⁻³]
+            U = 0.5 * stress_squared / (elastic_modulus + eps)
+            # 对数缩放后使用Min-Max归一化
+            U_log = torch.log1p(torch.clamp(U, min=eps))
+            U_log_min = torch.min(U_log)
+            U_log_max = torch.max(U_log)
+            U_log_range = U_log_max - U_log_min + eps
+            U_norm = (U_log - U_log_min) / U_log_range
+            feats.append(U_norm * self.feature_scales[11])
+            
         except Exception as e:
-            print(f"Error in physics feature extraction (features 6-10): {e}")
-            # 添加安全默认值
-            for i in range(5, 10):
-                feats.append(torch.zeros_like(hardness) * self.feature_scales[i])
-        feats.append(torch.tanh(B / 10) * self.feature_scales[9])
-
-        try:
-            # 11. 初-剖比  K_IC / E                       [ √m ]
-            ki_over_e = safe_division(fracture_tough, elastic_modulus, eps=eps, max_val=1.0)
-            feats.append(torch.tanh(torch.clamp(ki_over_e * 100, -10, 10)) * self.feature_scales[10])
-
-            # 12. 弹性应变能密度  U = 0.5 σ² / E          [ J·m⁻³ ]
-            stress_squared = torch.clamp(stress**2, max=1e12)  # 限制平方值
-            U = 0.5 * safe_division(stress_squared, elastic_modulus, eps=eps, max_val=1e6)
-            feats.append(torch.tanh(torch.clamp(U / 1e3, -10, 10)) * self.feature_scales[11])
-        except Exception as e:
-            print(f"Error in physics feature extraction (features 11-12): {e}")
-            # 添加安全默认值
-            for i in range(10, 12):
-                feats.append(torch.zeros_like(hardness) * self.feature_scales[i])
+            print(f"Error in physics feature extraction: {e}")
+            traceback.print_exc()
+            # 创建安全的默认值
+            feats = []
+            for i in range(12):
+                feats.append(torch.zeros_like(x[:, 0:1]) * self.feature_scales[i])
         
         # 将原始特征与提取的物理特征合并
         all_features = torch.cat(features + feats, dim=1)  # 6个原始特征 + 12个物理特征 = 18个总特征
         
-        # 最终输出前进行自适应缩放，避免传递极端值到下一层
+        # 仅在输出端进行一次自适应缩放
         all_features = adaptive_scale(all_features, target_max=100.0, name="physics_features_final")
         
         return all_features
@@ -360,15 +314,11 @@ class AdaptiveSymbolicLayer(nn.Module):
         z: [batch_size, latent_dim] - 潜在表示
         numeric_raw: [batch_size, 6] - 原始尺度的物理特征
         """
-        # 输入预处理和缩放
+        # 仅对输入z进行一次自适应缩放
         z = adaptive_scale(z, target_max=10.0, name="symbolic_z_input")
-        numeric_raw = adaptive_scale(numeric_raw, target_max=1e6, name="symbolic_numeric_raw")
         
         # 1. 提取物理特征
         physics_features = self.physics_extractor(numeric_raw)
-        
-        # 使用自适应缩放而不是简单的check_and_fix_tensor
-        physics_features = adaptive_scale(physics_features, target_max=10.0, name="physics_features")
         
         # 2. 准备交叉注意力的输入
         # z作为query
@@ -380,12 +330,7 @@ class AdaptiveSymbolicLayer(nn.Module):
         key = self.key_proj(phys_features_seq)    # [B, num_features, latent_dim]
         value = self.value_proj(phys_features_seq)  # [B, num_features, latent_dim]            # 3. 应用交叉注意力（第一个Transformer块），增强稳健性
         try:
-            # 先检查输入
-            query = adaptive_scale(query, name="attention_query")
-            key = adaptive_scale(key, name="attention_key")
-            value = adaptive_scale(value, name="attention_value")
-            
-            # 应用注意力机制
+            # 直接应用注意力机制，无需中间缩放
             attn_output, attn_weights = self.cross_attention(
                 query=query,
                 key=key,
@@ -410,12 +355,8 @@ class AdaptiveSymbolicLayer(nn.Module):
             attn_output = attn_output.squeeze(1)
             attn_output = torch.clamp(attn_output, -5.0, 5.0)  # 使用保守的裁剪
             
-            # 第一个残差连接 + 层归一化，采用更安全的方式
-            z_safe = adaptive_scale(z, name="z_pre_residual")
-            z_attn = z_safe + 0.1 * attn_output  # 减少注意力输出的影响
-            
-            # 检查残差连接结果
-            z_attn = adaptive_scale(z_attn, name="pre_norm_attention")
+            # 第一个残差连接 + 层归一化，简化方式
+            z_attn = z + 0.1 * attn_output  # 减少注意力输出的影响
             
             # 应用层归一化，包含错误处理
             try:
@@ -426,9 +367,6 @@ class AdaptiveSymbolicLayer(nn.Module):
                 mean = z_attn.mean(dim=-1, keepdim=True)
                 std = z_attn.std(dim=-1, keepdim=True) + 1e-5
                 z_attn = (z_attn - mean) / std
-                
-            # 最终检查
-            z_attn = adaptive_scale(z_attn, name="attention_output")
             
             # 4. 前馈网络（第二个Transformer块）
             ffn_output = self.feed_forward(z_attn)
@@ -436,7 +374,6 @@ class AdaptiveSymbolicLayer(nn.Module):
             # 第二个残差连接 + 层归一化
             z = z_attn + ffn_output  # 残差连接 2
             z = self.ffn_norm(z)
-            z = adaptive_scale(z, name="ffn_output")
             
         except Exception as e:
             print(f"Warning: Transformer processing failed ({e}), using original z")
@@ -445,22 +382,19 @@ class AdaptiveSymbolicLayer(nn.Module):
 
         # 5. 特征选择权重 - 使用更稳定的版本
         try:
-            # 通过自适应缩放处理选择器的输入
-            var_selector_input = adaptive_scale(z, target_max=5.0, name="var_selector_input")
-            op_selector_input = adaptive_scale(z, target_max=5.0, name="op_selector_input")
-            coeff_input = adaptive_scale(z, target_max=5.0, name="coeff_input")
+            # 直接使用z而不进行额外缩放
             
             # 计算权重和系数
-            var_logits = self.variable_selector(var_selector_input)
+            var_logits = self.variable_selector(z)
             var_logits = torch.clamp(var_logits, -5, 5)  # 限制logits范围
             var_weights = F.softmax(var_logits, dim=-1)
             
-            op_logits = self.operator_selector(op_selector_input)
+            op_logits = self.operator_selector(z)
             op_logits = torch.clamp(op_logits, -5, 5)  # 限制logits范围
             op_weights = F.softmax(op_logits, dim=-1)
             
             # 限制系数范围，避免过大值
-            coeffs = torch.tanh(self.coefficient_net(coeff_input)) * 3.0  # 使用tanh限制在[-3,3]范围
+            coeffs = torch.tanh(self.coefficient_net(z)) * 3.0  # 使用tanh限制在[-3,3]范围
             
             # 保存权重用于可解释性
             self.last_var_weights = var_weights
@@ -496,12 +430,8 @@ class AdaptiveSymbolicLayer(nn.Module):
                                         device=pooled_features.device)
                     pooled_features = torch.cat([pooled_features, padding], dim=1)
             
-            # 使用自适应缩放而不是check_and_fix_tensor
-            pooled_features = adaptive_scale(pooled_features, target_max=5.0, name="pooled_features")
-            
             # 7. 加权特征组合
             selected_features = (var_weights * pooled_features).sum(dim=1, keepdim=True)
-            selected_features = adaptive_scale(selected_features, target_max=5.0, name="selected_features")
         except Exception as e:
             print(f"Warning: Feature pooling failed: {e}")
             # 提供安全的后备值
@@ -513,25 +443,22 @@ class AdaptiveSymbolicLayer(nn.Module):
             
             # 线性项 - 直接乘法
             expr1 = coeffs[:, 0:1] * selected_features
-            expr1 = adaptive_scale(expr1, target_max=5.0, name="expression")
             expressions.append(expr1)
             
-            # 二次项 - 使用safe_power并缩放
+            # 二次项 - 使用safe_power
             expr2_base = safe_power(selected_features, 2, max_val=25.0)
             expr2 = coeffs[:, 1:2] * expr2_base
-            expr2 = adaptive_scale(expr2, target_max=5.0, name="expression")
             expressions.append(expr2)
             
-            # 三次项 - 使用safe_power并缩放
+            # 三次项 - 使用safe_power
             expr3_base = safe_power(selected_features, 3, max_val=25.0)
             expr3 = coeffs[:, 2:3] * expr3_base
-            expr3 = adaptive_scale(expr3, target_max=5.0, name="expression")
             expressions.append(expr3)
             
-            # 平方根项 - 使用safe_sqrt并缩放
+            # 平方根项 - 使用safe_sqrt
             expr4_base = safe_sqrt(selected_features)
             expr4 = coeffs[:, 3:4] * expr4_base
-            expr4 = adaptive_scale(expr4, target_max=5.0, name="expression")
+            expressions.append(expr4)
             expressions.append(expr4)
         except Exception as e:
             print(f"Warning: Expression calculation failed: {e}")
@@ -552,8 +479,7 @@ class AdaptiveSymbolicLayer(nn.Module):
                 torch.sin(torch.clamp(selected_features, -3.14, 3.14))  # 正弦，限制在[-π,π]
             ]
             
-            # 为每个操作应用自适应缩放
-            ops = [adaptive_scale(op, target_max=5.0, name=f"op_{i}") for i, op in enumerate(ops)]
+            # 不再为每个操作应用自适应缩放
         except Exception as e:
             print(f"Warning: Operator calculation failed: {e}")
             # 提供安全的后备值
@@ -578,7 +504,6 @@ class AdaptiveSymbolicLayer(nn.Module):
                 op_stack = torch.stack(safe_ops, dim=1)
                 if len(op_stack.shape) == 3 and op_stack.shape[2] == 1:
                     op_stack = op_stack.squeeze(-1)
-                op_stack = adaptive_scale(op_stack, name="op_stack")
             except Exception as e:
                 print(f"Error in stacking operations: {e}")
                 # 使用备选方法创建op_stack
@@ -593,8 +518,8 @@ class AdaptiveSymbolicLayer(nn.Module):
                 batch_size = op_stack.shape[0]
                 op_stack = op_stack.reshape(batch_size, -1)
             
-            # 确保权重不含NaN/Inf并且形状匹配
-            weights_clean = adaptive_scale(op_weights, name="op_weights")
+            # 确保权重形状匹配
+            weights_clean = op_weights
             
             # 如果维度不匹配，尝试调整
             if op_stack.shape[1] != weights_clean.shape[1]:
@@ -616,10 +541,7 @@ class AdaptiveSymbolicLayer(nn.Module):
                 for i in range(min(op_stack.shape[1], weights_clean.shape[1])):
                     op_comb = op_comb + op_stack[:, i:i+1] * weights_clean[:, i:i+1]
             
-            # 检查并修复结果
-            op_comb = adaptive_scale(op_comb, name="op_comb")
-            
-            # 应用更严格的裁剪
+            # 只应用裁剪，不做多余缩放
             op_comb = torch.clamp(op_comb, min=-5.0, max=5.0)
         except Exception as e:
             print(f"Warning: Operator combination failed ({e}), using fallback")
@@ -629,28 +551,19 @@ class AdaptiveSymbolicLayer(nn.Module):
         # 11. 最终输出，增强稳健性
         try:
             # 计算门控值
-            gate_input = adaptive_scale(z, target_max=5.0, name="gate_input")
-            gate_value = self.gate(gate_input)
+            gate_value = self.gate(z)
             gate_value = torch.clamp(gate_value, 0.2, 0.8)  # 使用更保守的范围避免极端值
             
-            # 单独计算表达式总和，使用自适应缩放
+            # 计算表达式总和，无需中间缩放
             expressions_sum = torch.zeros_like(selected_features)
-            for i, expr in enumerate(expressions):
-                # 在添加之前进行自适应缩放
-                safe_expr = adaptive_scale(expr, target_max=1.0, name=f"expr_{i}")
-                expressions_sum = expressions_sum + safe_expr
+            for expr in expressions:
+                expressions_sum = expressions_sum + expr
             
-            # 对总和再次应用自适应缩放
-            expressions_sum = adaptive_scale(expressions_sum, target_max=5.0, name="expressions_sum")
-            
-            # 安全地计算门控组合
+            # 计算门控组合
             gated_expr = expressions_sum * gate_value
             
-            # 确保操作符组合也进行了自适应缩放
-            op_comb_safe = adaptive_scale(op_comb, target_max=5.0, name="op_comb_final")
-            
-            # 组合最终输出并进行最终缩放
-            symbolic_output = gated_expr + (1.0 - gate_value) * op_comb_safe
+            # 组合最终输出并只在最终输出进行一次自适应缩放
+            symbolic_output = gated_expr + (1.0 - gate_value) * op_comb
             symbolic_output = adaptive_scale(symbolic_output, target_max=5.0, name="symbolic_output")
             
             # 应用tanh激活函数，确保输出在[-1,1]范围内
@@ -851,36 +764,28 @@ class MaterialCrackPGNN(nn.Module):
         
         # 2. 主网络特征处理（使用标准化数据）
         main_features = torch.cat([material_embed, numeric_scaled], dim=1)
-        main_features = adaptive_scale(main_features, name="main_features")
         z_main = self.feature_projection(main_features)
-        z_main = adaptive_scale(z_main, name="z_main")
         
         # 3. 物理特征提取（使用原始数据）
         physics_features = self.physics_extractor(numeric_raw)
         physics_features = adaptive_scale(physics_features, name="physics_features")
         z_physics = self.physics_projection(physics_features)
-        z_physics = adaptive_scale(z_physics, name="z_physics")
         
         # 4. 特征融合
         fusion_input = torch.cat([z_main, z_physics], dim=1)
-        fusion_input = adaptive_scale(fusion_input, name="fusion_input")
         z = self.fusion(fusion_input)
-        z = adaptive_scale(z, name="z_fusion")
         
-        # 5. 通过残差块，添加额外的数值检查
+        # 5. 通过残差块，简化数值检查
         for i, block in enumerate(self.blocks):
-            z_input = adaptive_scale(z, name=f"block_{i}_input")
             try:
-                z = block(z_input)  # 使用ResidualBlock类
+                z = block(z)  # 使用ResidualBlock类
             except Exception as e:
                 print(f"Error in residual block {i}: {e}")
-                z = z_input  # 出错时使用原始输入
-            z = adaptive_scale(z, name=f"block_{i}_output")
-            z = F.gelu(z)  # 额外的GELU激活
-            z = adaptive_scale(z, name=f"block_{i}_gelu")
+                # 出错时保持不变
+        z = F.gelu(z)  # 额外的GELU激活
         
         # 6. 符号输出 - 根据使用的符号层类型调用不同的前向传播
-        # 确保z在传给符号层之前没有数值问题
+        # 在传给符号层之前进行一次自适应缩放（关键节点）
         z = adaptive_scale(z, name="symbolic_z")
         
         try:
@@ -906,7 +811,7 @@ class MaterialCrackPGNN(nn.Module):
                 # 简化符号层只需要潜在向量z
                 symbolic = self.symbolic_layer(z)
                 
-            # 应用自适应缩放并裁剪
+            # 保留关键输出处的自适应缩放
             symbolic = adaptive_scale(symbolic, target_max=5.0, name="symbolic_final")
             symbolic = torch.clamp(symbolic, -5.0, 5.0)  # 使用更保守的限制
                 
@@ -917,14 +822,9 @@ class MaterialCrackPGNN(nn.Module):
         
         # 7. 残差预测
         try:
-            # 保证z和symbolic数值稳定，使用自适应缩放
-            z_safe = adaptive_scale(z, name="residual_z")
-            symbolic_safe = adaptive_scale(symbolic, name="residual_symbolic")
-            
-            residual_input = torch.cat([z_safe, symbolic_safe], dim=-1)
-            residual_input = adaptive_scale(residual_input, name="residual_input")
+            # 直接使用z和symbolic，不做额外缩放
+            residual_input = torch.cat([z, symbolic], dim=-1)
             residual = self.residual_head(residual_input)
-            residual = adaptive_scale(residual, name="residual_output")
             
         except Exception as e:
             print(f"Error in residual head: {e}")
@@ -948,16 +848,11 @@ class MaterialCrackPGNN(nn.Module):
             print(f"Error in prediction: {e}")
             prediction = torch.ones_like(symbolic) * 0.5
         
-        # 9. 不确定性估计，增强稳定性
+        # 9. 不确定性估计，简化处理
         try:
-            # 使用adaptive_scale代替check_and_fix_tensor
-            z_safe = adaptive_scale(z, name="uncertainty_z")
-            log_var = self.uncertainty_head(z_safe)
+            log_var = self.uncertainty_head(z)
             log_var = torch.clamp(log_var, -10.0, 2.0)  # 放宽下限，增加稳定性
             uncertainty = torch.exp(log_var) + 0.01
-            
-            # 使用adaptive_scale确保不确定性在合理范围内
-            uncertainty = adaptive_scale(uncertainty, target_max=5.0, name="uncertainty")
             uncertainty = torch.clamp(uncertainty, min=0.01, max=10.0)
             
         except Exception as e:

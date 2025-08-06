@@ -18,7 +18,7 @@ from sklearn.metrics import r2_score, mean_squared_error
 from torch.utils.data import TensorDataset, DataLoader
 
 # 导入自定义模块
-from model import MaterialCrackPGNN
+from models import MaterialCrackPGNN
 from losses import PhysicsInformedLoss
 from utils import prepare_material_data, reconstruct_df, augment_dataset
 

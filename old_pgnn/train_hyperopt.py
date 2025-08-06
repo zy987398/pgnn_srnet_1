@@ -442,7 +442,7 @@ def objective(trial, df, device, seed, space=None, fixed_params=None):
 
 
 def run_hyperopt(
-    data_path: str = "3011916164精确材料性能数据.csv",
+    data_path: str = "merged_normal_data_v3_sorted.csv",
     n_trials_stage1: int = 20,
     n_trials_stage2: int = 10,
     top_k: int = 3,
@@ -619,7 +619,7 @@ def print_optimization_results(study):
 
 
 def retrain_with_best_params(
-    study, data_path="3011916164精确材料性能数据.csv", seed=42
+    study, data_path="merged_normal_data_v3_sorted.csv", seed=42
 ):
     """
     使用最佳超参数重新训练模型
@@ -933,11 +933,11 @@ def main():
     print("=" * 60)
     
     # 配置参数
-    DATA_PATH = "3011916164精确材料性能数据.csv"
+    DATA_PATH = "merged_normal_data_v3_sorted.csv"
     N_TRIALS_STAGE1 = 10  # 第一阶段试验次数
     N_TRIALS_STAGE2 = 5  # 第二阶段试验次数
     TOP_K = 3  # 从第一阶段选择的最佳试验数量
-    SEED = 42
+    SEED = 88 # 随机种子
     
     print(f"数据路径: {DATA_PATH}")
     print(f"第一阶段试验次数: {N_TRIALS_STAGE1}")
