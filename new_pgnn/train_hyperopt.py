@@ -36,20 +36,25 @@ def create_model(trial, num_materials, fixed_params=None):
         print(f"  使用预设材料嵌入维度: {material_embed_dim}")
     else:
         material_embed_dim = trial.suggest_int(
-            "material_embed_dim", 8, 32, step=8
+            "material_embed_dim", 8, 24, step=8
         )  # 缩小范围
     
     if "latent_dim" in fixed_params:
         latent_dim = fixed_params["latent_dim"]
         print(f"  使用预设潜在维度: {latent_dim}")
     else:
-        latent_dim = trial.suggest_int("latent_dim", 16, 64, step=16)  # 缩小范围
+        latent_dim = trial.suggest_int("latent_dim", 16, 48, step=16)  # 缩小范围
 
+    # 符号层类型选择 - 始终从fixed_params获取，不再进行搜索
+    symbolic_type = fixed_params.get("symbolic_type", "lightweight")  # 默认使用轻量级符号层
+    print(f"  使用符号层类型: {symbolic_type}")
+    
     # 创建模型并修改部分架构
     model = MaterialCrackPGNN(
         num_materials=num_materials,
         material_embed_dim=material_embed_dim,
         latent_dim=latent_dim,
+        symbolic_type=symbolic_type
     )
 
     # 动态调整dropout率
@@ -124,7 +129,7 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda",
             patience = fixed_params["patience"]
             print(f"  使用预设早停耐心值: {patience}")
         else:
-            patience = trial.suggest_int("patience", 20, 40, step=5)
+            patience = trial.suggest_int("patience", 40, 60, step=5)
 
         # 数据增强 (类别参数)
         if "augmentation" in fixed_params:
@@ -437,9 +442,18 @@ def objective(trial, df, device, seed, space=None, fixed_params=None):
     return float(np.mean(fold_scores))
 
 
-def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_stage1=30, n_trials_stage2=20, top_k=5, seed=42):
-    """运行双阶段超参数优化"""
-
+def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_stage1=30, n_trials_stage2=20, top_k=5, seed=66, symbolic_type="lightweight"):
+    """
+    运行双阶段超参数优化
+    
+    参数:
+        data_path: 数据文件路径
+        n_trials_stage1: 第一阶段试验次数
+        n_trials_stage2: 第二阶段试验次数
+        top_k: 用于精炼搜索空间的最佳试验数量
+        seed: 随机种子
+        symbolic_type: 要使用的符号层类型 ("improved", "advanced", "lightweight")
+    """
     # 设置随机种子
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -451,6 +465,9 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_st
     # 设备
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
+    
+    # 设置固定的符号层类型
+    print(f"使用指定的符号层类型: {symbolic_type}")
 
     # 阶段1: 随机搜索 - 广泛探索超参数空间
     print(f"\n开始第1阶段: 初始随机搜索 ({n_trials_stage1}次试验)")
@@ -460,8 +477,11 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_st
         pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=30),
     )
     
+    # 为所有试验固定符号层类型
+    fixed_symbolic_params = {"symbolic_type": symbolic_type}
+    
     study1.optimize(
-        lambda trial: objective(trial, df, device, seed),
+        lambda trial: objective(trial, df, device, seed, fixed_params=fixed_symbolic_params),
         n_trials=n_trials_stage1,
         show_progress_bar=True,
         catch=(Exception,),
@@ -628,9 +648,17 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_st
 
 # 使用最佳超参数重新训练
 def retrain_with_best_params(
-    study, data_path="3011916164精确材料性能数据.csv", seed=42
+    study, data_path="3011916164精确材料性能数据.csv", seed=66, symbolic_type="lightweight"
 ):
-    """使用最佳超参数重新训练并评估"""
+    """
+    使用最佳超参数重新训练并评估
+    
+    参数:
+        study: Optuna study对象，包含最佳超参数
+        data_path: 数据文件路径
+        seed: 随机种子
+        symbolic_type: 要使用的符号层类型 ("improved", "advanced", "lightweight")
+    """
 
     # 读取数据
     df = pd.read_csv(data_path)
@@ -670,7 +698,8 @@ def retrain_with_best_params(
         num_materials=train_data["num_materials"],
         material_embed_dim=best_params.get("material_embed_dim", 16),  # 提供默认值
         latent_dim=best_params.get("latent_dim", 32),  # 提供默认值
-        dropout_rate=best_params.get("dropout_rate", 0.3),  # 提供默认值
+        dropout_rate=best_params.get("dropout_rate", 0.3),
+        symbolic_type=symbolic_type  # 使用传入的符号层类型参数
     )
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -1039,9 +1068,9 @@ if __name__ == "__main__":
         top_k = 1
         log_message("[警告] 调试模式: 仅运行少量试验", log_file)  # 移除emoji
     else:
-        n_trials_stage1 = 30
-        n_trials_stage2 = 15
-        top_k = 3
+        n_trials_stage1 = 40
+        n_trials_stage2 = 20
+        top_k = 5
         log_message("正式模式: 运行完整优化过程", log_file)
     
     try:
@@ -1085,12 +1114,15 @@ if __name__ == "__main__":
     try:
         # 使用最佳参数重新训练
         log_message("\n开始使用最佳超参数重新训练模型...", log_file)
-        model, train_losses, test_r2_history = retrain_with_best_params(study)
+        # 获取所使用的符号层类型（如果有），否则使用 "lightweight"
+        symbolic_type = study.best_params.get("symbolic_type", "lightweight")
+        log_message(f"使用符号层类型: {symbolic_type}", log_file)
+        model, train_losses, test_r2_history = retrain_with_best_params(study, symbolic_type=symbolic_type)
         
         # 详细评估
         log_message("\n开始详细评估模型...", log_file)
         df = pd.read_csv("3011916164精确材料性能数据.csv")
-        train_df, test_df = train_test_split(df, test_size=0.2, random_state=42)
+        train_df, test_df = train_test_split(df, test_size=0.2, random_state=66)
         train_data = prepare_material_data(train_df)
         test_data = prepare_material_data(
             test_df,

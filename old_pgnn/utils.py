@@ -202,11 +202,11 @@ def prepare_material_data(
         df_clean[col] = df_clean[col].astype(float)
     
     # 1. 单位统一 (在最开始进行，确保所有后续计算使用统一单位)
-    df_clean.loc[:, "莫氏硬度"] = 0.00981 * df_clean["莫氏硬度"]**3  # Mohs → Pa
-    df_clean.loc[:, "晶粒粒径"] = df_clean["晶粒粒径"] * 1e-6        # μm  → m
-    df_clean.loc[:, "压溃压力"] = df_clean["压溃压力"] * 1e3         # kPa → Pa
-    df_clean.loc[:, "断裂韧性"] = df_clean["断裂韧性"] * 1e6         # MPa√m → Pa√m
-    df_clean.loc[:, "弹性模量"] = df_clean["弹性模量"] * 1e9      # GPa → Pa
+    # df_clean.loc[:, "莫氏硬度"] = 0.00981 * df_clean["莫氏硬度"]**3  # Mohs → Pa
+    # df_clean.loc[:, "晶粒粒径"] = df_clean["晶粒粒径"] * 1e-6        # μm  → m
+    # df_clean.loc[:, "压溃压力"] = df_clean["压溃压力"] * 1e3         # kPa → Pa
+    # df_clean.loc[:, "断裂韧性"] = df_clean["断裂韧性"] * 1e6         # MPa√m → Pa√m
+    # df_clean.loc[:, "弹性模量"] = df_clean["弹性模量"] * 1e9      # GPa → Pa
     # 2. 处理缺失值
     for col in numeric_cols + ["亚表面裂纹深度"]:
         if df_clean[col].isna().any():

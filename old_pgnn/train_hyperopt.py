@@ -1,8 +1,3 @@
-"""
-超参数优化相关函数
-使用Optuna进行贝叶斯优化
-"""
-
 import optuna
 from optuna.trial import TrialState
 import torch
@@ -43,12 +38,12 @@ def create_model(trial, num_materials, space=None):
     可以使用预定义的搜索空间或默认范围
     """
     if space is None:
-        material_range = (8, 32)
-        latent_range = (16, 128)
+        material_range = (8, 24)
+        latent_range = (16, 48)
         block_range = (2, 4)
     else:
-        material_range = space.get("material_embed_dim", (8, 32))
-        latent_range = space.get("latent_dim", (16, 128))
+        material_range = space.get("material_embed_dim", (8, 24))
+        latent_range = space.get("latent_dim", (16, 48))
         block_range = space.get("num_blocks", (2, 4))
 
     # 模型架构超参数
@@ -85,7 +80,7 @@ def create_model(trial, num_materials, space=None):
     )
 
     # 动态调整dropout率
-    dropout_rate = trial.suggest_float("dropout_rate", 0.05, 0.2, step=0.05)
+    dropout_rate = trial.suggest_float("dropout_rate", 0.1, 0.2, step=0.05)
     for module in model.modules():
         if isinstance(module, nn.Dropout):
             module.p = dropout_rate
@@ -115,12 +110,12 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
         if "lr" in fixed_params:
             lr = fixed_params["lr"]
         else:
-            lr = trial.suggest_float("lr", 5e-4, 1e-2, log=True)
+            lr = trial.suggest_float("lr", 0.0005, 0.003, log=True)
             
         if "epochs" in fixed_params:
             epochs = fixed_params["epochs"]
         else:
-            epochs = trial.suggest_int("epochs", 100, 300, step=50)
+            epochs = trial.suggest_int("epochs", 200, 500, step=50)
             
         if "batch_size" in fixed_params:
             batch_size = fixed_params["batch_size"]
@@ -130,24 +125,24 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda", 
         if "weight_decay" in fixed_params:
             weight_decay = fixed_params["weight_decay"]
         else:
-            weight_decay = trial.suggest_float("weight_decay", 1e-5, 1e-3, log=True)
+            weight_decay = trial.suggest_float("weight_decay", 3e-3, 1e-2, log=True)
 
         # 损失函数超参数
         if "lambda_complexity" in fixed_params:
             lambda_complexity = fixed_params["lambda_complexity"]
         else:
-            lambda_complexity = trial.suggest_float("lambda_complexity", 1e-6, 1e-4, log=True)
+            lambda_complexity = trial.suggest_float("lambda_complexity", 1e-5, 1e-3, log=True)
             
         if "lambda_physics" in fixed_params:
             lambda_physics = fixed_params["lambda_physics"]
         else:
-            lambda_physics = trial.suggest_float("lambda_physics", 0.01, 0.05, step=0.01)
+            lambda_physics = trial.suggest_float("lambda_physics", 0.1, 0.5, step=0.01)
 
         # 早停参数
         if "patience" in fixed_params:
             patience = fixed_params["patience"]
         else:
-            patience = trial.suggest_int("patience", 20, 40, step=5)
+            patience = trial.suggest_int("patience", 40, 60, step=5)
 
         # 其他选项
         if "augmentation" in fixed_params:
@@ -442,7 +437,7 @@ def objective(trial, df, device, seed, space=None, fixed_params=None):
 
 
 def run_hyperopt(
-    data_path: str = "merged_normal_data_v3_sorted.csv",
+    data_path: str = "3011916164精确材料性能数据.csv",
     n_trials_stage1: int = 20,
     n_trials_stage2: int = 10,
     top_k: int = 3,
@@ -619,7 +614,7 @@ def print_optimization_results(study):
 
 
 def retrain_with_best_params(
-    study, data_path="merged_normal_data_v3_sorted.csv", seed=42
+    study, data_path="3011916164精确材料性能数据.csv", seed=42
 ):
     """
     使用最佳超参数重新训练模型
@@ -933,7 +928,7 @@ def main():
     print("=" * 60)
     
     # 配置参数
-    DATA_PATH = "merged_normal_data_v3_sorted.csv"
+    DATA_PATH = "3011916164精确材料性能数据.csv"
     N_TRIALS_STAGE1 = 10  # 第一阶段试验次数
     N_TRIALS_STAGE2 = 5  # 第二阶段试验次数
     TOP_K = 3  # 从第一阶段选择的最佳试验数量

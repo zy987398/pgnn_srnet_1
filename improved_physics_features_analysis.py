@@ -18,7 +18,7 @@ from typing import Dict, List, Tuple, Optional
 
 # 导入改进的PGNN模型和数据处理函数
 from improved_material_crack_pgnn import PhysicsInformedFeatureExtractor
-from old_pgnn.utils import prepare_material_data
+from improved_material_crack_pgnn import prepare_material_data
 
 # 忽略警告
 warnings.filterwarnings('ignore')

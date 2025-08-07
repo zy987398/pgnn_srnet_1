@@ -73,7 +73,7 @@ class PhysicsInformedFeatureExtractor(nn.Module):
             x = torch.nan_to_num(x, nan=0.0, posinf=1e3, neginf=0.0)
         
         # 在输入处进行一次自适应缩放，确保数据在合理范围内
-        x = adaptive_scale(x, target_max=1e6, name="physics_extractor_input")
+        # x = adaptive_scale(x, target_max=1e6, name="physics_extractor_input")
         
         # 保存原始特征用于输出
         features = [x]
@@ -212,7 +212,7 @@ class PhysicsInformedFeatureExtractor(nn.Module):
         all_features = torch.cat(features + feats, dim=1)  # 6个原始特征 + 12个物理特征 = 18个总特征
         
         # 仅在输出端进行一次自适应缩放
-        all_features = adaptive_scale(all_features, target_max=100.0, name="physics_features_final")
+        # all_features = adaptive_scale(all_features, target_max=100.0, name="physics_features_final")
         
         return all_features
 
@@ -315,7 +315,7 @@ class AdaptiveSymbolicLayer(nn.Module):
         numeric_raw: [batch_size, 6] - 原始尺度的物理特征
         """
         # 仅对输入z进行一次自适应缩放
-        z = adaptive_scale(z, target_max=10.0, name="symbolic_z_input")
+        # z = adaptive_scale(z, target_max=10.0, name="symbolic_z_input")
         
         # 1. 提取物理特征
         physics_features = self.physics_extractor(numeric_raw)
@@ -589,6 +589,7 @@ class AdaptiveSymbolicLayer(nn.Module):
             else:
                 self.complexity = float(self.complexity)
         except:
+            print("Warning: Failed to compute complexity value.")
             self.complexity = 0.0
 
         return symbolic_output

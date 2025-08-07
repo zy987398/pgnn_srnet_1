@@ -13,7 +13,7 @@ from sklearn.manifold import TSNE
 from sklearn.feature_selection import mutual_info_regression
 import torch
 from scipy.stats import pearsonr, spearmanr
-from old_pgnn.utils import prepare_material_data
+from improved_material_crack_pgnn import prepare_material_data
 import os
 
 # 设置更好的可视化样式
@@ -40,7 +40,7 @@ def load_and_preprocess_data(file_path='3011916164精确材料性能数据.csv')
     print(f"材料种类数量: {df['材料种类'].nunique()}")
     
     # 使用项目中的预处理方法
-    data_dict = prepare_material_data(df, verbose=True)
+    data_dict = prepare_material_data(df)
     
     # 返回原始数据和预处理后的数据
     return df, data_dict
@@ -840,18 +840,6 @@ def multidimensional_analysis(features_df):
     except Exception as e:
         print(f"多维特征分析出错: {e}")
         return
-    
-        ax.set_xlabel(x_feature)
-        ax.set_ylabel(y_feature)
-        ax.set_zlabel(z_feature)
-        ax.set_title(f'三维特征空间可视化: {x_feature}, {y_feature}, {z_feature}')
-        
-        cbar = plt.colorbar(scatter, ax=ax, pad=0.1)
-        cbar.set_label('亚表面裂纹深度')
-        
-        plt.tight_layout()
-        plt.savefig('analysis_results/三维特征空间可视化.png', dpi=300)
-        print(f"\n完成三维特征空间可视化，使用特征: {x_feature}, {y_feature}, {z_feature}")
 
 def create_output_dir():
     """创建输出目录"""

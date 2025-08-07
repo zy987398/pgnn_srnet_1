@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import torch
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from typing import Dict, List, Tuple, Optional
 
@@ -139,3 +140,68 @@ def augment_dataset(orig_df, noise_scale=0.05):
     except Exception as e:
         print(f"数据增强过程出错: {str(e)}")
         return orig_df  # 出错时返回原始数据
+
+
+def safe_division(a, b, eps=1e-6, max_val=1e6):
+    """安全除法操作，防止除零"""
+    # 确保分母非零
+    safe_denom = torch.clamp(b, min=eps)
+    
+    # 计算结果
+    result = a / safe_denom
+    
+    # 处理无穷大和NaN
+    result = torch.nan_to_num(result, nan=0.0, posinf=max_val, neginf=-max_val)
+    
+    # 限制最大值
+    return torch.clamp(result, min=-max_val, max=max_val)
+
+
+def safe_log(x, eps=1e-6):
+    """安全对数操作，防止对负数或零取对数"""
+    x_safe = torch.clamp(x, min=eps)
+    result = torch.log(x_safe)
+    return torch.nan_to_num(result, nan=0.0, posinf=10.0, neginf=-10.0)
+
+
+def safe_sqrt(x, eps=1e-6):
+    """安全平方根操作，防止对负数取平方根"""
+    x_safe = torch.clamp(torch.abs(x), min=eps)
+    result = torch.sqrt(x_safe)
+    return torch.nan_to_num(result, nan=0.0, posinf=10.0, neginf=0.0)
+
+
+def safe_power(x, power, eps=1e-6, max_val=1e6):
+    """安全幂运算，处理边界情况"""
+    # 如果是偶数幂，确保不使用负数
+    if power % 2 == 0:
+        x_safe = torch.abs(x)
+    else:
+        x_safe = x
+    
+    # 限制基数范围以避免过大结果
+    if power > 1:
+        max_base = torch.pow(torch.tensor(max_val, device=x.device), 1/power)
+        x_safe = torch.clamp(x_safe, -max_base, max_base)
+    
+    result = torch.pow(x_safe + eps, power)
+    return torch.nan_to_num(result, nan=0.0, posinf=max_val, neginf=-max_val)
+
+
+def adaptive_scale(x, target_max=10.0, name=None):
+    """自适应缩放，防止数值过大或过小"""
+    if torch.isnan(x).any() or torch.isinf(x).any():
+        if name:
+            print(f"Warning: NaN/Inf in {name}, fixing")
+        x = torch.nan_to_num(x, nan=0.0, posinf=1e3, neginf=-1e3)
+    
+    # 计算当前范围
+    abs_max = torch.max(torch.abs(x))
+    
+    # 如果范围太大或太小，进行缩放
+    if abs_max > target_max or abs_max < (target_max / 100):
+        if abs_max > 0:
+            scale = target_max / abs_max
+            x = x * scale
+    
+    return x

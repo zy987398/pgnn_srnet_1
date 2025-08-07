@@ -1,0 +1,15 @@
+{
+  "lr": 0.0013179203824025122,
+  "epochs": 250,
+  "batch_size": 32,
+  "weight_decay": 0.0030808580280397985,
+  "lambda_complexity": 0.0001786227905317658,
+  "lambda_physics": 0.48,
+  "patience": 60,
+  "augmentation": false,
+  "optimizer": "RMSprop",
+  "material_embed_dim": 16,
+  "latent_dim": 32,
+  "num_blocks": 3,
+  "dropout_rate": 0.2
+}
