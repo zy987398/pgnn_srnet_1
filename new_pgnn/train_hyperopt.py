@@ -7,6 +7,7 @@ import joblib
 import datetime
 import optuna
 from optuna.trial import TrialState
+import sys
 import torch
 import torch.nn as nn
 from torch.optim.lr_scheduler import OneCycleLR
@@ -21,6 +22,22 @@ from torch.utils.data import TensorDataset, DataLoader
 from models import MaterialCrackPGNN
 from losses import PhysicsInformedLoss
 from utils import prepare_material_data, reconstruct_df, augment_dataset
+
+
+# 日志重定向类：将所有print内容写入日志文件和控制台
+class Logger(object):
+    def __init__(self, log_file):
+        self.terminal = sys.__stdout__
+        self.log = open(log_file, "a", encoding="utf-8")
+    def write(self, message):
+        self.terminal.write(message)
+        self.log.write(message)
+    def flush(self):
+        self.terminal.flush()
+        self.log.flush()
+    def close(self):
+        self.log.close()
+
 
 # 忽略警告
 warnings.filterwarnings("ignore")
@@ -46,7 +63,7 @@ def create_model(trial, num_materials, fixed_params=None):
         latent_dim = trial.suggest_int("latent_dim", 16, 48, step=16)  # 缩小范围
 
     # 符号层类型选择 - 始终从fixed_params获取，不再进行搜索
-    symbolic_type = fixed_params.get("symbolic_type", "lightweight")  # 默认使用轻量级符号层
+    symbolic_type = fixed_params.get("symbolic_type", "advanced")  # 默认使用高级符号层
     print(f"  使用符号层类型: {symbolic_type}")
     
     # 创建模型并修改部分架构
@@ -268,7 +285,6 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda",
     )
 
     val_materials = torch.LongTensor(val_data["material_ids"]).to(device)
-    val_features = torch.FloatTensor(val_data["numeric_features"]).to(device)
     val_raw = torch.FloatTensor(val_data["numeric_raw"]).to(device)
     val_target = torch.FloatTensor(val_data["target"]).unsqueeze(1).to(device)
 
@@ -315,13 +331,13 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda",
         model.eval()
         with torch.no_grad():
             val_pred, val_uncertainty, _, _ = model(val_materials, val_raw)
-            val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
+            # val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
 
             val_pred_np = val_pred.cpu().squeeze().numpy()
             val_target_np = val_target.cpu().squeeze().numpy()
 
             val_r2 = r2_score(val_target_np, val_pred_np)
-            val_rmse = np.sqrt(mean_squared_error(val_target_np, val_pred_np))
+            # val_rmse = np.sqrt(mean_squared_error(val_target_np, val_pred_np))
 
         # 早停检查
         if val_r2 > best_val_r2:
@@ -442,7 +458,7 @@ def objective(trial, df, device, seed, space=None, fixed_params=None):
     return float(np.mean(fold_scores))
 
 
-def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_stage1=30, n_trials_stage2=20, top_k=5, seed=66, symbolic_type="lightweight"):
+def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_stage1=30, n_trials_stage2=20, top_k=5, seed=66, symbolic_type="advanced"):
     """
     运行双阶段超参数优化
     
@@ -460,7 +476,7 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_st
 
     # 读取数据
     df = pd.read_csv(data_path)
-    num_materials = df["材料种类"].nunique()
+    # num_materials = df["材料种类"].nunique()
 
     # 设备
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -542,6 +558,9 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_st
             fixed_params[param_name] = param_value
             print(f"第2阶段将使用固定 {param_name} = {param_value}")
     
+    # 保存一个单独的固定参数字典供后续使用
+    study1._fixed_params = fixed_params.copy() if fixed_params else {}
+    
     print(f"\n开始第2阶段: 精细TPE搜索 ({n_trials_stage2}次试验)")
     study2 = optuna.create_study(
         direction="maximize", 
@@ -568,6 +587,9 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_st
         if study2.best_value > study1.best_value:
             final_study = study2
             print("\n阶段2搜索找到了更好的参数!")
+            # 将阶段1的固定参数存入study2
+            if hasattr(study1, "_fixed_params"):
+                final_study._fixed_params = study1._fixed_params
         else:
             final_study = study1
             print("\n阶段1搜索的参数更优!")
@@ -606,6 +628,22 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_st
     # 为了可视化，在final_study中保存两个阶段的study对象
     final_study._study1 = study1
     final_study._study2 = study2
+    
+    # 合并第一阶段和第二阶段的参数为完整参数集
+    complete_params = {}
+    
+    # 首先添加固定参数（第一阶段的参数）
+    if hasattr(study1, "_fixed_params"):
+        complete_params.update(study1._fixed_params)
+    elif hasattr(study1, "best_params") and study1.best_params:
+        complete_params.update(study1.best_params)
+    
+    # 然后添加第二阶段可能搜索到的参数
+    if final_study.best_params:
+        complete_params.update(final_study.best_params)
+    
+    # 将完整参数保存到final_study中的一个特殊属性
+    final_study._complete_params = complete_params
         
     # 打印最终结果
     print("\n" + "=" * 50)
@@ -614,8 +652,15 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_st
 
     print(f"\n最终最佳验证R²: {final_study.best_value:.4f}")
     print("\n最终最佳超参数:")
-    for key, value in final_study.best_params.items():
-        print(f"  {key}: {value}")
+    
+    # 打印完整的参数集
+    if hasattr(final_study, "_complete_params") and final_study._complete_params:
+        for key, value in final_study._complete_params.items():
+            print(f"  {key}: {value}")
+    else:
+        # 如果没有完整参数，则打印第二阶段的最佳参数（如果有）
+        for key, value in final_study.best_params.items():
+            print(f"  {key}: {value}")
 
     # 统计信息
     completed_trials1 = len([t for t in study1.trials if t.state == TrialState.COMPLETE])
@@ -648,7 +693,7 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_st
 
 # 使用最佳超参数重新训练
 def retrain_with_best_params(
-    study, data_path="3011916164精确材料性能数据.csv", seed=66, symbolic_type="lightweight"
+    study, data_path="3011916164精确材料性能数据.csv", seed=66, symbolic_type="advanced"
 ):
     """
     使用最佳超参数重新训练并评估
@@ -1044,52 +1089,56 @@ def log_message(message, log_file=None):
 if __name__ == "__main__":
     # 确保结果目录存在
     os.makedirs("results", exist_ok=True)
-    
+
     # 设置日志文件
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_file = f"results/hyperopt_run_{timestamp}.log"
-    
-    log_message(f"开始执行双阶段超参数优化 - {timestamp}", log_file)
-    
+
+    # 重定向所有print输出到日志文件和控制台
+    logger = Logger(log_file)
+    sys.stdout = logger
+    sys.stderr = logger
+
+    print(f"开始执行双阶段超参数优化 - {timestamp}")
+
     # 检查CUDA可用性
     cuda_available = torch.cuda.is_available()
     if cuda_available:
         device_name = torch.cuda.get_device_name(0)
-        log_message(f"CUDA可用: {device_name}", log_file)
+        print(f"CUDA可用: {device_name}")
         torch.backends.cudnn.benchmark = True
     else:
-        log_message("CUDA不可用，将使用CPU（训练可能较慢）", log_file)
-    
+        print("CUDA不可用，将使用CPU（训练可能较慢）")
+
     # 设置不同调试级别的试验次数
     debug_mode = False  # 切换调试模式
     if debug_mode:
         n_trials_stage1 = 2
         n_trials_stage2 = 1
         top_k = 1
-        log_message("[警告] 调试模式: 仅运行少量试验", log_file)  # 移除emoji
+        print("[警告] 调试模式: 仅运行少量试验")
     else:
         n_trials_stage1 = 40
         n_trials_stage2 = 20
         top_k = 5
-        log_message("正式模式: 运行完整优化过程", log_file)
-    
+        print("正式模式: 运行完整优化过程")
+
     try:
         # 运行双阶段超参数优化
-        log_message(f"开始双阶段超参数优化 (阶段1: {n_trials_stage1}次, 阶段2: {n_trials_stage2}次, 前{top_k}个最佳结果)", log_file)
+        print(f"开始双阶段超参数优化 (阶段1: {n_trials_stage1}次, 阶段2: {n_trials_stage2}次, 前{top_k}个最佳结果)")
         study = run_hyperopt(n_trials_stage1=n_trials_stage1, n_trials_stage2=n_trials_stage2, top_k=top_k)
     except Exception as e:
-        log_message(f"超参数优化过程出错: {str(e)}", log_file)
-        log_message(f"错误详情: {traceback.format_exc()}", log_file)
-        
+        print(f"超参数优化过程出错: {str(e)}")
+        print(f"错误详情: {traceback.format_exc()}")
         # 尝试加载之前的结果（如果有）
         try:
             if os.path.exists("results/best_hyperopt_study.pkl"):
                 study = joblib.load("results/best_hyperopt_study.pkl")
-                log_message("已加载之前保存的study对象继续运行", log_file)
+                print("已加载之前保存的study对象继续运行")
             else:
                 raise FileNotFoundError("未找到已保存的study文件")
         except Exception as load_err:
-            log_message(f"无法加载之前的study对象: {str(load_err)}，将创建默认参数", log_file)
+            print(f"无法加载之前的study对象: {str(load_err)}，将创建默认参数")
             # 创建一个默认study用于继续运行
             study = optuna.create_study(direction="maximize")
             default_params = {
@@ -1106,21 +1155,21 @@ if __name__ == "__main__":
                 "augmentation": True,
                 "optimizer": "AdamW"
             }
-            log_message("使用默认参数:", log_file)
+            print("使用默认参数:")
             for k, v in default_params.items():
-                log_message(f"  {k}: {v}", log_file)
+                print(f"  {k}: {v}")
             study.enqueue_trial(default_params)
 
     try:
         # 使用最佳参数重新训练
-        log_message("\n开始使用最佳超参数重新训练模型...", log_file)
+        print("\n开始使用最佳超参数重新训练模型...")
         # 获取所使用的符号层类型（如果有），否则使用 "lightweight"
-        symbolic_type = study.best_params.get("symbolic_type", "lightweight")
-        log_message(f"使用符号层类型: {symbolic_type}", log_file)
+        symbolic_type = study.best_params.get("symbolic_type", "advanced")
+        print(f"使用符号层类型: {symbolic_type}")
         model, train_losses, test_r2_history = retrain_with_best_params(study, symbolic_type=symbolic_type)
-        
+
         # 详细评估
-        log_message("\n开始详细评估模型...", log_file)
+        print("\n开始详细评估模型...")
         df = pd.read_csv("3011916164精确材料性能数据.csv")
         train_df, test_df = train_test_split(df, test_size=0.2, random_state=66)
         train_data = prepare_material_data(train_df)
@@ -1131,35 +1180,48 @@ if __name__ == "__main__":
         )
 
         results = evaluate_model_detailed(model, test_data)
-        
+
         # 保存模型
         try:
             torch.save(model.state_dict(), "results/improved_model.pth")
-            log_message("模型已保存至 results/improved_model.pth", log_file)
-            
+            print("模型已保存至 results/improved_model.pth")
+
             # 保存训练历史
+            # 获取完整参数集
+            if hasattr(study, "_complete_params") and study._complete_params:
+                complete_params = study._complete_params
+            else:
+                # 尝试合并第一阶段参数
+                complete_params = {}
+                if hasattr(study, "_study1") and hasattr(study._study1, "best_params"):
+                    complete_params.update(study._study1.best_params)
+                if study.best_params:
+                    complete_params.update(study.best_params)
+                if not complete_params:
+                    complete_params = study.best_params or {}
+            
             history_dict = {
                 "train_losses": train_losses,
                 "test_r2_history": test_r2_history,
-                "best_params": study.best_params,
+                "best_params": complete_params,  # 使用完整参数
                 "best_value": study.best_value,
             }
             joblib.dump(history_dict, "results/training_history.pkl")
-            log_message("训练历史已保存至 results/training_history.pkl", log_file)
-            
+            print("训练历史已保存至 results/training_history.pkl")
+
         except Exception as save_err:
-            log_message(f"保存模型时出错: {str(save_err)}", log_file)
-            
+            print(f"保存模型时出错: {str(save_err)}")
+
     except Exception as e:
-        log_message(f"训练或评估过程中出错: {str(e)}", log_file)
-        log_message(f"错误详情: {traceback.format_exc()}", log_file)
+        print(f"训练或评估过程中出错: {str(e)}")
+        print(f"错误详情: {traceback.format_exc()}")
         model = None
         train_losses = []
         test_r2_history = []
         results = None
 
     try:
-        log_message("\n生成可视化图表...", log_file)
+        print("\n生成可视化图表...")
         # 可视化优化历史 - 双阶段
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -1168,13 +1230,13 @@ if __name__ == "__main__":
             # 如果study对象有保存两个阶段的study
             values1 = [t.value for t in study._study1.trials if t.value is not None]
             values2 = [t.value for t in study._study2.trials if t.value is not None]
-            
+
             if values1:  # 只有当有值时才绘制阶段1
                 ax1.plot(range(len(values1)), values1, 'b-', alpha=0.7, label='阶段1 - 随机搜索')
-            
+
             if values2:  # 只有当有值时才绘制阶段2
                 ax1.plot(range(len(values1), len(values1) + len(values2)), values2, 'r-', alpha=0.7, label='阶段2 - TPE精细搜索')
-            
+
             if values1 or values2:  # 只有当至少有一个阶段有值时才添加分隔线和图例
                 if values1:  # 只有当阶段1有值时才添加分隔线
                     ax1.axvline(x=len(values1), color='k', linestyle='--', alpha=0.5)
@@ -1186,7 +1248,7 @@ if __name__ == "__main__":
                 ax1.plot(values)
             else:
                 ax1.text(0.5, 0.5, '没有有效的优化结果', horizontalalignment='center', verticalalignment='center')
-        
+
         ax1.set_xlabel("Trial")
         ax1.set_ylabel("Validation R²")
         ax1.set_title("双阶段超参数优化历史")
@@ -1198,7 +1260,7 @@ if __name__ == "__main__":
             ax2.set_yscale("log")
         else:
             ax2.text(0.5, 0.5, '没有训练损失数据', horizontalalignment='center', verticalalignment='center')
-            
+
         ax2.set_xlabel("Epoch")
         ax2.set_ylabel("Loss")
         ax2.set_title("Training Loss with Best Hyperparameters")
@@ -1241,15 +1303,15 @@ if __name__ == "__main__":
             plt.tight_layout()
             plt.savefig("results/predictions_visualization.png", dpi=300)
             plt.close(fig)
-            
+
             # 不确定性可视化
             try:
                 fig, ax = plt.subplots(figsize=(10, 6))
-                
+
                 # 按误差大小排序
                 errors = np.abs(results["predictions"]["y_mc_pred"] - results["predictions"]["y_true"])
                 sorted_indices = np.argsort(errors)
-                
+
                 ax.errorbar(
                     range(len(sorted_indices)),
                     results["predictions"]["y_mc_pred"][sorted_indices],
@@ -1266,27 +1328,30 @@ if __name__ == "__main__":
                     color='k',
                     label='True Values'
                 )
-                
+
                 ax.set_xlabel('Sample Index (sorted by error)')
                 ax.set_ylabel('Crack Depth')
                 ax.set_title('Predictions with Uncertainty Intervals')
                 ax.legend()
                 ax.grid(True, alpha=0.3)
-                
+
                 plt.tight_layout()
                 plt.savefig("results/uncertainty_visualization.png", dpi=300)
                 plt.close(fig)
             except Exception as e:
-                log_message(f"绘制不确定性可视化时出错: {str(e)}", log_file)
-                
-        log_message("可视化图表已保存到results文件夹", log_file)
-            
+                print(f"绘制不确定性可视化时出错: {str(e)}")
+
+        print("可视化图表已保存到results文件夹")
+
     except Exception as e:
-        log_message(f"生成可视化过程出错: {str(e)}", log_file)
-        log_message(f"错误详情: {traceback.format_exc()}", log_file)
-        
-    log_message("\n优化和训练过程完成!", log_file)
-    
+        print(f"生成可视化过程出错: {str(e)}")
+        print(f"错误详情: {traceback.format_exc()}")
+
+    print("\n优化和训练过程完成!")
+
     # 运行结束时间
     end_timestamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    log_message(f"运行结束时间: {end_timestamp}", log_file)
+    print(f"运行结束时间: {end_timestamp}")
+
+    # 关闭日志文件
+    logger.close()

@@ -36,21 +36,21 @@ if torch.cuda.is_available():
 # 最佳超参数 (从best_hyperopt_params.json提取)
 PARAMS = {
     # 模型架构参数
-    "material_embed_dim": 16,    # 材料嵌入维度
-    "latent_dim": 32,            # 隐藏层维度
-    "num_blocks": 3,             # 残差块数量
-    "dropout_rate": 0.2,         # Dropout率
-    
+    "material_embed_dim": 8,     # 材料嵌入维度
+    "latent_dim": 16,            # 隐藏层维度
+    "dropout_rate": 0.4,         # Dropout率
+    "symbolic_type": "advanced",  # 符号层类型，可选: "lightweight", "improved", "advanced"等
+
     # 训练参数
-    "epochs": 250,               # 训练轮数
-    "batch_size": 32,            # 批次大小
-    "lr": 0.0013179203824025122,                 # 学习率
+    "epochs": 300,               # 训练轮数
+    "batch_size": 16,            # 批次大小
+    "lr": 0.0018568988385351992, # 学习率
     "patience": 60,              # 早停参数
-    "augmentation": False,        # 是否使用数据增强
-    "optimizer": "RMSprop",      # 优化器
-    "weight_decay": 0.0030808580280397985,      # 权重衰减
-    "lambda_complexity": 0.0001786227905317658,  # 复杂度损失权重
-    "lambda_physics": 0.48       # 物理损失权重
+    "augmentation": True,        # 是否使用数据增强
+    "optimizer": "AdamW",        # 优化器
+    "weight_decay": 0.005758576456620779,      # 权重衰减
+    "lambda_complexity": 3.0143649044331185e-05,  # 复杂度损失权重
+    "lambda_physics": 0.35       # 物理损失权重
 }
 
 
@@ -108,6 +108,7 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         material_embed_dim=params.get("material_embed_dim", 16),
         latent_dim=params.get("latent_dim", 32),
         dropout_rate=params.get("dropout_rate", 0.2),
+        symbolic_type=params.get("symbolic_type", "advanced")
     )
     model = model.to(device)
     
@@ -440,6 +441,7 @@ def load_model_and_predict(model_path, data_path=DATA_PATH, new_data_path=None):
         material_embed_dim=PARAMS["material_embed_dim"],
         latent_dim=PARAMS["latent_dim"],
         dropout_rate=PARAMS["dropout_rate"],
+        symbolic_type=PARAMS.get("symbolic_type", "advanced")
     )
     
     # 加载模型参数
