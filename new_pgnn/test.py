@@ -11,14 +11,64 @@ from torch.optim.lr_scheduler import OneCycleLR
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
+from matplotlib import font_manager
+from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from torch.utils.data import TensorDataset, DataLoader
+
+# 配置matplotlib支持中文显示
+try:
+    # 尝试配置中文字体
+    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'KaiTi', 'FangSong', 'SimSun']
+    plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+    plt.rcParams['font.size'] = 12  # 设置字体大小
+    
+    # 验证是否可以找到中文字体
+    fonts = [f.name for f in font_manager.fontManager.ttflist]
+    chinese_fonts = [f for f in fonts if any(name in f for name in ['SimHei', 'Microsoft YaHei', 'KaiTi', 'FangSong', 'SimSun'])]
+    
+    if not chinese_fonts:
+        print("警告：未找到中文字体，将使用系统默认字体")
+except Exception as e:
+    print(f"设置中文字体时出错: {e}")
+    print("继续使用默认字体")
+    
+# 设置绘图样式
+plt.style.use('seaborn-v0_8-whitegrid')
+
+def setup_plot_style(fig=None, ax=None):
+    """设置图表风格以确保中文正确显示和样式统一"""
+    if fig is None:
+        fig = plt.gcf()
+    if ax is None:
+        ax = plt.gca()
+        
+    # 增强网格线和轴线的可见性
+    ax.grid(True, linestyle='--', alpha=0.7)
+    
+    # 设置轴标签和标题的字体属性
+    for label in ax.get_xticklabels() + ax.get_yticklabels():
+        label.set_fontproperties(font_manager.FontProperties(family='SimHei'))
+        
+    # 边框设置
+    ax.spines['top'].set_visible(False)
+    ax.spines['right'].set_visible(False)
+    ax.spines['left'].set_linewidth(1.2)
+    ax.spines['bottom'].set_linewidth(1.2)
+    
+    # 图例样式
+    legend = ax.get_legend()
+    if legend is not None:
+        legend.get_frame().set_alpha(0.8)
+        for text in legend.get_texts():
+            text.set_fontproperties(font_manager.FontProperties(family='SimHei'))
+    
+    return fig, ax
 
 # 导入自定义模块
 from models import MaterialCrackPGNN
 from losses import PhysicsInformedLoss
-from utils import prepare_material_data, augment_dataset
+from utils import prepare_material_data, augment_dataset, reconstruct_df
 
 # 忽略警告
 warnings.filterwarnings("ignore")
@@ -33,76 +83,38 @@ np.random.seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
 
-# 最佳超参数 (从best_hyperopt_params.json提取)
+# 最佳超参数 (从hyperopt优化结果提取)
 PARAMS = {
     # 模型架构参数
-    "material_embed_dim": 8,     # 材料嵌入维度
-    "latent_dim": 16,            # 隐藏层维度
-    "dropout_rate": 0.4,         # Dropout率
+    "material_embed_dim": 16,    # 材料嵌入维度
+    "latent_dim": 32,            # 隐藏层维度
+    "dropout_rate": 0.3,         # Dropout率
     "symbolic_type": "advanced",  # 符号层类型，可选: "lightweight", "improved", "advanced"等
 
     # 训练参数
     "epochs": 300,               # 训练轮数
-    "batch_size": 16,            # 批次大小
-    "lr": 0.0018568988385351992, # 学习率
+    "batch_size": 64,            # 批次大小
+    "lr": 0.0006268177412569363, # 学习率
     "patience": 60,              # 早停参数
     "augmentation": True,        # 是否使用数据增强
     "optimizer": "AdamW",        # 优化器
-    "weight_decay": 0.005758576456620779,      # 权重衰减
-    "lambda_complexity": 3.0143649044331185e-05,  # 复杂度损失权重
-    "lambda_physics": 0.35       # 物理损失权重
+    "weight_decay": 0.0034927629214886254,      # 权重衰减
+    "lambda_complexity": 1.4318423278662003e-05,  # 复杂度损失权重
+    "lambda_physics": 0.15000000000000002,      # 物理损失权重
+    
+    # 评估参数
+    "use_cross_validation": True,  # 是否使用交叉验证
+    "cv_folds": 5,                # 交叉验证折数
+    "max_norm": 1.0               # 梯度裁剪阈值，与train_hyperopt.py保持一致
 }
 
 
-def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
-    """使用固定超参数训练和评估模型"""
-    print("\n" + "="*50)
-    print("使用固定超参数训练模型")
-    print("="*50)
-    
-    # 打印使用的参数
-    for key, value in params.items():
-        print(f"{key}: {value}")
-    
-    # 设置设备
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"\n使用设备: {device}")
-    
-    # 读取和分割数据
-    print("\n加载数据...")
-    df = pd.read_csv(data_path)
-    print(f"数据集大小: {len(df)} 样本")
-    
-    train_df, test_df = train_test_split(df, test_size=0.2, random_state=seed, stratify=df["材料种类"])
-    print(f"训练集: {len(train_df)} 样本, 测试集: {len(test_df)} 样本")
-    
-    # 准备数据
-    train_data = prepare_material_data(train_df)
-    test_data = prepare_material_data(
-        test_df,
-        scaler=train_data["scaler"],
-        le=train_data["label_encoder"],
-    )
-    
-    num_materials = train_data["num_materials"]
-    print(f"共 {num_materials} 种材料类型")
-    
-    # 数据增强 (如果启用)
-    train_df_for_aug = train_df.copy()
-    if params["augmentation"]:
-        print("\n应用数据增强...")
-        train_df_for_aug = augment_dataset(train_df_for_aug)
-        print(f"数据集大小: {len(train_df)} -> {len(train_df_for_aug)} (增加 {len(train_df_for_aug)-len(train_df)} 个样本)")
-    
-    augmented_train_data = prepare_material_data(
-        train_df_for_aug,
-        scaler=train_data["scaler"],
-        le=train_data["label_encoder"],
-        augment=False,
-    )
+def train_single_fold(train_data, val_data, params, device, fold_idx=None):
+    """训练单个折叠或数据集划分的模型"""
+    fold_str = f"折叠 {fold_idx+1}/{params['cv_folds']}: " if fold_idx is not None else ""
     
     # 创建模型
-    print("\n创建模型...")
+    num_materials = train_data["num_materials"]
     model = MaterialCrackPGNN(
         num_materials=num_materials,
         material_embed_dim=params.get("material_embed_dim", 16),
@@ -112,17 +124,29 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
     )
     model = model.to(device)
     
-    # 打印模型参数总数
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"模型参数总数: {total_params:,}")
+    # 数据增强 (如果启用)
+    if params["augmentation"]:
+        train_df = reconstruct_df(train_data)
+        original_size = len(train_df)
+        train_df = augment_dataset(train_df)
+        if fold_idx is not None:
+            print(f"  {fold_str}数据增强: {original_size} -> {len(train_df)} 样本")
+        
+        # 使用增强后的数据更新训练集
+        train_data = prepare_material_data(
+            train_df,
+            scaler=train_data["scaler"],
+            le=train_data["label_encoder"],
+            augment=False,
+        )
     
     # 创建DataLoader
     batch_size = params["batch_size"]
     train_dataset = TensorDataset(
-        torch.LongTensor(augmented_train_data["material_ids"]),
-        torch.FloatTensor(augmented_train_data["numeric_features"]),
-        torch.FloatTensor(augmented_train_data["numeric_raw"]),
-        torch.FloatTensor(augmented_train_data["target"]).unsqueeze(1),
+        torch.LongTensor(train_data["material_ids"]),
+        torch.FloatTensor(train_data["numeric_features"]),
+        torch.FloatTensor(train_data["numeric_raw"]),
+        torch.FloatTensor(train_data["target"]).unsqueeze(1),
     )
     train_loader = DataLoader(
         train_dataset,
@@ -130,14 +154,14 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         shuffle=True,
         drop_last=False,
         pin_memory=True,
-        num_workers=0,  # 单进程加载
+        num_workers=0,
     )
     
-    # 准备测试数据
-    test_materials = torch.LongTensor(test_data["material_ids"]).to(device)
-    test_features = torch.FloatTensor(test_data["numeric_features"]).to(device)
-    test_raw = torch.FloatTensor(test_data["numeric_raw"]).to(device)
-    test_target = torch.FloatTensor(test_data["target"]).unsqueeze(1).to(device)
+    # 准备验证数据
+    val_materials = torch.LongTensor(val_data["material_ids"]).to(device)
+    val_features = torch.FloatTensor(val_data["numeric_features"]).to(device)
+    val_raw = torch.FloatTensor(val_data["numeric_raw"]).to(device)
+    val_target = torch.FloatTensor(val_data["target"]).unsqueeze(1).to(device)
     
     # 优化器
     lr = params["lr"]
@@ -183,8 +207,6 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
     loss_fn.total_epochs = epochs
     
     # 训练循环
-    print("\n开始训练...")
-    start_time = time.time()
     best_val_r2 = -float("inf")
     patience_counter = 0
     best_model_wts = None
@@ -213,14 +235,15 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
             
             # 检查NaN
             if torch.isnan(loss) or torch.isinf(loss):
-                print("警告：检测到NaN或Inf损失，跳过此批次")
+                if fold_idx is not None:
+                    print(f"  {fold_str}警告：检测到NaN或Inf损失，跳过此批次")
                 continue
                 
             loss.backward()
-            # 更严格的梯度裁剪
-            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=0.5)
+            # 使用与train_hyperopt.py相同的梯度裁剪
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=params.get("max_norm", 1.0))
             optimizer.step()
-            scheduler.step()  # OneCycleLR 需要在每个批次后更新
+            scheduler.step()
             
             epoch_loss += loss.item() * batch_target.size(0)
         
@@ -230,20 +253,20 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         # 验证
         model.eval()
         with torch.no_grad():
-            val_pred, val_uncertainty, _, _ = model(test_materials, test_raw)
-            val_loss, _ = loss_fn(val_pred, val_uncertainty, test_target, model, test_raw)
+            val_pred, val_uncertainty, _, _ = model(val_materials, val_raw)
+            val_loss, _ = loss_fn(val_pred, val_uncertainty, val_target, model, val_raw)
             val_losses.append(val_loss.item())
             
             val_pred_np = val_pred.cpu().squeeze().numpy()
-            val_target_np = test_target.cpu().squeeze().numpy()
+            val_target_np = val_target.cpu().squeeze().numpy()
             
             val_r2 = r2_score(val_target_np, val_pred_np)
             val_rmse = np.sqrt(mean_squared_error(val_target_np, val_pred_np))
             val_r2_scores.append(val_r2)
             
-            # 每10个epoch打印一次进度
-            if epoch % 10 == 0 or epoch == epochs - 1:
-                print(f"Epoch {epoch+1}/{epochs} - 训练损失: {epoch_loss:.4f}, 验证损失: {val_loss.item():.4f}, 验证R²: {val_r2:.4f}, 验证RMSE: {val_rmse:.4f}")
+            # 每10个epoch打印一次进度（仅在交叉验证时）
+            if (epoch % 10 == 0 or epoch == epochs - 1) and fold_idx is not None:
+                print(f"  {fold_str}Epoch {epoch+1}/{epochs} - 训练损失: {epoch_loss:.4f}, 验证R²: {val_r2:.4f}, RMSE: {val_rmse:.4f}")
         
         # 早停检查
         if val_r2 > best_val_r2:
@@ -255,20 +278,48 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
             patience_counter += 1
         
         if patience_counter >= params["patience"]:
-            print(f"\n早停：{params['patience']} 轮未改善，在第 {epoch+1} 轮停止")
+            if fold_idx is not None:
+                print(f"  {fold_str}早停：{params['patience']} 轮未改善，在第 {epoch+1} 轮停止")
             break
     
     # 恢复最佳模型状态
     if best_model_wts is not None:
         model.load_state_dict(best_model_wts)
     
-    # 训练时间
-    train_time = time.time() - start_time
-    print(f"\n训练完成，用时: {train_time:.2f} 秒 ({train_time/60:.2f} 分钟)")
-    
-    # 评估模型
-    print("\n在测试集上评估模型...")
+    # 最终验证结果
     model.eval()
+    with torch.no_grad():
+        val_pred, val_uncertainty, val_symbolic, val_residual = model(val_materials, val_raw)
+        val_pred_np = val_pred.cpu().squeeze().numpy()
+        val_target_np = val_target.cpu().squeeze().numpy()
+        
+        final_val_r2 = r2_score(val_target_np, val_pred_np)
+        final_val_rmse = np.sqrt(mean_squared_error(val_target_np, val_pred_np))
+    
+    if fold_idx is not None:
+        print(f"  {fold_str}最终验证 R²: {final_val_r2:.4f}, RMSE: {final_val_rmse:.4f}")
+    
+    return {
+        "model": model,
+        "val_r2": final_val_r2,
+        "val_rmse": final_val_rmse,
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_r2_scores": val_r2_scores,
+        "best_epoch": len(val_r2_scores) - patience_counter - 1
+    }
+
+
+def evaluate_model(model, test_data, device):
+    """评估模型在测试数据上的性能"""
+    model.eval()
+    
+    # 准备测试数据
+    test_materials = torch.LongTensor(test_data["material_ids"]).to(device)
+    test_features = torch.FloatTensor(test_data["numeric_features"]).to(device)
+    test_raw = torch.FloatTensor(test_data["numeric_raw"]).to(device)
+    test_target = torch.FloatTensor(test_data["target"]).unsqueeze(1).to(device)
+    
     with torch.no_grad():
         test_pred, test_uncertainty, test_symbolic, test_residual = model(test_materials, test_raw)
         
@@ -276,83 +327,432 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         test_pred_np = test_pred.cpu().squeeze().numpy()
         test_target_np = test_target.cpu().squeeze().numpy()
         test_uncertainty_np = test_uncertainty.cpu().squeeze().numpy()
+        test_symbolic_np = test_symbolic.cpu().squeeze().numpy() if test_symbolic is not None else None
+        test_residual_np = test_residual.cpu().squeeze().numpy() if test_residual is not None else None
         
         # 计算指标
         test_r2 = r2_score(test_target_np, test_pred_np)
         test_rmse = np.sqrt(mean_squared_error(test_target_np, test_pred_np))
         test_mae = mean_absolute_error(test_target_np, test_pred_np)
         
+        # 评估符号层和残差网络的单独性能
+        results = {
+            "test_r2": test_r2,
+            "test_rmse": test_rmse,
+            "test_mae": test_mae,
+            "test_pred": test_pred_np,
+            "test_target": test_target_np,
+            "test_uncertainty": test_uncertainty_np,
+        }
+        
+        if test_symbolic_np is not None and test_residual_np is not None:
+            symbolic_r2 = r2_score(test_target_np, test_symbolic_np)
+            residual_r2 = r2_score(test_target_np, test_residual_np)
+            results["symbolic_r2"] = symbolic_r2
+            results["residual_r2"] = residual_r2
+            results["symbolic_pred"] = test_symbolic_np
+            results["residual_pred"] = test_residual_np
+            
+            # 获取权重信息
+            if hasattr(model, 'get_symbolic_interpretation'):
+                interpretation = model.get_symbolic_interpretation()
+                if "alpha_weight" in interpretation:
+                    results["alpha_weight"] = interpretation["alpha_weight"]
+    
+    return results
+
+
+def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
+    """使用固定超参数训练和评估模型 - 支持单次分割和交叉验证"""
+    print("\n" + "="*50)
+    print("使用固定超参数训练模型")
+    print("="*50)
+    
+    # 打印使用的参数
+    for key, value in params.items():
+        print(f"{key}: {value}")
+    
+    # 设置设备
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print(f"\n使用设备: {device}")
+    
+    # 读取数据
+    print("\n加载数据...")
+    df = pd.read_csv(data_path)
+    print(f"数据集大小: {len(df)} 样本")
+    
+    # 检查是否使用交叉验证
+    use_cv = params.get("use_cross_validation", False)
+    cv_folds = params.get("cv_folds", 5)
+    
+    if use_cv:
+        # 执行交叉验证训练
+        print(f"\n使用 {cv_folds} 折交叉验证...")
+        
+        # 创建分层K折交叉验证
+        skf = StratifiedKFold(n_splits=cv_folds, shuffle=True, random_state=seed)
+        cv_results = []
+        
+        # 用于记录所有折叠的平均测试性能
+        cv_test_r2_values = []
+        cv_test_rmse_values = []
+        cv_test_mae_values = []
+        cv_symbolic_r2_values = []
+        cv_residual_r2_values = []
+        cv_alpha_values = []
+        
+        # 准备可视化测试结果
+        all_predictions = []
+        all_targets = []
+        
+        # 保存最佳模型
+        best_model = None
+        best_model_r2 = -float("inf")
+        
+        # 执行交叉验证
+        fold_idx = 0
+        for train_idx, test_idx in skf.split(df, df["材料种类"]):
+            print(f"\n训练折叠 {fold_idx+1}/{cv_folds}...")
+            train_fold = df.iloc[train_idx]
+            test_fold = df.iloc[test_idx]
+            
+            print(f"  折叠 {fold_idx+1}: 训练集 {len(train_idx)} 样本, 测试集 {len(test_idx)} 样本")
+            
+            # 准备数据
+            train_data = prepare_material_data(train_fold)
+            test_data = prepare_material_data(
+                test_fold,
+                scaler=train_data["scaler"],
+                le=train_data["label_encoder"],
+            )
+            
+            # 训练该折叠
+            fold_result = train_single_fold(train_data, test_data, params, device, fold_idx)
+            
+            # 评估测试集性能
+            eval_results = evaluate_model(fold_result["model"], test_data, device)
+            
+            # 记录结果
+            cv_test_r2_values.append(eval_results["test_r2"])
+            cv_test_rmse_values.append(eval_results["test_rmse"])
+            cv_test_mae_values.append(eval_results["test_mae"])
+            
+            if "symbolic_r2" in eval_results:
+                cv_symbolic_r2_values.append(eval_results["symbolic_r2"])
+                cv_residual_r2_values.append(eval_results["residual_r2"])
+            
+            if "alpha_weight" in eval_results:
+                cv_alpha_values.append(eval_results["alpha_weight"])
+                
+            # 收集预测结果
+            all_predictions.append(eval_results["test_pred"])
+            all_targets.append(eval_results["test_target"])
+            
+            # 保存结果
+            fold_result.update({
+                "test_r2": eval_results["test_r2"],
+                "test_rmse": eval_results["test_rmse"],
+                "test_mae": eval_results["test_mae"]
+            })
+            cv_results.append(fold_result)
+            
+            # 更新最佳模型
+            if eval_results["test_r2"] > best_model_r2:
+                best_model_r2 = eval_results["test_r2"]
+                best_model = fold_result["model"]
+            
+            fold_idx += 1
+        
+        # 计算平均性能
+        mean_test_r2 = np.mean(cv_test_r2_values)
+        std_test_r2 = np.std(cv_test_r2_values)
+        mean_test_rmse = np.mean(cv_test_rmse_values)
+        mean_test_mae = np.mean(cv_test_mae_values)
+        
+        # 打印交叉验证结果
+        print("\n" + "="*30)
+        print(f"交叉验证结果 ({cv_folds}折):")
+        print("="*30)
+        print(f"测试集 R²: {mean_test_r2:.4f} ± {std_test_r2:.4f}")
+        print(f"测试集 RMSE: {mean_test_rmse:.4f}")
+        print(f"测试集 MAE: {mean_test_mae:.4f}")
+        
+        if cv_symbolic_r2_values:
+            mean_symbolic_r2 = np.mean(cv_symbolic_r2_values)
+            mean_residual_r2 = np.mean(cv_residual_r2_values)
+            print(f"\n组件性能分析:")
+            print(f"  符号层 R²: {mean_symbolic_r2:.4f}")
+            print(f"  残差网络 R²: {mean_residual_r2:.4f}")
+            print(f"  组合模型 R²: {mean_test_r2:.4f}  (提升: +{mean_test_r2-max(mean_symbolic_r2, mean_residual_r2):.4f})")
+            
+        if cv_alpha_values:
+            mean_alpha = np.mean(cv_alpha_values)
+            print(f"  符号层平均权重: {mean_alpha:.4f}")
+            print(f"  残差网络平均权重: {1-mean_alpha:.4f}")
+        
+        # 每折的R²值
+        for i, r2 in enumerate(cv_test_r2_values):
+            print(f"  折叠 {i+1} R²: {r2:.4f}")
+        
+        # 可视化交叉验证结果
+        print("\n生成交叉验证结果可视化...")
+        
+        # 创建结果目录
+        os.makedirs("results", exist_ok=True)
+        
+        # 折叠性能对比
+        fig, ax = plt.subplots(figsize=(10, 6))
+        ax.bar(range(cv_folds), cv_test_r2_values, alpha=0.7, color='#4472C4')
+        ax.axhline(y=mean_test_r2, color='r', linestyle='-', label=f'平均 R² = {mean_test_r2:.4f}')
+        ax.set_xlabel('交叉验证折叠')
+        ax.set_ylabel('测试集 R²')
+        ax.set_title('交叉验证性能', fontweight='bold')
+        ax.set_xticks(range(cv_folds))
+        ax.set_xticklabels([f'折叠 {i+1}' for i in range(cv_folds)])
+        ax.legend()
+        
+        # 应用样式
+        fig, ax = setup_plot_style(fig, ax)
+        
+        plt.savefig("results/cv_performance.png", dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # 所有折叠的预测散点图
+        fig, ax = plt.subplots(figsize=(10, 8))
+        colors = ['#4472C4', '#ED7D31', '#A5A5A5', '#FFC000', '#5B9BD5', 
+                '#70AD47', '#264478', '#9E480E', '#636363', '#997300']
+                
+        for i in range(len(all_predictions)):
+            ax.scatter(all_targets[i], all_predictions[i], alpha=0.5, 
+                     label=f'折叠 {i+1}' if i < 5 else None,  # 只显示前5个折叠的图例
+                     color=colors[i % len(colors)])
+        
+        # 添加理想线
+        min_val = min(np.min(np.concatenate(all_targets)), np.min(np.concatenate(all_predictions)))
+        max_val = max(np.max(np.concatenate(all_targets)), np.max(np.concatenate(all_predictions)))
+        ax.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2)
+        
+        ax.set_xlabel('实际裂纹深度')
+        ax.set_ylabel('预测裂纹深度')
+        ax.set_title(f'交叉验证预测 (平均 R² = {mean_test_r2:.4f} ± {std_test_r2:.4f})', fontweight='bold')
+        if cv_folds <= 5:  # 只有当折叠数较小时才显示图例
+            ax.legend()
+            
+        # 应用样式
+        fig, ax = setup_plot_style(fig, ax)
+        
+        plt.savefig("results/cv_predictions.png", dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # 保存最佳模型
+        if best_model is not None:
+            torch.save(best_model.state_dict(), "results/best_cv_model.pth")
+            print("\n最佳交叉验证模型已保存至 results/best_cv_model.pth")
+        
+        # 返回交叉验证结果
+        return {
+            "cv_results": cv_results,
+            "mean_test_r2": mean_test_r2,
+            "std_test_r2": std_test_r2,
+            "mean_test_rmse": mean_test_rmse,
+            "mean_test_mae": mean_test_mae,
+            "best_model": best_model
+        }
+    
+    else:
+        # 单次训练-测试分割
+        print("\n使用单次训练-测试分割 (80%-20%)...")
+        
+        # 分割数据
+        train_df, test_df = train_test_split(df, test_size=0.2, random_state=seed, stratify=df["材料种类"])
+        print(f"训练集: {len(train_df)} 样本, 测试集: {len(test_df)} 样本")
+        
+        # 准备数据
+        train_data = prepare_material_data(train_df)
+        test_data = prepare_material_data(
+            test_df,
+            scaler=train_data["scaler"],
+            le=train_data["label_encoder"],
+        )
+        
+        num_materials = train_data["num_materials"]
+        print(f"共 {num_materials} 种材料类型")
+        
+        # 单次训练
+        print("\n开始训练...")
+        start_time = time.time()
+        
+        # 训练模型
+        result = train_single_fold(train_data, test_data, params, device)
+        model = result["model"]
+        
+        # 训练时间
+        train_time = time.time() - start_time
+        print(f"\n训练完成，用时: {train_time:.2f} 秒 ({train_time/60:.2f} 分钟)")
+        
+        # 评估模型
+        print("\n在测试集上评估模型...")
+        eval_results = evaluate_model(model, test_data, device)
+        
+        # 显示结果
+        test_r2 = eval_results["test_r2"]
+        test_rmse = eval_results["test_rmse"]
+        test_mae = eval_results["test_mae"]
+        
         print(f"测试集 R²: {test_r2:.4f}")
         print(f"测试集 RMSE: {test_rmse:.4f}")
         print(f"测试集 MAE: {test_mae:.4f}")
-    
-    # 可视化训练过程
-    print("\n生成训练过程可视化...")
-    plt.figure(figsize=(12, 10))
-    
-    # 绘制损失曲线
-    plt.subplot(2, 1, 1)
-    plt.plot(train_losses, label='训练损失')
-    plt.plot(val_losses, label='验证损失')
-    plt.xlabel('Epoch')
-    plt.ylabel('损失')
-    plt.legend()
-    plt.title('训练和验证损失')
-    
-    # 绘制R²曲线
-    plt.subplot(2, 1, 2)
-    plt.plot(val_r2_scores, label='验证R²')
-    plt.axhline(y=test_r2, color='r', linestyle='-', label=f'测试R²: {test_r2:.4f}')
-    plt.xlabel('Epoch')
-    plt.ylabel('R²')
-    plt.legend()
-    plt.title('验证和测试R²')
-    
-    # 保存图表
-    os.makedirs("results", exist_ok=True)
-    plt.tight_layout()
-    plt.savefig("results/training_plots.png")
-    plt.close()
-    
-    # 预测可视化
-    plt.figure(figsize=(10, 8))
-    plt.scatter(test_target_np, test_pred_np, alpha=0.5)
-    plt.plot([test_target_np.min(), test_target_np.max()], 
-             [test_target_np.min(), test_target_np.max()], 'r--')
-    plt.xlabel('实际裂纹深度')
-    plt.ylabel('预测裂纹深度')
-    plt.title(f'实际值 vs 预测值 (测试集 R² = {test_r2:.4f})')
-    plt.savefig("results/predictions_visualization.png")
-    plt.close()
-    
-    # 保存模型
-    torch.save(model.state_dict(), "results/improved_model.pth")
-    print("模型已保存至 results/improved_model.pth")
-    
-    # 不确定性可视化
-    plt.figure(figsize=(10, 8))
-    plt.errorbar(range(len(test_pred_np)), test_pred_np, 
-                 yerr=np.sqrt(test_uncertainty_np), fmt='o', alpha=0.4)
-    plt.plot(range(len(test_target_np)), test_target_np, 'ro', label='实际值')
-    plt.xlabel('测试样本')
-    plt.ylabel('裂纹深度')
-    plt.title('预测值与不确定性')
-    plt.legend()
-    plt.savefig("results/uncertainty_visualization.png")
-    plt.close()
-    
-    # 返回模型和指标
-    results = {
-        "model": model,
-        "test_r2": test_r2,
-        "test_rmse": test_rmse,
-        "test_mae": test_mae,
-        "train_losses": train_losses,
-        "val_losses": val_losses,
-        "val_r2_scores": val_r2_scores
-    }
-    
-    return results
+        
+        # 组件性能分析
+        if "symbolic_r2" in eval_results:
+            symbolic_r2 = eval_results["symbolic_r2"]
+            residual_r2 = eval_results["residual_r2"]
+            print(f"\n组件性能分析:")
+            print(f"  符号层 R²: {symbolic_r2:.4f}")
+            print(f"  残差网络 R²: {residual_r2:.4f}")
+            print(f"  组合模型 R²: {test_r2:.4f}  (提升: +{test_r2-max(symbolic_r2, residual_r2):.4f})")
+            
+            if "alpha_weight" in eval_results:
+                alpha = eval_results["alpha_weight"]
+                print(f"  符号层平均权重: {alpha:.4f}")
+                print(f"  残差网络平均权重: {1-alpha:.4f}")
+        
+        # 可视化训练过程
+        print("\n生成训练过程可视化...")
+        fig, axs = plt.subplots(2, 1, figsize=(12, 10))
+        
+        # 绘制损失曲线
+        axs[0].plot(result["train_losses"], label='训练损失', color='#4472C4', linewidth=2)
+        axs[0].plot(result["val_losses"], label='验证损失', color='#ED7D31', linewidth=2)
+        axs[0].set_xlabel('Epoch')
+        axs[0].set_ylabel('损失')
+        axs[0].legend()
+        axs[0].set_title('训练和验证损失', fontweight='bold')
+        setup_plot_style(fig, axs[0])
+        
+        # 绘制R²曲线
+        axs[1].plot(result["val_r2_scores"], label='验证R²', color='#70AD47', linewidth=2)
+        axs[1].axhline(y=test_r2, color='r', linestyle='-', linewidth=2, label=f'测试R²: {test_r2:.4f}')
+        axs[1].set_xlabel('Epoch')
+        axs[1].set_ylabel('R²')
+        axs[1].legend()
+        axs[1].set_title('验证和测试R²', fontweight='bold')
+        setup_plot_style(fig, axs[1])
+        
+        # 保存图表
+        os.makedirs("results", exist_ok=True)
+        plt.tight_layout()
+        plt.savefig("results/training_plots.png", dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # 预测可视化
+        fig, ax = plt.subplots(figsize=(10, 8))
+        ax.scatter(eval_results["test_target"], eval_results["test_pred"], alpha=0.7, 
+                  color='#4472C4', edgecolors='k', linewidths=0.5)
+        ax.plot([eval_results["test_target"].min(), eval_results["test_target"].max()], 
+               [eval_results["test_target"].min(), eval_results["test_target"].max()], 
+               'r--', linewidth=2, label='理想预测线')
+        ax.set_xlabel('实际裂纹深度')
+        ax.set_ylabel('预测裂纹深度')
+        ax.set_title(f'实际值 vs 预测值 (测试集 R² = {test_r2:.4f})', fontweight='bold')
+        ax.legend()
+        
+        # 应用样式
+        fig, ax = setup_plot_style(fig, ax)
+        
+        plt.savefig("results/predictions_visualization.png", dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # 保存模型
+        torch.save(model.state_dict(), "results/improved_model.pth")
+        print("模型已保存至 results/improved_model.pth")
+        
+        # 不确定性可视化
+        fig, ax = plt.subplots(figsize=(10, 8))
+        
+        # 排序样本以使图形更清晰
+        sort_idx = np.argsort(eval_results["test_target"])
+        sorted_target = eval_results["test_target"][sort_idx]
+        sorted_pred = eval_results["test_pred"][sort_idx]
+        sorted_uncertainty = eval_results["test_uncertainty"][sort_idx]
+        
+        # 绘制带有误差棒的预测值
+        ax.errorbar(range(len(sorted_pred)), sorted_pred, 
+                   yerr=np.sqrt(sorted_uncertainty), fmt='o', alpha=0.6,
+                   ecolor='#70AD47', color='#4472C4', capsize=3, label='预测值±不确定性')
+                   
+        # 绘制实际值
+        ax.plot(range(len(sorted_target)), sorted_target, 'ro', label='实际值', markersize=4)
+        
+        ax.set_xlabel('测试样本(已排序)')
+        ax.set_ylabel('裂纹深度')
+        ax.set_title('预测值与不确定性', fontweight='bold')
+        ax.legend()
+        
+        # 应用样式
+        fig, ax = setup_plot_style(fig, ax)
+        
+        plt.savefig("results/uncertainty_visualization.png", dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        # 获取并可视化符号层权重分布
+        try:
+            interpretation = model.get_symbolic_interpretation()
+            if "alpha_weight" in interpretation:
+                print(f"\n符号层平均权重: {interpretation['alpha_weight']:.4f}")
+                
+                # 获取样本级别的权重（如果可用）
+                if hasattr(model, 'last_alpha'):
+                    alpha_weights = model.last_alpha.detach().cpu().squeeze().numpy()
+                    
+                    # 可视化权重分布
+                    fig, ax = plt.subplots(figsize=(10, 6))
+                    
+                    # 使用更好的样式绘制直方图
+                    n, bins, patches = ax.hist(alpha_weights, bins=20, alpha=0.7, 
+                                             color='#4472C4', edgecolor='k', linewidth=0.8)
+                                             
+                    # 添加平均值线
+                    mean_alpha = np.mean(alpha_weights)
+                    ax.axvline(mean_alpha, color='r', linestyle='--', linewidth=2,
+                              label=f'平均值: {mean_alpha:.4f}')
+                    
+                    # 添加50%线，表示平衡点
+                    ax.axvline(0.5, color='g', linestyle='-.', linewidth=1.5,
+                              label='平衡点: 0.5000')
+                    
+                    ax.set_xlabel('符号层权重 (α)')
+                    ax.set_ylabel('样本数量')
+                    ax.set_title('符号层与残差网络的权重分布', fontweight='bold')
+                    
+                    # 添加文字说明
+                    textstr = f'符号层权重: {mean_alpha:.4f}\n残差网络权重: {1-mean_alpha:.4f}'
+                    props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
+                    ax.text(0.05, 0.95, textstr, transform=ax.transAxes, fontsize=12,
+                           verticalalignment='top', bbox=props)
+                    
+                    ax.legend()
+                    
+                    # 应用样式
+                    fig, ax = setup_plot_style(fig, ax)
+                    
+                    plt.savefig("results/alpha_weights_distribution.png", dpi=300, bbox_inches='tight')
+                    plt.close()
+                    print("符号层权重分布已保存至 results/alpha_weights_distribution.png")
+        except Exception as e:
+            print(f"可视化符号层权重时出错: {e}")
+        
+        # 返回结果
+        return {
+            "model": model,
+            "test_r2": test_r2,
+            "test_rmse": test_rmse,
+            "test_mae": test_mae,
+            "train_losses": result["train_losses"],
+            "val_losses": result["val_losses"],
+            "val_r2_scores": result["val_r2_scores"],
+            "best_epoch": result["best_epoch"]
+        }
 
 
 def predict_on_new_data(model, new_data_path, train_data_path=DATA_PATH):
@@ -414,7 +814,7 @@ def predict_on_new_data(model, new_data_path, train_data_path=DATA_PATH):
         plt.xlabel('实际裂纹深度')
         plt.ylabel('预测裂纹深度')
         plt.title(f'实际值 vs 预测值 (R² = {r2:.4f})')
-        plt.savefig("results/new_data_predictions.png")
+        plt.savefig("results/new_data_predictions.png", dpi=300, bbox_inches='tight')
         plt.close()
     
     # 保存预测结果
@@ -498,7 +898,11 @@ if __name__ == "__main__":
     results = train_with_fixed_params(PARAMS)
     
     print("\n" + "="*50)
-    print(f"模型训练与评估完成，测试集 R² = {results['test_r2']:.4f}")
+    # 区分交叉验证结果和普通测试结果
+    if 'mean_test_r2' in results:
+        print(f"模型训练与评估完成，交叉验证平均 R² = {results['mean_test_r2']:.4f} ± {results['std_test_r2']:.4f}")
+    elif 'test_r2' in results:
+        print(f"模型训练与评估完成，测试集 R² = {results['test_r2']:.4f}")
     print("="*50)
     
     # 如果需要加载已保存的模型并在新数据上进行预测，可以取消下面的注释

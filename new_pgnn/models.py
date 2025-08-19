@@ -785,6 +785,15 @@ class MaterialCrackPGNN(nn.Module):
             nn.GELU(),
             nn.Linear(32, 1),  # 输出log_var (随机不确定性)
         )
+        
+        # 加权自适应组合网络 - 为符号层和残差网络输出动态分配权重
+        self.alpha_net = nn.Sequential(
+            nn.Linear(latent_dim, 16),
+            nn.GELU(),
+            nn.LayerNorm(16),
+            nn.Linear(16, 1),
+            nn.Sigmoid()  # 输出范围[0,1]，表示符号层的权重
+        )
 
         # 输出层（确保正值）
         self.output_activation = nn.Softplus()
@@ -863,8 +872,14 @@ class MaterialCrackPGNN(nn.Module):
         residual_input = torch.cat([z, sym_detached], dim=-1)
         residual_output = self.residual_net(residual_input)
 
-        # 组合预测（非负）
-        prediction = F.softplus(symbolic_output + residual_output, beta=5) + 1e-3
+        # 计算自适应权重 - alpha用于符号层，(1-alpha)用于残差网络
+        alpha = self.alpha_net(z)
+        
+        # 存储权重用于可解释性分析
+        self.last_alpha = alpha
+        
+        # 加权自适应组合并确保输出为正值
+        prediction = F.softplus(alpha * symbolic_output + (1.0 - alpha) * residual_output, beta=5) + 1e-3
 
         # 不确定性估计 - 随机不确定性
         log_var = self.aleatoric_net(z).clamp(-10, 6)
@@ -879,15 +894,25 @@ class MaterialCrackPGNN(nn.Module):
 
         predictions = []
         uncertainties = []
+        alphas = []  # 存储每次采样的权重值
 
         with torch.no_grad():
             for _ in range(n_samples):
                 pred, uncertainty, _, _ = self(material_ids, numeric_features)
                 predictions.append(pred)
                 uncertainties.append(uncertainty)
+                
+                # 存储当前的alpha权重（如果可用）
+                if hasattr(self, 'last_alpha'):
+                    alphas.append(self.last_alpha.clone())
 
         # 恢复正常模式
         self.enable_mc_dropout(False)
+        
+        # 如果收集了alpha值，计算其平均值和方差
+        if alphas:
+            self.mc_alpha_mean = torch.mean(torch.stack(alphas), dim=0)
+            self.mc_alpha_var = torch.var(torch.stack(alphas), dim=0)
 
         # 计算均值和不确定性
         mean_pred = torch.mean(torch.stack(predictions), dim=0)
@@ -910,10 +935,20 @@ class MaterialCrackPGNN(nn.Module):
     # 获取符号层的解释性信息（如果使用高级符号层）
     def get_symbolic_interpretation(self):
         """获取符号层的解释性信息"""
+        interpretation = {}
+        
+        # 添加自适应权重信息
+        if hasattr(self, 'last_alpha'):
+            interpretation["alpha_weight"] = float(self.last_alpha.detach().mean().item())
+            
+        # 添加符号层解释
         if self.use_advanced_symbolic:
-            return self.symbolic_layer.get_interpretation()
+            symbolic_interpretation = self.symbolic_layer.get_interpretation()
+            interpretation.update(symbolic_interpretation)
         else:
-            return {"message": "使用的是简化符号层，没有可解释性信息"}
+            interpretation["symbolic_message"] = "使用的是简化符号层，没有可解释性信息"
+            
+        return interpretation
     
     # 可视化注意力权重（如果使用高级符号层）
     def visualize_symbolic_attention(self, feature_names=None):
