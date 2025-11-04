@@ -37,20 +37,20 @@ if torch.cuda.is_available():
 PARAMS = {
     # 模型架构参数
     "material_embed_dim": 8,     # 材料嵌入维度
-    "latent_dim": 16,            # 隐藏层维度
-    "dropout_rate": 0.4,         # Dropout率
+    "latent_dim": 48,            # 隐藏层维度
+    "dropout_rate": 0.35,        # Dropout率
     "symbolic_type": "advanced",  # 符号层类型，可选: "lightweight", "improved", "advanced"等
 
     # 训练参数
-    "epochs": 300,               # 训练轮数
+    "epochs": 350,               # 训练轮数
     "batch_size": 16,            # 批次大小
-    "lr": 0.0018568988385351992, # 学习率
-    "patience": 60,              # 早停参数
-    "augmentation": True,        # 是否使用数据增强
+    "lr": 0.0011173842752625436, # 学习率
+    "patience": 55,              # 早停参数
+    "augmentation": False,       # 是否使用数据增强
     "optimizer": "AdamW",        # 优化器
-    "weight_decay": 0.005758576456620779,      # 权重衰减
-    "lambda_complexity": 3.0143649044331185e-05,  # 复杂度损失权重
-    "lambda_physics": 0.35       # 物理损失权重
+    "weight_decay": 0.0066923795400554925,      # 权重衰减
+    "lambda_complexity": 3.4069890537972935e-05,  # 复杂度损失权重
+    "lambda_physics": 0.2        # 物理损失权重
 }
 
 
@@ -244,6 +244,13 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
             # 每10个epoch打印一次进度
             if epoch % 10 == 0 or epoch == epochs - 1:
                 print(f"Epoch {epoch+1}/{epochs} - 训练损失: {epoch_loss:.4f}, 验证损失: {val_loss.item():.4f}, 验证R²: {val_r2:.4f}, 验证RMSE: {val_rmse:.4f}")
+                
+                # 门控监控
+                if hasattr(model, 'get_gate_statistics'):
+                    gate_stats = model.get_gate_statistics()
+                    print(f"         门控统计 - 平均值: {gate_stats['mean']:.3f}, "
+                          f"标准差: {gate_stats['std']:.3f}, "
+                          f"符号层权重: {gate_stats['symbolic_weight']:.3f}")
         
         # 早停检查
         if val_r2 > best_val_r2:
@@ -285,6 +292,22 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         print(f"测试集 R²: {test_r2:.4f}")
         print(f"测试集 RMSE: {test_rmse:.4f}")
         print(f"测试集 MAE: {test_mae:.4f}")
+        
+        # 门控融合分析
+        if hasattr(model, 'get_fusion_interpretation'):
+            print(f"\n门控融合分析:")
+            print(model.get_fusion_interpretation())
+            
+            gate_stats = model.get_gate_statistics()
+            print(f"门控详细统计: 平均={gate_stats['mean']:.3f}, "
+                  f"最小={gate_stats['min']:.3f}, 最大={gate_stats['max']:.3f}")
+        
+        # 符号层可解释性分析（如果支持）
+        if hasattr(model, 'get_symbolic_interpretation'):
+            print(f"\n符号层可解释性分析:")
+            interp = model.get_symbolic_interpretation()
+            if 'complexity' in interp:
+                print(f"符号表达式复杂度: {interp['complexity']:.4f}")
     
     # 可视化训练过程
     print("\n生成训练过程可视化...")
@@ -313,6 +336,32 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
     plt.tight_layout()
     plt.savefig("results/training_plots.png")
     plt.close()
+    
+    # 门控权重可视化（如果模型支持）
+    if hasattr(model, 'last_gate') and model.last_gate is not None:
+        plt.figure(figsize=(10, 6))
+        gate_values = model.last_gate.cpu().detach().numpy().flatten()
+        
+        plt.subplot(1, 2, 1)
+        plt.hist(gate_values, bins=30, alpha=0.7, edgecolor='black')
+        plt.xlabel('门控权重值')
+        plt.ylabel('频次')
+        plt.title('门控权重分布')
+        plt.axvline(x=0.5, color='r', linestyle='--', label='平衡点 (0.5)')
+        plt.legend()
+        
+        plt.subplot(1, 2, 2)
+        plt.plot(gate_values[:50], 'o-', alpha=0.7)  # 显示前50个样本
+        plt.xlabel('样本索引')
+        plt.ylabel('门控权重')
+        plt.title('门控权重示例 (前50个样本)')
+        plt.axhline(y=0.5, color='r', linestyle='--', label='平衡点')
+        plt.legend()
+        
+        plt.tight_layout()
+        plt.savefig("results/gate_analysis.png")
+        plt.close()
+        print("门控分析图已保存至 results/gate_analysis.png")
     
     # 预测可视化
     plt.figure(figsize=(10, 8))
@@ -477,6 +526,11 @@ def load_model_and_predict(model_path, data_path=DATA_PATH, new_data_path=None):
         print(f"测试集 R²: {test_r2:.4f}")
         print(f"测试集 RMSE: {test_rmse:.4f}")
         print(f"测试集 MAE: {test_mae:.4f}")
+        
+        # 门控融合分析
+        if hasattr(model, 'get_fusion_interpretation'):
+            print(f"\n门控融合分析:")
+            print(model.get_fusion_interpretation())
     
     # 如果提供了新数据路径，对新数据进行预测
     if new_data_path:

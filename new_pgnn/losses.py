@@ -49,11 +49,26 @@ class PhysicsInformedLoss(nn.Module):
         physics_loss = self.compute_physics_constraints(pred, numeric_features)
         physics_weight = self.get_physics_weight()
 
+        # 4. 新增：门控正则化（鼓励合理的融合行为）
+        gate_reg_loss = 0.0
+        if hasattr(model, 'last_gate') and model.last_gate is not None:
+            gate = model.last_gate
+            
+            # 鼓励门控偏向符号层（但不强制）
+            gate_bias_loss = F.binary_cross_entropy(
+                gate, torch.full_like(gate, 0.7), reduction='mean'
+            ) * 1e-3
+            
+            gate_reg_loss = gate_bias_loss
+        else:
+            gate_reg_loss = torch.tensor(0.0, device=pred.device)
+
         # 总损失
         total_loss = (
             nll_loss
             + self.lambda_complexity * complexity_loss
             + physics_weight * physics_loss
+            + gate_reg_loss
         )
 
         return total_loss, {
@@ -65,6 +80,7 @@ class PhysicsInformedLoss(nn.Module):
             ),
             "physics": physics_loss.item(),
             "physics_weight": physics_weight,
+            "gate_reg": gate_reg_loss.item() if torch.is_tensor(gate_reg_loss) else gate_reg_loss,
             "total": total_loss.item(),
         }
 

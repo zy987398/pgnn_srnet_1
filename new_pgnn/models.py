@@ -779,6 +779,24 @@ class MaterialCrackPGNN(nn.Module):
             nn.Linear(32, 1),
         )
 
+        # 新增：符号输出对齐网络（学习最佳的scale和bias）
+        self.sym_scale_net = nn.Sequential(
+            nn.Linear(latent_dim, 16),
+            nn.GELU(),
+            nn.Linear(16, 2)  # 输出 [scale_raw, bias_raw]
+        )
+        
+        # 新增：融合门控网络（决定符号层vs残差的权重）
+        self.fusion_gate = nn.Sequential(
+            nn.Linear(latent_dim, 16),
+            nn.GELU(),
+            nn.Linear(16, 1),
+            nn.Sigmoid()  # gate ∈ (0,1)
+        )
+        
+        # 记录最近一次的门控值（用于可解释性分析）
+        self.last_gate = None
+
         # 不确定性预测 - 分离认知不确定性和随机不确定性
         self.aleatoric_net = nn.Sequential(
             nn.Linear(latent_dim, 32),
@@ -858,13 +876,31 @@ class MaterialCrackPGNN(nn.Module):
             # 符号层失败时提供安全的回退值
             symbolic_output = torch.zeros(z.size(0), 1, device=z.device)
 
-        # 残差网络输入：符号层输出与潜在表示，切断梯度
-        sym_detached = symbolic_output.detach()
-        residual_input = torch.cat([z, sym_detached], dim=-1)
+        # 新增：符号输出对齐（学习最佳的幅值缩放和偏置）
+        scale_bias = self.sym_scale_net(z)
+        scale_raw = scale_bias[:, 0:1]
+        bias_raw = scale_bias[:, 1:2]
+        
+        # 使用exp确保scale为正，用tanh限制bias范围
+        scale = torch.exp(scale_raw * 0.5)  # scale ∈ (0, ∞)，但通常在(0.6, 1.6)范围
+        bias = torch.tanh(bias_raw) * 0.5   # bias ∈ (-0.5, 0.5)
+        
+        # 对齐符号输出
+        symbolic_aligned = scale * symbolic_output + bias
+
+        # 新增：计算融合门控
+        gate = self.fusion_gate(z)  # gate ∈ (0,1)
+        self.last_gate = gate.detach().clone()  # 保存用于分析
+        
+        # 修改：残差网络输入 - 移除detach()，让梯度双向流动
+        residual_input = torch.cat([z, symbolic_output], dim=-1)  # 不再使用sym_detached
         residual_output = self.residual_net(residual_input)
 
-        # 组合预测（非负）
-        prediction = F.softplus(symbolic_output + residual_output, beta=5) + 1e-3
+        # 新增：门控加权融合（这是核心改进）
+        prediction = gate * symbolic_aligned + (1 - gate) * residual_output
+        
+        # 应用激活函数确保非负
+        prediction = F.softplus(prediction, beta=5) + 1e-3
 
         # 不确定性估计 - 随机不确定性
         log_var = self.aleatoric_net(z).clamp(-10, 6)
@@ -923,3 +959,46 @@ class MaterialCrackPGNN(nn.Module):
         else:
             print("使用的是简化符号层，没有注意力权重可视化")
             return None
+    def get_fusion_interpretation(self):
+        """分析融合门的行为"""
+        if self.last_gate is None:
+            return "模型尚未进行前向传播"
+        
+        stats = self.get_gate_statistics()
+        mean_gate = stats['mean']
+        
+        if mean_gate > 0.7:
+            return f"模型强烈依赖符号层（物理先验主导），平均信任度: {mean_gate:.2f}"
+        elif mean_gate > 0.5:
+            return f"模型偏向符号层，但残差仍有贡献，平均信任度: {mean_gate:.2f}"
+        elif mean_gate > 0.3:
+            return f"模型在符号层和残差之间较好平衡，平均信任度: {mean_gate:.2f}"
+        else:
+            return f"模型更依赖残差网络（数据驱动为主），平均信任度: {mean_gate:.2f}"
+    
+    def get_gate_statistics(self):
+        """获取门控统计信息"""
+        if self.last_gate is None:
+            return {
+                'mean': 0.5,
+                'std': 0.0,
+                'min': 0.5,
+                'max': 0.5,
+                'symbolic_weight': 0.5,
+                'residual_weight': 0.5
+            }
+        
+        gate = self.last_gate
+        mean_gate = float(gate.mean().item())
+        std_gate = float(gate.std().item())
+        min_gate = float(gate.min().item())
+        max_gate = float(gate.max().item())
+        
+        return {
+            'mean': mean_gate,
+            'std': std_gate,
+            'min': min_gate,
+            'max': max_gate,
+            'symbolic_weight': mean_gate,
+            'residual_weight': 1.0 - mean_gate
+        }
