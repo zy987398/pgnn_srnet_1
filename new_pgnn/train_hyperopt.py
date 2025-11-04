@@ -338,6 +338,13 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda",
 
             val_r2 = r2_score(val_target_np, val_pred_np)
             # val_rmse = np.sqrt(mean_squared_error(val_target_np, val_pred_np))
+            
+            # 门控监控（每10个epoch打印一次）
+            if epoch % 10 == 0 and hasattr(model, 'get_gate_statistics'):
+                gate_stats = model.get_gate_statistics()
+                print(f"Epoch {epoch}: Gate Mean: {gate_stats['mean']:.3f}, "
+                      f"Std: {gate_stats['std']:.3f}, "
+                      f"Symbolic Weight: {gate_stats['symbolic_weight']:.3f}")
 
         # 早停检查
         if val_r2 > best_val_r2:
@@ -883,6 +890,12 @@ def retrain_with_best_params(
             print(
                 f"Epoch {epoch+1}: LR={current_lr:.6f}, Test R²={test_r2:.4f}, RMSE={test_rmse:.4f}"
             )
+            # 门控监控
+            if hasattr(model, 'get_gate_statistics'):
+                gate_stats = model.get_gate_statistics()
+                print(f"         Gate Mean: {gate_stats['mean']:.3f}, "
+                      f"Std: {gate_stats['std']:.3f}, "
+                      f"Symbolic Weight: {gate_stats['symbolic_weight']:.3f}")
 
         if test_r2 > best_test_r2:
             best_test_r2 = test_r2

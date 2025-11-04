@@ -86,26 +86,21 @@ if torch.cuda.is_available():
 # 最佳超参数 (从hyperopt优化结果提取)
 PARAMS = {
     # 模型架构参数
-    "material_embed_dim": 16,    # 材料嵌入维度
-    "latent_dim": 32,            # 隐藏层维度
-    "dropout_rate": 0.3,         # Dropout率
+    "material_embed_dim": 8,     # 材料嵌入维度
+    "latent_dim": 48,            # 隐藏层维度
+    "dropout_rate": 0.35,        # Dropout率
     "symbolic_type": "advanced",  # 符号层类型，可选: "lightweight", "improved", "advanced"等
 
     # 训练参数
-    "epochs": 300,               # 训练轮数
-    "batch_size": 64,            # 批次大小
-    "lr": 0.0006268177412569363, # 学习率
-    "patience": 60,              # 早停参数
-    "augmentation": True,        # 是否使用数据增强
+    "epochs": 350,               # 训练轮数
+    "batch_size": 16,            # 批次大小
+    "lr": 0.0011173842752625436, # 学习率
+    "patience": 55,              # 早停参数
+    "augmentation": False,       # 是否使用数据增强
     "optimizer": "AdamW",        # 优化器
-    "weight_decay": 0.0034927629214886254,      # 权重衰减
-    "lambda_complexity": 1.4318423278662003e-05,  # 复杂度损失权重
-    "lambda_physics": 0.15000000000000002,      # 物理损失权重
-    
-    # 评估参数
-    "use_cross_validation": True,  # 是否使用交叉验证
-    "cv_folds": 5,                # 交叉验证折数
-    "max_norm": 1.0               # 梯度裁剪阈值，与train_hyperopt.py保持一致
+    "weight_decay": 0.0066923795400554925,      # 权重衰减
+    "lambda_complexity": 3.4069890537972935e-05,  # 复杂度损失权重
+    "lambda_physics": 0.2        # 物理损失权重
 }
 
 
@@ -264,9 +259,16 @@ def train_single_fold(train_data, val_data, params, device, fold_idx=None):
             val_rmse = np.sqrt(mean_squared_error(val_target_np, val_pred_np))
             val_r2_scores.append(val_r2)
             
-            # 每10个epoch打印一次进度（仅在交叉验证时）
-            if (epoch % 10 == 0 or epoch == epochs - 1) and fold_idx is not None:
-                print(f"  {fold_str}Epoch {epoch+1}/{epochs} - 训练损失: {epoch_loss:.4f}, 验证R²: {val_r2:.4f}, RMSE: {val_rmse:.4f}")
+            # 每10个epoch打印一次进度
+            if epoch % 10 == 0 or epoch == epochs - 1:
+                print(f"Epoch {epoch+1}/{epochs} - 训练损失: {epoch_loss:.4f}, 验证损失: {val_loss.item():.4f}, 验证R²: {val_r2:.4f}, 验证RMSE: {val_rmse:.4f}")
+                
+                # 门控监控
+                if hasattr(model, 'get_gate_statistics'):
+                    gate_stats = model.get_gate_statistics()
+                    print(f"         门控统计 - 平均值: {gate_stats['mean']:.3f}, "
+                          f"标准差: {gate_stats['std']:.3f}, "
+                          f"符号层权重: {gate_stats['symbolic_weight']:.3f}")
         
         # 早停检查
         if val_r2 > best_val_r2:
@@ -603,156 +605,115 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         print(f"测试集 RMSE: {test_rmse:.4f}")
         print(f"测试集 MAE: {test_mae:.4f}")
         
-        # 组件性能分析
-        if "symbolic_r2" in eval_results:
-            symbolic_r2 = eval_results["symbolic_r2"]
-            residual_r2 = eval_results["residual_r2"]
-            print(f"\n组件性能分析:")
-            print(f"  符号层 R²: {symbolic_r2:.4f}")
-            print(f"  残差网络 R²: {residual_r2:.4f}")
-            print(f"  组合模型 R²: {test_r2:.4f}  (提升: +{test_r2-max(symbolic_r2, residual_r2):.4f})")
+        # 门控融合分析
+        if hasattr(model, 'get_fusion_interpretation'):
+            print(f"\n门控融合分析:")
+            print(model.get_fusion_interpretation())
             
-            if "alpha_weight" in eval_results:
-                alpha = eval_results["alpha_weight"]
-                print(f"  符号层平均权重: {alpha:.4f}")
-                print(f"  残差网络平均权重: {1-alpha:.4f}")
+            gate_stats = model.get_gate_statistics()
+            print(f"门控详细统计: 平均={gate_stats['mean']:.3f}, "
+                  f"最小={gate_stats['min']:.3f}, 最大={gate_stats['max']:.3f}")
         
-        # 可视化训练过程
-        print("\n生成训练过程可视化...")
-        fig, axs = plt.subplots(2, 1, figsize=(12, 10))
+        # 符号层可解释性分析（如果支持）
+        if hasattr(model, 'get_symbolic_interpretation'):
+            print(f"\n符号层可解释性分析:")
+            interp = model.get_symbolic_interpretation()
+            if 'complexity' in interp:
+                print(f"符号表达式复杂度: {interp['complexity']:.4f}")
+    
+    # 可视化训练过程
+    print("\n生成训练过程可视化...")
+    plt.figure(figsize=(12, 10))
+    
+    # 绘制损失曲线
+    plt.subplot(2, 1, 1)
+    plt.plot(train_losses, label='训练损失')
+    plt.plot(val_losses, label='验证损失')
+    plt.xlabel('Epoch')
+    plt.ylabel('损失')
+    plt.legend()
+    plt.title('训练和验证损失')
+    
+    # 绘制R²曲线
+    plt.subplot(2, 1, 2)
+    plt.plot(val_r2_scores, label='验证R²')
+    plt.axhline(y=test_r2, color='r', linestyle='-', label=f'测试R²: {test_r2:.4f}')
+    plt.xlabel('Epoch')
+    plt.ylabel('R²')
+    plt.legend()
+    plt.title('验证和测试R²')
+    
+    # 保存图表
+    os.makedirs("results", exist_ok=True)
+    plt.tight_layout()
+    plt.savefig("results/training_plots.png")
+    plt.close()
+    
+    # 门控权重可视化（如果模型支持）
+    if hasattr(model, 'last_gate') and model.last_gate is not None:
+        plt.figure(figsize=(10, 6))
+        gate_values = model.last_gate.cpu().detach().numpy().flatten()
         
-        # 绘制损失曲线
-        axs[0].plot(result["train_losses"], label='训练损失', color='#4472C4', linewidth=2)
-        axs[0].plot(result["val_losses"], label='验证损失', color='#ED7D31', linewidth=2)
-        axs[0].set_xlabel('Epoch')
-        axs[0].set_ylabel('损失')
-        axs[0].legend()
-        axs[0].set_title('训练和验证损失', fontweight='bold')
-        setup_plot_style(fig, axs[0])
+        plt.subplot(1, 2, 1)
+        plt.hist(gate_values, bins=30, alpha=0.7, edgecolor='black')
+        plt.xlabel('门控权重值')
+        plt.ylabel('频次')
+        plt.title('门控权重分布')
+        plt.axvline(x=0.5, color='r', linestyle='--', label='平衡点 (0.5)')
+        plt.legend()
         
-        # 绘制R²曲线
-        axs[1].plot(result["val_r2_scores"], label='验证R²', color='#70AD47', linewidth=2)
-        axs[1].axhline(y=test_r2, color='r', linestyle='-', linewidth=2, label=f'测试R²: {test_r2:.4f}')
-        axs[1].set_xlabel('Epoch')
-        axs[1].set_ylabel('R²')
-        axs[1].legend()
-        axs[1].set_title('验证和测试R²', fontweight='bold')
-        setup_plot_style(fig, axs[1])
+        plt.subplot(1, 2, 2)
+        plt.plot(gate_values[:50], 'o-', alpha=0.7)  # 显示前50个样本
+        plt.xlabel('样本索引')
+        plt.ylabel('门控权重')
+        plt.title('门控权重示例 (前50个样本)')
+        plt.axhline(y=0.5, color='r', linestyle='--', label='平衡点')
+        plt.legend()
         
-        # 保存图表
-        os.makedirs("results", exist_ok=True)
         plt.tight_layout()
-        plt.savefig("results/training_plots.png", dpi=300, bbox_inches='tight')
+        plt.savefig("results/gate_analysis.png")
         plt.close()
-        
-        # 预测可视化
-        fig, ax = plt.subplots(figsize=(10, 8))
-        ax.scatter(eval_results["test_target"], eval_results["test_pred"], alpha=0.7, 
-                  color='#4472C4', edgecolors='k', linewidths=0.5)
-        ax.plot([eval_results["test_target"].min(), eval_results["test_target"].max()], 
-               [eval_results["test_target"].min(), eval_results["test_target"].max()], 
-               'r--', linewidth=2, label='理想预测线')
-        ax.set_xlabel('实际裂纹深度')
-        ax.set_ylabel('预测裂纹深度')
-        ax.set_title(f'实际值 vs 预测值 (测试集 R² = {test_r2:.4f})', fontweight='bold')
-        ax.legend()
-        
-        # 应用样式
-        fig, ax = setup_plot_style(fig, ax)
-        
-        plt.savefig("results/predictions_visualization.png", dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        # 保存模型
-        torch.save(model.state_dict(), "results/improved_model.pth")
-        print("模型已保存至 results/improved_model.pth")
-        
-        # 不确定性可视化
-        fig, ax = plt.subplots(figsize=(10, 8))
-        
-        # 排序样本以使图形更清晰
-        sort_idx = np.argsort(eval_results["test_target"])
-        sorted_target = eval_results["test_target"][sort_idx]
-        sorted_pred = eval_results["test_pred"][sort_idx]
-        sorted_uncertainty = eval_results["test_uncertainty"][sort_idx]
-        
-        # 绘制带有误差棒的预测值
-        ax.errorbar(range(len(sorted_pred)), sorted_pred, 
-                   yerr=np.sqrt(sorted_uncertainty), fmt='o', alpha=0.6,
-                   ecolor='#70AD47', color='#4472C4', capsize=3, label='预测值±不确定性')
-                   
-        # 绘制实际值
-        ax.plot(range(len(sorted_target)), sorted_target, 'ro', label='实际值', markersize=4)
-        
-        ax.set_xlabel('测试样本(已排序)')
-        ax.set_ylabel('裂纹深度')
-        ax.set_title('预测值与不确定性', fontweight='bold')
-        ax.legend()
-        
-        # 应用样式
-        fig, ax = setup_plot_style(fig, ax)
-        
-        plt.savefig("results/uncertainty_visualization.png", dpi=300, bbox_inches='tight')
-        plt.close()
-        
-        # 获取并可视化符号层权重分布
-        try:
-            interpretation = model.get_symbolic_interpretation()
-            if "alpha_weight" in interpretation:
-                print(f"\n符号层平均权重: {interpretation['alpha_weight']:.4f}")
-                
-                # 获取样本级别的权重（如果可用）
-                if hasattr(model, 'last_alpha'):
-                    alpha_weights = model.last_alpha.detach().cpu().squeeze().numpy()
-                    
-                    # 可视化权重分布
-                    fig, ax = plt.subplots(figsize=(10, 6))
-                    
-                    # 使用更好的样式绘制直方图
-                    n, bins, patches = ax.hist(alpha_weights, bins=20, alpha=0.7, 
-                                             color='#4472C4', edgecolor='k', linewidth=0.8)
-                                             
-                    # 添加平均值线
-                    mean_alpha = np.mean(alpha_weights)
-                    ax.axvline(mean_alpha, color='r', linestyle='--', linewidth=2,
-                              label=f'平均值: {mean_alpha:.4f}')
-                    
-                    # 添加50%线，表示平衡点
-                    ax.axvline(0.5, color='g', linestyle='-.', linewidth=1.5,
-                              label='平衡点: 0.5000')
-                    
-                    ax.set_xlabel('符号层权重 (α)')
-                    ax.set_ylabel('样本数量')
-                    ax.set_title('符号层与残差网络的权重分布', fontweight='bold')
-                    
-                    # 添加文字说明
-                    textstr = f'符号层权重: {mean_alpha:.4f}\n残差网络权重: {1-mean_alpha:.4f}'
-                    props = dict(boxstyle='round', facecolor='wheat', alpha=0.5)
-                    ax.text(0.05, 0.95, textstr, transform=ax.transAxes, fontsize=12,
-                           verticalalignment='top', bbox=props)
-                    
-                    ax.legend()
-                    
-                    # 应用样式
-                    fig, ax = setup_plot_style(fig, ax)
-                    
-                    plt.savefig("results/alpha_weights_distribution.png", dpi=300, bbox_inches='tight')
-                    plt.close()
-                    print("符号层权重分布已保存至 results/alpha_weights_distribution.png")
-        except Exception as e:
-            print(f"可视化符号层权重时出错: {e}")
-        
-        # 返回结果
-        return {
-            "model": model,
-            "test_r2": test_r2,
-            "test_rmse": test_rmse,
-            "test_mae": test_mae,
-            "train_losses": result["train_losses"],
-            "val_losses": result["val_losses"],
-            "val_r2_scores": result["val_r2_scores"],
-            "best_epoch": result["best_epoch"]
-        }
+        print("门控分析图已保存至 results/gate_analysis.png")
+    
+    # 预测可视化
+    plt.figure(figsize=(10, 8))
+    plt.scatter(test_target_np, test_pred_np, alpha=0.5)
+    plt.plot([test_target_np.min(), test_target_np.max()], 
+             [test_target_np.min(), test_target_np.max()], 'r--')
+    plt.xlabel('实际裂纹深度')
+    plt.ylabel('预测裂纹深度')
+    plt.title(f'实际值 vs 预测值 (测试集 R² = {test_r2:.4f})')
+    plt.savefig("results/predictions_visualization.png")
+    plt.close()
+    
+    # 保存模型
+    torch.save(model.state_dict(), "results/improved_model.pth")
+    print("模型已保存至 results/improved_model.pth")
+    
+    # 不确定性可视化
+    plt.figure(figsize=(10, 8))
+    plt.errorbar(range(len(test_pred_np)), test_pred_np, 
+                 yerr=np.sqrt(test_uncertainty_np), fmt='o', alpha=0.4)
+    plt.plot(range(len(test_target_np)), test_target_np, 'ro', label='实际值')
+    plt.xlabel('测试样本')
+    plt.ylabel('裂纹深度')
+    plt.title('预测值与不确定性')
+    plt.legend()
+    plt.savefig("results/uncertainty_visualization.png")
+    plt.close()
+    
+    # 返回模型和指标
+    results = {
+        "model": model,
+        "test_r2": test_r2,
+        "test_rmse": test_rmse,
+        "test_mae": test_mae,
+        "train_losses": train_losses,
+        "val_losses": val_losses,
+        "val_r2_scores": val_r2_scores
+    }
+    
+    return results
 
 
 def predict_on_new_data(model, new_data_path, train_data_path=DATA_PATH):
@@ -877,6 +838,11 @@ def load_model_and_predict(model_path, data_path=DATA_PATH, new_data_path=None):
         print(f"测试集 R²: {test_r2:.4f}")
         print(f"测试集 RMSE: {test_rmse:.4f}")
         print(f"测试集 MAE: {test_mae:.4f}")
+        
+        # 门控融合分析
+        if hasattr(model, 'get_fusion_interpretation'):
+            print(f"\n门控融合分析:")
+            print(model.get_fusion_interpretation())
     
     # 如果提供了新数据路径，对新数据进行预测
     if new_data_path:
