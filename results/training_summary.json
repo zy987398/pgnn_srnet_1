@@ -1,9 +1,0 @@
-{
-    "test_r2": 0.7043331861495972,
-    "test_rmse": 1.335852993974951,
-    "test_mae": 1.0102260112762451,
-    "best_val_r2": 0.7043331861495972,
-    "training_time_seconds": 67.99798226356506,
-    "epochs_trained": 120,
-    "parameters": {}
-}
