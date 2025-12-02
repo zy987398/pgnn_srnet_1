@@ -14,6 +14,11 @@ from torch.optim.lr_scheduler import OneCycleLR
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+
+# 设置中文字体为 SimSun，解决中文显示问题
+plt.rcParams['font.sans-serif'] = ['SimSun']
+plt.rcParams['axes.unicode_minus'] = False
+
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import r2_score, mean_squared_error
 from torch.utils.data import TensorDataset, DataLoader
@@ -177,16 +182,6 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda",
         traceback.print_exc()
         return -1.0
 
-    # 准备数据 - 可选数据增强
-    train_df = reconstruct_df(train_data)
-    original_size = len(train_df)
-    
-    # 显式应用数据增强
-    if use_augmentation:
-        train_df = augment_dataset(train_df)
-        # 记录增强前后的大小变化，便于调试
-        if len(train_df) > original_size:
-            print(f"  Trial {trial.number}: 应用数据增强 {original_size} -> {len(train_df)} 样本")
 
     augmented_train_data = prepare_material_data(
         train_df,
@@ -1131,8 +1126,8 @@ if __name__ == "__main__":
         top_k = 1
         print("[警告] 调试模式: 仅运行少量试验")
     else:
-        n_trials_stage1 = 40
-        n_trials_stage2 = 20
+        n_trials_stage1 = 10
+        n_trials_stage2 = 5
         top_k = 5
         print("正式模式: 运行完整优化过程")
 

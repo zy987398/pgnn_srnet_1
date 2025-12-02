@@ -33,8 +33,11 @@ class PhysicsInformedLoss(nn.Module):
         batch_size = pred.shape[0]
 
         # 1. NLL损失（异方差高斯）
+        # 为不确定性（方差）设置一个安全的最小阈值，防止除零
+        min_uncertainty_floor = 1e-4  
+        safe_uncertainty = torch.clamp(uncertainty, min=min_uncertainty_floor)
         nll_loss = 0.5 * (
-            torch.log(2 * np.pi * uncertainty) + (target - pred) ** 2 / uncertainty
+            torch.log(2 * np.pi * safe_uncertainty) + (target - pred) ** 2 / safe_uncertainty
         )
         nll_loss = nll_loss.mean()
 
@@ -50,18 +53,7 @@ class PhysicsInformedLoss(nn.Module):
         physics_weight = self.get_physics_weight()
 
         # 4. 新增：门控正则化（鼓励合理的融合行为）
-        gate_reg_loss = 0.0
-        if hasattr(model, 'last_gate') and model.last_gate is not None:
-            gate = model.last_gate
-            
-            # 鼓励门控偏向符号层（但不强制）
-            gate_bias_loss = F.binary_cross_entropy(
-                gate, torch.full_like(gate, 0.7), reduction='mean'
-            ) * 1e-3
-            
-            gate_reg_loss = gate_bias_loss
-        else:
-            gate_reg_loss = torch.tensor(0.0, device=pred.device)
+        gate_reg_loss = torch.tensor(0.0, device=pred.device)
 
         # 总损失
         total_loss = (
