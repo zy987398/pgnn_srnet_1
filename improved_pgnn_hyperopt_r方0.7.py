@@ -13,9 +13,26 @@ from torch.optim.lr_scheduler import OneCycleLR
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from matplotlib import font_manager
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import r2_score, mean_squared_error
 from torch.utils.data import TensorDataset, DataLoader
+
+# 中文字体配置
+def get_chinese_font():
+    """获取中文字体"""
+    chinese_fonts = ['Microsoft YaHei', 'SimHei', 'SimSun', 'KaiTi', 'FangSong']
+    for font_name in chinese_fonts:
+        try:
+            font_path = font_manager.findfont(font_manager.FontProperties(family=font_name))
+            if font_path and font_name.lower() in font_path.lower():
+                return font_manager.FontProperties(family=font_name)
+        except:
+            continue
+    return font_manager.FontProperties()
+
+# 全局中文字体属性
+chinese_font_prop = get_chinese_font()
 
 # 忽略警告
 warnings.filterwarnings("ignore")
@@ -1213,7 +1230,7 @@ if __name__ == "__main__":
             if values1 or values2:  # 只有当至少有一个阶段有值时才添加分隔线和图例
                 if values1:  # 只有当阶段1有值时才添加分隔线
                     ax1.axvline(x=len(values1), color='k', linestyle='--', alpha=0.5)
-                ax1.legend()
+                ax1.legend(prop=chinese_font_prop)
         else:
             # 兼容旧版本
             values = [t.value for t in study.trials if t.value is not None]
@@ -1222,9 +1239,9 @@ if __name__ == "__main__":
             else:
                 ax1.text(0.5, 0.5, '没有有效的优化结果', horizontalalignment='center', verticalalignment='center')
         
-        ax1.set_xlabel("Trial")
-        ax1.set_ylabel("Validation R²")
-        ax1.set_title("双阶段超参数优化历史")
+        ax1.set_xlabel("Trial", fontproperties=chinese_font_prop)
+        ax1.set_ylabel("Validation R²", fontproperties=chinese_font_prop)
+        ax1.set_title("双阶段超参数优化历史", fontproperties=chinese_font_prop)
         ax1.grid(True, alpha=0.3)
 
         # 训练损失
@@ -1234,9 +1251,9 @@ if __name__ == "__main__":
         else:
             ax2.text(0.5, 0.5, '没有训练损失数据', horizontalalignment='center', verticalalignment='center')
             
-        ax2.set_xlabel("Epoch")
-        ax2.set_ylabel("Loss")
-        ax2.set_title("Training Loss with Best Hyperparameters")
+        ax2.set_xlabel("训练轮数", fontproperties=chinese_font_prop)
+        ax2.set_ylabel("损失值", fontproperties=chinese_font_prop)
+        ax2.set_title("最佳超参数训练损失", fontproperties=chinese_font_prop)
         ax2.grid(True, alpha=0.3)
 
         plt.tight_layout()
@@ -1252,9 +1269,9 @@ if __name__ == "__main__":
                 results["predictions"]["y_true"], results["predictions"]["y_pred"], alpha=0.6
             )
             ax1.plot([0, 10], [0, 10], "r--")  # 理想线
-            ax1.set_xlabel("True Crack Depth")
-            ax1.set_ylabel("Predicted Crack Depth")
-            ax1.set_title(f'Standard Prediction (R² = {results["standard"]["r2"]:.4f})')
+            ax1.set_xlabel("真实裂纹深度", fontproperties=chinese_font_prop)
+            ax1.set_ylabel("预测裂纹深度", fontproperties=chinese_font_prop)
+            ax1.set_title(f'标准预测 (R² = {results["standard"]["r2"]:.4f})', fontproperties=chinese_font_prop)
             ax1.grid(True, alpha=0.3)
 
             # MC Dropout预测
@@ -1266,12 +1283,12 @@ if __name__ == "__main__":
                 alpha=0.6,
             )
             ax2.plot([0, 10], [0, 10], "r--")  # 理想线
-            ax2.set_xlabel("True Crack Depth")
-            ax2.set_ylabel("MC Prediction")
-            ax2.set_title(f'MC Dropout Prediction (R² = {results["mc_dropout"]["r2"]:.4f})')
+            ax2.set_xlabel("真实裂纹深度", fontproperties=chinese_font_prop)
+            ax2.set_ylabel("MC预测值", fontproperties=chinese_font_prop)
+            ax2.set_title(f'MC Dropout预测 (R² = {results["mc_dropout"]["r2"]:.4f})', fontproperties=chinese_font_prop)
             ax2.grid(True, alpha=0.3)
             cbar = plt.colorbar(scatter, ax=ax2)
-            cbar.set_label("Predictive Uncertainty")
+            cbar.set_label("预测不确定性", fontproperties=chinese_font_prop)
 
             plt.tight_layout()
             plt.savefig("results/predictions_visualization.png", dpi=300)
@@ -1299,13 +1316,13 @@ if __name__ == "__main__":
                     results["predictions"]["y_true"][sorted_indices],
                     marker='x',
                     color='k',
-                    label='True Values'
+                    label='真实值'
                 )
                 
-                ax.set_xlabel('Sample Index (sorted by error)')
-                ax.set_ylabel('Crack Depth')
-                ax.set_title('Predictions with Uncertainty Intervals')
-                ax.legend()
+                ax.set_xlabel('样本索引（按误差排序）', fontproperties=chinese_font_prop)
+                ax.set_ylabel('裂纹深度', fontproperties=chinese_font_prop)
+                ax.set_title('带不确定性区间的预测', fontproperties=chinese_font_prop)
+                ax.legend(prop=chinese_font_prop)
                 ax.grid(True, alpha=0.3)
                 
                 plt.tight_layout()

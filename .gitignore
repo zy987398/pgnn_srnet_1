@@ -103,3 +103,11 @@ logs/
 /images/
 /img/
 /figures/
+
+
+.json
+
+#忽略结果
+results/
+*.png
+*.json
