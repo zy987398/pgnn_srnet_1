@@ -7,6 +7,7 @@ import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
 import seaborn as sns
+from matplotlib import font_manager
 from sklearn.preprocessing import RobustScaler
 from sklearn.decomposition import PCA
 from sklearn.manifold import TSNE
@@ -15,6 +16,22 @@ import torch
 from scipy.stats import pearsonr, spearmanr
 from improved_material_crack_pgnn import prepare_material_data
 import os
+
+# 中文字体配置函数
+def get_chinese_font():
+    """获取中文字体"""
+    chinese_fonts = ['Microsoft YaHei', 'SimHei', 'SimSun', 'KaiTi', 'FangSong']
+    for font_name in chinese_fonts:
+        try:
+            font_path = font_manager.findfont(font_manager.FontProperties(family=font_name))
+            if font_path and font_name.lower() in font_path.lower():
+                return font_manager.FontProperties(family=font_name)
+        except:
+            continue
+    return font_manager.FontProperties()
+
+# 全局中文字体属性
+chinese_font_prop = get_chinese_font()
 
 # 设置更好的可视化样式
 plt.style.use('seaborn-v0_8-whitegrid')
@@ -228,18 +245,19 @@ def basic_statistics_analysis(df, features_df):
     material_counts = df['材料种类'].value_counts()
     plt.figure(figsize=(12, 6))
     material_counts.plot(kind='bar')
-    plt.title('各材料种类样本数量')
-    plt.xlabel('材料种类')
-    plt.ylabel('样本数量')
+    plt.title('各材料种类样本数量', fontproperties=chinese_font_prop)
+    plt.xlabel('材料种类', fontproperties=chinese_font_prop)
+    plt.ylabel('样本数量', fontproperties=chinese_font_prop)
+    plt.xticks(fontproperties=chinese_font_prop)
     plt.tight_layout()
     plt.savefig('analysis_results/材料种类分布.png', dpi=300)
     
     # 目标变量分布
     plt.figure(figsize=(10, 6))
     sns.histplot(df['亚表面裂纹深度'], kde=True)
-    plt.title('亚表面裂纹深度分布')
-    plt.xlabel('亚表面裂纹深度')
-    plt.ylabel('频率')
+    plt.title('亚表面裂纹深度分布', fontproperties=chinese_font_prop)
+    plt.xlabel('亚表面裂纹深度', fontproperties=chinese_font_prop)
+    plt.ylabel('频率', fontproperties=chinese_font_prop)
     plt.tight_layout()
     plt.savefig('analysis_results/目标变量分布.png', dpi=300)
     
@@ -333,7 +351,7 @@ def correlation_analysis(features_df):
                 verticalalignment='center',
                 fontsize=20)
     
-    plt.title('特征相关性热力图')
+    plt.title('特征相关性热力图', fontproperties=chinese_font_prop)
     plt.tight_layout()
     plt.savefig('analysis_results/特征相关性热力图.png', dpi=300)
     
@@ -384,7 +402,9 @@ def correlation_analysis(features_df):
                     except Exception as e:
                         print(f"为'{feature}'添加趋势线失败: {e}")
                     
-                    ax.set_title(f'{feature} vs 亚表面裂纹深度')
+                    ax.set_title(f'{feature} vs 亚表面裂纹深度', fontproperties=chinese_font_prop)
+                    ax.set_xlabel(feature, fontproperties=chinese_font_prop)
+                    ax.set_ylabel('亚表面裂纹深度', fontproperties=chinese_font_prop)
                     
                     # 计算并显示相关系数
                     p_corr_rows = corr_df[corr_df['特征'] == feature]['Pearson相关系数']
@@ -469,19 +489,19 @@ def feature_dimensionality_reduction(features_df):
         
         # PCA可视化 - 按裂纹深度着色
         scatter1 = axes[0].scatter(X_pca[:, 0], X_pca[:, 1], c=y, cmap='viridis', alpha=0.8, s=60)
-        axes[0].set_title(f'PCA投影 (解释方差: {pca.explained_variance_ratio_.sum():.2%})')
-        axes[0].set_xlabel(f'主成分1 ({pca.explained_variance_ratio_[0]:.2%})')
-        axes[0].set_ylabel(f'主成分2 ({pca.explained_variance_ratio_[1]:.2%})')
+        axes[0].set_title(f'PCA投影 (解释方差: {pca.explained_variance_ratio_.sum():.2%})', fontproperties=chinese_font_prop)
+        axes[0].set_xlabel(f'主成分1 ({pca.explained_variance_ratio_[0]:.2%})', fontproperties=chinese_font_prop)
+        axes[0].set_ylabel(f'主成分2 ({pca.explained_variance_ratio_[1]:.2%})', fontproperties=chinese_font_prop)
         cbar1 = plt.colorbar(scatter1, ax=axes[0])
-        cbar1.set_label('亚表面裂纹深度')
+        cbar1.set_label('亚表面裂纹深度', fontproperties=chinese_font_prop)
         
         # t-SNE可视化 - 按裂纹深度着色
         scatter2 = axes[1].scatter(X_tsne[:, 0], X_tsne[:, 1], c=y, cmap='viridis', alpha=0.8, s=60)
-        axes[1].set_title('t-SNE投影')
-        axes[1].set_xlabel('t-SNE维度1')
-        axes[1].set_ylabel('t-SNE维度2')
+        axes[1].set_title('t-SNE投影', fontproperties=chinese_font_prop)
+        axes[1].set_xlabel('t-SNE维度1', fontproperties=chinese_font_prop)
+        axes[1].set_ylabel('t-SNE维度2', fontproperties=chinese_font_prop)
         cbar2 = plt.colorbar(scatter2, ax=axes[1])
-        cbar2.set_label('亚表面裂纹深度')
+        cbar2.set_label('亚表面裂纹深度', fontproperties=chinese_font_prop)
         
         plt.tight_layout()
         plt.savefig('analysis_results/特征降维可视化_按裂纹深度.png', dpi=300)
@@ -497,9 +517,9 @@ def feature_dimensionality_reduction(features_df):
             
             # PCA可视化 - 按材料种类着色
             scatter1 = axes[0].scatter(X_pca[:, 0], X_pca[:, 1], c=color_indices, cmap='tab20', alpha=0.8, s=60)
-            axes[0].set_title(f'PCA投影 - 材料种类分布')
-            axes[0].set_xlabel(f'主成分1 ({pca.explained_variance_ratio_[0]:.2%})')
-            axes[0].set_ylabel(f'主成分2 ({pca.explained_variance_ratio_[1]:.2%})')
+            axes[0].set_title(f'PCA投影 - 材料种类分布', fontproperties=chinese_font_prop)
+            axes[0].set_xlabel(f'主成分1 ({pca.explained_variance_ratio_[0]:.2%})', fontproperties=chinese_font_prop)
+            axes[0].set_ylabel(f'主成分2 ({pca.explained_variance_ratio_[1]:.2%})', fontproperties=chinese_font_prop)
             
             # 为每种材料添加标签，但限制数量
             max_labels = min(10, len(unique_materials))
@@ -520,9 +540,9 @@ def feature_dimensionality_reduction(features_df):
     # t-SNE可视化 - 按材料种类着色
     try:
         scatter2 = axes[1].scatter(X_tsne[:, 0], X_tsne[:, 1], c=color_indices, cmap='tab20', alpha=0.8, s=60)
-        axes[1].set_title('t-SNE投影 - 材料种类分布')
-        axes[1].set_xlabel('t-SNE维度1')
-        axes[1].set_ylabel('t-SNE维度2')
+        axes[1].set_title('t-SNE投影 - 材料种类分布', fontproperties=chinese_font_prop)
+        axes[1].set_xlabel('t-SNE维度1', fontproperties=chinese_font_prop)
+        axes[1].set_ylabel('t-SNE维度2', fontproperties=chinese_font_prop)
         
         # 为每种材料添加标签
         max_labels = min(10, len(unique_materials))
@@ -555,15 +575,15 @@ def feature_dimensionality_reduction(features_df):
     component_df = component_df.sort_values(by='PC1', ascending=True)
     plt.subplot(1, 2, 1)
     bars = plt.barh(component_df.index, component_df['PC1'], color='skyblue')
-    plt.title('PC1特征权重')
-    plt.xlabel('绝对权重')
+    plt.title('PC1特征权重', fontproperties=chinese_font_prop)
+    plt.xlabel('绝对权重', fontproperties=chinese_font_prop)
     
     # 绘制PC2的特征权重
     component_df = component_df.sort_values(by='PC2', ascending=True)
     plt.subplot(1, 2, 2)
     plt.barh(component_df.index, component_df['PC2'], color='lightgreen')
-    plt.title('PC2特征权重')
-    plt.xlabel('绝对权重')
+    plt.title('PC2特征权重', fontproperties=chinese_font_prop)
+    plt.xlabel('绝对权重', fontproperties=chinese_font_prop)
     
     plt.tight_layout()
     plt.savefig('analysis_results/PCA组件特征权重可视化.png', dpi=300)
@@ -594,7 +614,7 @@ def material_group_analysis(features_df):
         y='亚表面裂纹深度',
         data=features_df[features_df['材料种类'].isin(top_materials)]
     )
-    plt.title('不同材料种类的亚表面裂纹深度分布')
+    plt.title('不同材料种类的亚表面裂纹深度分布', fontproperties=chinese_font_prop)
     plt.xticks(rotation=45, ha='right')
     plt.tight_layout()
     plt.savefig('analysis_results/材料种类裂纹深度箱线图.png', dpi=300)
@@ -624,7 +644,7 @@ def material_group_analysis(features_df):
         linewidths=.5,
         cbar_kws={'label': '平均值'}
     )
-    plt.title('材料种类的平均特征值(前10种材料)')
+    plt.title('材料种类的平均特征值(前10种材料)', fontproperties=chinese_font_prop)
     plt.tight_layout()
     plt.savefig('analysis_results/材料特征平均值热力图.png', dpi=300)
 
@@ -678,8 +698,8 @@ def physics_features_analysis(features_df):
     colors = ['green' if c > 0 else 'red' for _, c in orig_corrs]
     plt.barh(y_pos, [abs(c) for _, c in orig_corrs], color=colors, alpha=0.7)
     plt.yticks(y_pos, [f"{name} ({corr:.3f})" for name, corr in orig_corrs])
-    plt.title('原始特征与亚表面裂纹深度的相关性')
-    plt.xlabel('|相关系数|')
+    plt.title('原始特征与亚表面裂纹深度的相关性', fontproperties=chinese_font_prop)
+    plt.xlabel('|相关系数|', fontproperties=chinese_font_prop)
     
     # 物理特征相关性
     plt.subplot(2, 1, 2)
@@ -687,8 +707,8 @@ def physics_features_analysis(features_df):
     colors = ['green' if c > 0 else 'red' for _, c in physics_corrs]
     plt.barh(y_pos, [abs(c) for _, c in physics_corrs], color=colors, alpha=0.7)
     plt.yticks(y_pos, [f"{name} ({corr:.3f})" for name, corr in physics_corrs])
-    plt.title('物理生成特征与亚表面裂纹深度的相关性')
-    plt.xlabel('|相关系数|')
+    plt.title('物理生成特征与亚表面裂纹深度的相关性', fontproperties=chinese_font_prop)
+    plt.xlabel('|相关系数|', fontproperties=chinese_font_prop)
     
     plt.tight_layout()
     plt.savefig('analysis_results/原始vs物理特征相关性比较.png', dpi=300)
@@ -753,11 +773,12 @@ def physics_features_analysis(features_df):
         # 计算相关系数
         corr, _ = pearsonr(features_df[orig_feat], features_df[phys_feat])
         
-        plt.title(f'{phys_feat} vs {orig_feat}\nr = {corr:.3f}')
-        plt.xlabel(orig_feat)
-        plt.ylabel(phys_feat)
+        plt.title(f'{phys_feat} vs {orig_feat}\nr = {corr:.3f}', fontproperties=chinese_font_prop)
+        plt.xlabel(orig_feat, fontproperties=chinese_font_prop)
+        plt.ylabel(phys_feat, fontproperties=chinese_font_prop)
         
-    plt.colorbar(scatter, ax=plt.gca(), label='亚表面裂纹深度')
+    cbar = plt.colorbar(scatter, ax=plt.gca())
+    cbar.set_label('亚表面裂纹深度', fontproperties=chinese_font_prop)
     plt.tight_layout()
     plt.savefig('analysis_results/物理特征与原始特征关系.png', dpi=300)
 

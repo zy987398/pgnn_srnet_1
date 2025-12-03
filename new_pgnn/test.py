@@ -16,24 +16,72 @@ from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from torch.utils.data import TensorDataset, DataLoader
 
 # 配置matplotlib支持中文显示
+plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'SimSun', 'KaiTi', 'FangSong']
+plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+plt.rcParams['font.size'] = 12  # 设置字体大小
+
+# 设置matplotlib后端，确保中文显示
+import matplotlib
+matplotlib.rcParams['font.family'] = 'sans-serif'
+
+# 创建全局字体属性对象
+chinese_font_prop = None
 try:
-    # 尝试配置中文字体
-    plt.rcParams['font.sans-serif'] = ['SimHei', 'Microsoft YaHei', 'KaiTi', 'FangSong', 'SimSun']
-    plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
-    plt.rcParams['font.size'] = 12  # 设置字体大小
-    
-    # 验证是否可以找到中文字体
-    fonts = [f.name for f in font_manager.fontManager.ttflist]
-    chinese_fonts = [f for f in fonts if any(name in f for name in ['SimHei', 'Microsoft YaHei', 'KaiTi', 'FangSong', 'SimSun'])]
-    
-    if not chinese_fonts:
-        print("警告：未找到中文字体，将使用系统默认字体")
+    chinese_fonts = ['Microsoft YaHei', 'SimHei', 'SimSun', 'KaiTi', 'FangSong']
+    for font_name in chinese_fonts:
+        fonts = [f.name for f in font_manager.fontManager.ttflist]
+        if font_name in fonts:
+            chinese_font_prop = font_manager.FontProperties(family=font_name)
+            print(f"使用中文字体: {font_name}")
+            break
+    if chinese_font_prop is None:
+        chinese_font_prop = font_manager.FontProperties(family='DejaVu Sans')
+        print("使用默认字体: DejaVu Sans")
 except Exception as e:
-    print(f"设置中文字体时出错: {e}")
-    print("继续使用默认字体")
+    chinese_font_prop = font_manager.FontProperties(family='DejaVu Sans')
+    print(f"字体设置出错，使用默认字体: {e}")
     
 # 设置绘图样式
 plt.style.use('seaborn-v0_8-whitegrid')
+
+def get_chinese_font():
+    """获取可用的中文字体"""
+    global chinese_font_prop
+    return chinese_font_prop.get_name() if chinese_font_prop else 'DejaVu Sans'
+
+def apply_chinese_font_to_axes(ax):
+    """为指定的axes应用中文字体"""
+    global chinese_font_prop
+    if chinese_font_prop is None:
+        return
+        
+    # 强制设置轴标签字体
+    xlabel = ax.get_xlabel()
+    if xlabel:
+        ax.set_xlabel(xlabel, fontproperties=chinese_font_prop)
+        
+    ylabel = ax.get_ylabel()  
+    if ylabel:
+        ax.set_ylabel(ylabel, fontproperties=chinese_font_prop)
+        
+    title = ax.get_title()
+    if title:
+        ax.set_title(title, fontproperties=chinese_font_prop)
+    
+    # 强制设置刻度标签字体
+    for label in ax.get_xticklabels():
+        label.set_fontproperties(chinese_font_prop)
+    for label in ax.get_yticklabels():
+        label.set_fontproperties(chinese_font_prop)
+        
+    # 设置图例字体
+    legend = ax.get_legend()
+    if legend:
+        for text in legend.get_texts():
+            text.set_fontproperties(chinese_font_prop)
+            
+    # 强制刷新显示
+    ax.figure.canvas.draw_idle() if hasattr(ax.figure, 'canvas') else None
 
 def setup_plot_style(fig=None, ax=None):
     """设置图表风格以确保中文正确显示和样式统一"""
@@ -46,8 +94,18 @@ def setup_plot_style(fig=None, ax=None):
     ax.grid(True, linestyle='--', alpha=0.7)
     
     # 设置轴标签和标题的字体属性
+    font_name = get_chinese_font()
+    
     for label in ax.get_xticklabels() + ax.get_yticklabels():
-        label.set_fontproperties(font_manager.FontProperties(family='SimHei'))
+        label.set_fontproperties(font_manager.FontProperties(family=font_name))
+        
+    # 设置标题和轴标签字体
+    if ax.get_title():
+        ax.set_title(ax.get_title(), fontproperties=font_manager.FontProperties(family=font_name))
+    if ax.get_xlabel():
+        ax.set_xlabel(ax.get_xlabel(), fontproperties=font_manager.FontProperties(family=font_name))
+    if ax.get_ylabel():
+        ax.set_ylabel(ax.get_ylabel(), fontproperties=font_manager.FontProperties(family=font_name))
         
     # 边框设置
     ax.spines['top'].set_visible(False)
@@ -60,7 +118,7 @@ def setup_plot_style(fig=None, ax=None):
     if legend is not None:
         legend.get_frame().set_alpha(0.8)
         for text in legend.get_texts():
-            text.set_fontproperties(font_manager.FontProperties(family='SimHei'))
+            text.set_fontproperties(font_manager.FontProperties(family=font_name))
     
     return fig, ax
 
@@ -81,6 +139,10 @@ torch.manual_seed(SEED)
 np.random.seed(SEED)
 if torch.cuda.is_available():
     torch.cuda.manual_seed_all(SEED)
+
+# 配置参数
+USE_CROSS_VALIDATION = True  # 是否使用交叉验证
+CV_FOLDS = 5  # 交叉验证折数
 
 
 def load_best_params_from_study(study_path):
@@ -521,12 +583,18 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         fig, ax = plt.subplots(figsize=(10, 6))
         ax.bar(range(cv_folds), cv_test_r2_values, alpha=0.7, color='#4472C4')
         ax.axhline(y=mean_test_r2, color='r', linestyle='-', label=f'平均 R² = {mean_test_r2:.4f}')
-        ax.set_xlabel('交叉验证折叠')
-        ax.set_ylabel('测试集 R²')
-        ax.set_title('交叉验证性能', fontweight='bold')
+        ax.set_xlabel('交叉验证折叠', fontproperties=chinese_font_prop)
+        ax.set_ylabel('测试集 R²', fontproperties=chinese_font_prop)
+        ax.set_title('交叉验证性能', fontweight='bold', fontproperties=chinese_font_prop)
         ax.set_xticks(range(cv_folds))
         ax.set_xticklabels([f'折叠 {i+1}' for i in range(cv_folds)])
-        ax.legend()
+        ax.legend(prop=chinese_font_prop)
+        
+        # 为刻度标签设置字体
+        for label in ax.get_xticklabels():
+            label.set_fontproperties(chinese_font_prop)
+        for label in ax.get_yticklabels():
+            label.set_fontproperties(chinese_font_prop)
         
         # 应用样式
         fig, ax = setup_plot_style(fig, ax)
@@ -549,11 +617,17 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         max_val = max(np.max(np.concatenate(all_targets)), np.max(np.concatenate(all_predictions)))
         ax.plot([min_val, max_val], [min_val, max_val], 'r--', linewidth=2)
         
-        ax.set_xlabel('实际裂纹深度')
-        ax.set_ylabel('预测裂纹深度')
-        ax.set_title(f'交叉验证预测 (平均 R² = {mean_test_r2:.4f} ± {std_test_r2:.4f})', fontweight='bold')
+        ax.set_xlabel('实际裂纹深度', fontproperties=chinese_font_prop)
+        ax.set_ylabel('预测裂纹深度', fontproperties=chinese_font_prop)
+        ax.set_title(f'交叉验证预测 (平均 R² = {mean_test_r2:.4f} ± {std_test_r2:.4f})', fontweight='bold', fontproperties=chinese_font_prop)
         if cv_folds <= 5:  # 只有当折叠数较小时才显示图例
-            ax.legend()
+            ax.legend(prop=chinese_font_prop)
+            
+        # 为刻度标签设置字体
+        for label in ax.get_xticklabels():
+            label.set_fontproperties(chinese_font_prop)
+        for label in ax.get_yticklabels():
+            label.set_fontproperties(chinese_font_prop)
             
         # 应用样式
         fig, ax = setup_plot_style(fig, ax)
@@ -652,9 +726,9 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         plt.plot(train_losses, label='训练损失', alpha=0.7)
         plt.plot(val_losses, label='验证损失', alpha=0.7)
         plt.xlabel('Epoch')
-        plt.ylabel('损失')
-        plt.legend()
-        plt.title('训练和验证损失')
+        plt.ylabel('损失', fontproperties=chinese_font_prop)
+        plt.legend(prop=chinese_font_prop)
+        plt.title('训练和验证损失', fontproperties=chinese_font_prop)
         plt.grid(True, alpha=0.3)
         
         # R²曲线
@@ -663,8 +737,8 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         plt.axhline(y=test_r2, color='r', linestyle='--', label=f'测试R²: {test_r2:.4f}')
         plt.xlabel('Epoch')
         plt.ylabel('R²')
-        plt.legend()
-        plt.title('验证和测试R²')
+        plt.legend(prop=chinese_font_prop)
+        plt.title('验证和测试R²', fontproperties=chinese_font_prop)
         plt.grid(True, alpha=0.3)
         
         # 预测散点图
@@ -673,9 +747,9 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         min_val = min(test_target_np.min(), test_pred_np.min())
         max_val = max(test_target_np.max(), test_pred_np.max())
         plt.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2)
-        plt.xlabel('实际裂纹深度')
-        plt.ylabel('预测裂纹深度')
-        plt.title(f'预测结果 (R²={test_r2:.4f})')
+        plt.xlabel('实际裂纹深度', fontproperties=chinese_font_prop)
+        plt.ylabel('预测裂纹深度', fontproperties=chinese_font_prop)
+        plt.title(f'预测结果 (R²={test_r2:.4f})', fontproperties=chinese_font_prop)
         plt.grid(True, alpha=0.3)
         
         plt.tight_layout()
@@ -690,21 +764,21 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         
         plt.subplot(1, 2, 1)
         plt.hist(gate_values, bins=30, alpha=0.7, edgecolor='black', color='steelblue')
-        plt.xlabel('门控权重值')
-        plt.ylabel('频次')
-        plt.title('门控权重分布')
+        plt.xlabel('门控权重值', fontproperties=chinese_font_prop)
+        plt.ylabel('频次', fontproperties=chinese_font_prop)
+        plt.title('门控权重分布', fontproperties=chinese_font_prop)
         plt.axvline(x=0.5, color='r', linestyle='--', linewidth=2, label='平衡点 (0.5)')
-        plt.legend()
+        plt.legend(prop=chinese_font_prop)
         plt.grid(True, alpha=0.3)
         
         plt.subplot(1, 2, 2)
         sample_size = min(100, len(gate_values))
         plt.plot(gate_values[:sample_size], 'o-', alpha=0.6, markersize=4)
-        plt.xlabel('样本索引')
-        plt.ylabel('门控权重')
-        plt.title(f'门控权重示例 (前{sample_size}个样本)')
+        plt.xlabel('样本索引', fontproperties=chinese_font_prop)
+        plt.ylabel('门控权重', fontproperties=chinese_font_prop)
+        plt.title(f'门控权重示例 (前{sample_size}个样本)', fontproperties=chinese_font_prop)
         plt.axhline(y=0.5, color='r', linestyle='--', linewidth=2, label='平衡点')
-        plt.legend()
+        plt.legend(prop=chinese_font_prop)
         plt.grid(True, alpha=0.3)
         
         plt.tight_layout()
@@ -719,10 +793,10 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         plt.errorbar(indices, test_pred_np, yerr=np.sqrt(test_uncertainty_np), 
                      fmt='o', alpha=0.3, elinewidth=1, capsize=2, label='预测±不确定性')
         plt.plot(indices, test_target_np, 'ro', markersize=3, alpha=0.6, label='实际值')
-        plt.xlabel('测试样本索引')
-        plt.ylabel('裂纹深度')
-        plt.title('预测值与不确定性')
-        plt.legend()
+        plt.xlabel('测试样本索引', fontproperties=chinese_font_prop)
+        plt.ylabel('裂纹深度', fontproperties=chinese_font_prop)
+        plt.title('预测值与不确定性', fontproperties=chinese_font_prop)
+        plt.legend(prop=chinese_font_prop)
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
         plt.savefig("results/uncertainty_visualization.png", dpi=150)
@@ -941,9 +1015,9 @@ def train_with_best_params(params, data_path=DATA_PATH, seed=SEED):
     plt.plot(train_losses, label='训练损失', alpha=0.7)
     plt.plot(val_losses, label='验证损失', alpha=0.7)
     plt.xlabel('Epoch')
-    plt.ylabel('损失')
-    plt.legend()
-    plt.title('训练和验证损失')
+    plt.ylabel('损失', fontproperties=chinese_font_prop)
+    plt.legend(prop=chinese_font_prop)
+    plt.title('训练和验证损失', fontproperties=chinese_font_prop)
     plt.grid(True, alpha=0.3)
     
     # R²曲线
@@ -952,8 +1026,8 @@ def train_with_best_params(params, data_path=DATA_PATH, seed=SEED):
     plt.axhline(y=test_r2, color='r', linestyle='--', label=f'测试R²: {test_r2:.4f}')
     plt.xlabel('Epoch')
     plt.ylabel('R²')
-    plt.legend()
-    plt.title('验证和测试R²')
+    plt.legend(prop=chinese_font_prop)
+    plt.title('验证和测试R²', fontproperties=chinese_font_prop)
     plt.grid(True, alpha=0.3)
     
     # 预测散点图
@@ -962,9 +1036,9 @@ def train_with_best_params(params, data_path=DATA_PATH, seed=SEED):
     min_val = min(test_target_np.min(), test_pred_np.min())
     max_val = max(test_target_np.max(), test_pred_np.max())
     plt.plot([min_val, max_val], [min_val, max_val], 'r--', lw=2)
-    plt.xlabel('实际裂纹深度')
-    plt.ylabel('预测裂纹深度')
-    plt.title(f'预测结果 (R²={test_r2:.4f})')
+    plt.xlabel('实际裂纹深度', fontproperties=chinese_font_prop)
+    plt.ylabel('预测裂纹深度', fontproperties=chinese_font_prop)
+    plt.title(f'预测结果 (R²={test_r2:.4f})', fontproperties=chinese_font_prop)
     plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
@@ -1035,6 +1109,12 @@ if __name__ == "__main__":
     if best_params is None:
         print("\n加载参数失败，程序退出")
         exit(1)
+    
+    # 添加交叉验证参数（如果没有的话）
+    if 'use_cross_validation' not in best_params:
+        best_params['use_cross_validation'] = USE_CROSS_VALIDATION
+        best_params['cv_folds'] = CV_FOLDS
+        print(f"\n添加交叉验证参数: {'启用' if USE_CROSS_VALIDATION else '禁用'} {CV_FOLDS}折交叉验证")
     
     # 使用最佳参数训练模型
     print("\n" + "="*70)
