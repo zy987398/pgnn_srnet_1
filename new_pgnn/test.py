@@ -637,8 +637,8 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         
         # 保存最佳模型
         if best_model is not None:
-            torch.save(best_model.state_dict(), "results/best_cv_model.pth")
-            print("\n最佳交叉验证模型已保存至 results/best_cv_model.pth")
+            torch.save(best_model.state_dict(), "results/best_model.pth")
+            print("\n最佳交叉验证模型已保存至 results/best_model.pth")
         
         # 返回交叉验证结果
         return {

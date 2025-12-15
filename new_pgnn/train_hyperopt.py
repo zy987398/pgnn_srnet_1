@@ -1213,8 +1213,8 @@ if __name__ == "__main__":
 
         # 保存模型
         try:
-            torch.save(model.state_dict(), "results/improved_model.pth")
-            print("模型已保存至 results/improved_model.pth")
+            torch.save(model.state_dict(), "results/select_model.pth")
+            print("模型已保存至 results/select_model.pth")
 
             # 保存训练历史
             # 获取完整参数集
