@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """
-Enhanced comparison script with hyperparameter optimization for PGNN
+Comparison script for traditional ML models vs PGNN model
+Uses the trained model from new_pgnn/model_pre.py
 """
 
 import warnings
@@ -10,16 +11,14 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
-import optuna
-from optuna.trial import TrialState
-from sklearn.model_selection import train_test_split, KFold
+from sklearn.model_selection import train_test_split, GroupKFold
 from sklearn.preprocessing import StandardScaler, LabelEncoder
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
 import matplotlib.pyplot as plt
 import seaborn as sns
 import os
+import sys
 import glob
-import json
 
 # Traditional ML models
 from sklearn.ensemble import RandomForestRegressor, GradientBoostingRegressor
@@ -28,164 +27,26 @@ from xgboost import XGBRegressor
 from sklearn.linear_model import ElasticNet
 from sklearn.neural_network import MLPRegressor
 
-# PGNN imports
-from improved_material_crack_pgnn import (
-    MaterialCrackPGNN,
-    PhysicsInformedLoss,
-    prepare_material_data,
-)
+# 添加new_pgnn到路径
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'new_pgnn'))
 
-# Enable anomaly detection
-torch.autograd.set_detect_anomaly(True)
-torch.backends.cuda.matmul.allow_tf32 = False
+# PGNN imports - 从new_pgnn文件夹导入
+from new_pgnn.models import MaterialCrackPGNN
+from new_pgnn.model_pre import CrackDepthPredictor
+from new_pgnn.utils import prepare_material_data
 
-# ---------------------------------------------------------------------------
-# Hyperparameter optimization functions
-# ---------------------------------------------------------------------------
+# 设置中文字体（用于matplotlib）
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans']
+plt.rcParams['axes.unicode_minus'] = False
 
-def create_pgnn_with_hyperparams(trial, num_materials):
-    """Create PGNN model with trial hyperparameters"""
-    material_embed_dim = trial.suggest_int("material_embed_dim", 8, 64, step=8)
-    latent_dim = trial.suggest_int("latent_dim", 16, 128, step=16)
-    
-    model = MaterialCrackPGNN(
-        num_materials=num_materials,
-        material_embed_dim=material_embed_dim,
-        latent_dim=latent_dim
-    )
-    
-    # Adjust dropout
-    dropout_rate = trial.suggest_float("dropout_rate", 0.0, 0.5, step=0.05)
-    for module in model.modules():
-        if isinstance(module, nn.Dropout):
-            module.p = dropout_rate
-    
-    return model
+# 固定随机种子
+SEED = 66
+torch.manual_seed(SEED)
+np.random.seed(SEED)
 
-def train_pgnn_with_trial(trial, train_data, val_data, num_materials, device='cuda'):
-    """Train PGNN with hyperparameters from trial"""
-    
-    # Training hyperparameters
-    lr = trial.suggest_float("lr", 1e-5, 1e-2, log=True)
-    epochs = trial.suggest_int("epochs", 200, 800, step=100)
-    
-    # Loss hyperparameters
-    lambda_complexity = trial.suggest_float("lambda_complexity", 1e-5, 1e-2, log=True)
-    lambda_physics = trial.suggest_float("lambda_physics", 0, 0.5, step=0.05)
-    
-    # Optimizer
-    optimizer_name = trial.suggest_categorical("optimizer", ["Adam", "AdamW", "RMSprop"])
-    weight_decay = trial.suggest_float("weight_decay", 0, 0.01) if optimizer_name == "AdamW" else 0
-    
-    # Create model
-    model = create_pgnn_with_hyperparams(trial, num_materials).to(device)
-    
-    # Optimizer
-    if optimizer_name == "Adam":
-        optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    elif optimizer_name == "AdamW":
-        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
-    else:
-        optimizer = torch.optim.RMSprop(model.parameters(), lr=lr)
-    
-    # Scheduler
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, patience=20, factor=0.5, min_lr=1e-6
-    )
-    
-    # Loss function
-    loss_fn = PhysicsInformedLoss(
-        lambda_complexity=lambda_complexity,
-        lambda_physics=lambda_physics
-    )
-    
-    # Prepare data
-    train_materials = torch.LongTensor(train_data['material_ids']).to(device)
-    train_features = torch.FloatTensor(train_data['numeric_features']).to(device)
-    train_target = torch.FloatTensor(train_data['target']).unsqueeze(1).to(device)
-    
-    val_materials = torch.LongTensor(val_data['material_ids']).to(device)
-    val_features = torch.FloatTensor(val_data['numeric_features']).to(device)
-    val_target = torch.FloatTensor(val_data['target']).unsqueeze(1).to(device)
-    
-    # Training
-    best_val_r2 = -float('inf')
-    patience = 50
-    patience_counter = 0
-    
-    for epoch in range(epochs):
-        model.train()
-        optimizer.zero_grad()
-        
-        pred, uncertainty, _, _ = model(train_materials, train_features)
-        loss, _ = loss_fn(pred, uncertainty, train_target, model, train_features)
-        
-        if torch.isnan(loss):
-            return -float('inf')
-        
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-        
-        # Validation
-        model.eval()
-        with torch.no_grad():
-            val_pred, _, _, _ = model(val_materials, val_features)
-            val_r2 = r2_score(
-                val_target.cpu().squeeze().numpy(),
-                val_pred.cpu().squeeze().numpy()
-            )
-        
-        scheduler.step(-val_r2)  # Minimize negative R2
-        
-        # Early stopping
-        if val_r2 > best_val_r2:
-            best_val_r2 = val_r2
-            patience_counter = 0
-        else:
-            patience_counter += 1
-        
-        if patience_counter >= patience:
-            break
-        
-        # Report to Optuna
-        trial.report(val_r2, epoch)
-        if trial.should_prune():
-            raise optuna.TrialPruned()
-    
-    return best_val_r2
-
-def optimize_hyperparameters(train_df, val_df, n_trials=30, seed=42):
-    """Run hyperparameter optimization"""
-    
-    train_data = prepare_material_data(train_df)
-    val_data = prepare_material_data(val_df)
-    num_materials = train_data['num_materials']
-    
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    study = optuna.create_study(
-        direction="maximize",
-        pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=30),
-        sampler=optuna.samplers.TPESampler(seed=seed)
-    )
-    
-    objective = lambda trial: train_pgnn_with_trial(
-        trial, train_data, val_data, num_materials, device
-    )
-    
-    print("\n" + "="*60)
-    print("Starting hyperparameter optimization...")
-    print("="*60)
-    
-    study.optimize(objective, n_trials=n_trials, show_progress_bar=True)
-    
-    print(f"\nBest validation R²: {study.best_value:.4f}")
-    print("\nBest hyperparameters:")
-    for key, value in study.best_params.items():
-        print(f"  {key}: {value}")
-    
-    return study.best_params
+# 模型路径配置
+MODEL_PATH = "results/select_model.pth"
+TRAIN_DATA_PATH = "new_pgnn/3011916164精确材料性能数据.csv"
 
 # ---------------------------------------------------------------------------
 # Traditional ML helpers
@@ -213,6 +74,7 @@ def evaluate_traditional_models(X_train, X_test, y_train, y_test):
     
     results = {}
     for name, model in models.items():
+        print(f"训练 {name}...")
         model.fit(X_train, y_train)
         y_pred_test = model.predict(X_test)
         
@@ -263,9 +125,10 @@ def create_ensemble_features(df):
     features.append((1 / np.sqrt(df["晶粒粒径"])).values.reshape(-1, 1))
     feature_names.append("Hall-Petch")
     
-    material_mean = df.groupby("材料种类")["亚表面裂纹深度"].transform("mean")
-    features.append(material_mean.values.reshape(-1, 1))
-    feature_names.append("材料平均裂纹深度")
+    # 移除数据泄露特征：材料平均裂纹深度（使用了目标变量）
+    # material_mean = df.groupby("材料种类")["亚表面裂纹深度"].transform("mean")
+    # features.append(material_mean.values.reshape(-1, 1))
+    # feature_names.append("材料平均裂纹深度")
     
     X = np.hstack(features)
     return X, feature_names
@@ -323,192 +186,133 @@ def plot_model_comparison(results, y_test):
     for i, v in enumerate(rmse_scores):
         ax2.text(i, v + 0.05, f"{v:.3f}", ha="center")
     
-    plt.xticks(rotation=45)
+    plt.xticks(rotation=45, ha='right')
     plt.tight_layout()
     plt.savefig(os.path.join(save_dir, f"bar_charts_{run_id}.png"), dpi=300)
     plt.show()
 
 # ---------------------------------------------------------------------------
-# Main experiment with hyperopt
+# Main experiment with pre-trained PGNN model
 # ---------------------------------------------------------------------------
 
-from sklearn.model_selection import StratifiedKFold, GroupKFold
-
 def main():
+    # 数据路径
     CSV_PATH = "3011916164精确材料性能数据.csv"
-    SEED = 42
-    USE_HYPEROPT = True  # Toggle hyperparameter optimization
-    N_TRIALS = 30  # Number of hyperopt trials
+    train_data_path = TRAIN_DATA_PATH  # 使用全局配置
     
-    torch.manual_seed(SEED)
-    np.random.seed(SEED)
+    print("="*60)
+    print("模型对比实验 - 传统ML模型 vs PGNN预训练模型")
+    print("="*60)
+    print(f"\n数据文件: {CSV_PATH}")
+    print(f"PGNN模型: {MODEL_PATH}")
+    print(f"训练数据: {train_data_path}")
     
-    print("Reading data...")
+    print("\n读取数据...")
     df = pd.read_csv(CSV_PATH)
     
-    # Split data using StratifiedKFold or GroupKFold
-    group_kfold = GroupKFold(n_splits=5)
-    groups = df["材料种类"].values
-    
-    for train_idx, val_idx in group_kfold.split(df, groups=groups):
-        df_train, df_val = df.iloc[train_idx], df.iloc[val_idx]
-        break  # 只取一次分割
-    
-    df_test = df.sample(frac=0.2, random_state=SEED)
-    df_train = df.drop(df_test.index)
-    
-    # Traditional ML features
-    X_all, feat_names = create_ensemble_features(df)
-    y_all = df["亚表面裂纹深度"].values
-    
-    X_train_all, X_test, y_train_all, y_test = train_test_split(
-        X_all, y_all, test_size=0.2, random_state=SEED
+    # 首先进行数据划分 - 使用stratify确保材料种类分布一致
+    df_train, df_test = train_test_split(
+        df, test_size=0.2, random_state=SEED, stratify=df["材料种类"]
     )
     
-    scaler = StandardScaler().fit(X_train_all)
-    X_train_s = scaler.transform(X_train_all)
+    print(f"训练集大小: {len(df_train)} 样本")
+    print(f"测试集大小: {len(df_test)} 样本")
+    
+    # Traditional ML features - 从划分好的数据创建特征
+    X_train, _ = create_ensemble_features(df_train)
+    X_test, feat_names = create_ensemble_features(df_test)
+    y_train_all = df_train["亚表面裂纹深度"].values
+    y_test = df_test["亚表面裂纹深度"].values
+    
+    # 标准化特征
+    scaler = StandardScaler().fit(X_train)
+    X_train_s = scaler.transform(X_train)
     X_test_s = scaler.transform(X_test)
     
-    print("\nTraining classical models...")
+    print("\n训练传统机器学习模型...")
     baseline_results = evaluate_traditional_models(X_train_s, X_test_s, y_train_all, y_test)
     
-    # PGNN with hyperopt
-    if USE_HYPEROPT:
-        # Hyperparameter optimization
-        best_params = optimize_hyperparameters(df_train, df_val, n_trials=N_TRIALS, seed=SEED)
-        
-        # Save best params
-        save_dir = "results"
-        os.makedirs(save_dir, exist_ok=True)
-        with open(os.path.join(save_dir, "best_hyperparams.json"), "w") as f:
-            json.dump(best_params, f, indent=2)
-    else:
-        # Default params
-        best_params = {
-            "material_embed_dim": 32,
-            "latent_dim": 64,
-            "dropout_rate": 0.2,
-            "lr": 5e-4,
-            "epochs": 800,
-            "lambda_complexity": 0,
-            "lambda_physics": 0.1,
-            "optimizer": "Adam",
-        }
+    # PGNN - 加载预训练模型
+    print("\n加载预训练的PGNN模型...")
     
-    # Train PGNN with best params
-    print(f"\nTraining PGNN with {'optimized' if USE_HYPEROPT else 'default'} parameters...")
+    # 检查模型文件是否存在
+    if not os.path.exists(MODEL_PATH):
+        print(f"错误: 模型文件不存在: {MODEL_PATH}")
+        print("请先训练模型或检查路径配置")
+        return
     
-    # Prepare data
-    train_data = prepare_material_data(df_train if USE_HYPEROPT else df.iloc[df_train.index])
-    test_data = prepare_material_data(df_test)
+    if not os.path.exists(train_data_path):
+        print(f"错误: 训练数据文件不存在: {train_data_path}")
+        print("尝试使用当前目录的数据文件...")
+        train_data_path = CSV_PATH
     
-    # Adjust sample weights for deep cracks
-    train_data['sample_weights'] = np.where(train_data['target'] > 4, 5, 1)  # 深裂纹权重增加
-    
-    # Create model
-    model = MaterialCrackPGNN(
-        num_materials=train_data["num_materials"],
-        material_embed_dim=best_params["material_embed_dim"],
-        latent_dim=best_params["latent_dim"]
-    )
-    
-    # Set dropout
-    for module in model.modules():
-        if isinstance(module, nn.Dropout):
-            module.p = best_params["dropout_rate"]
-    
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model = model.to(device)
-    
-    # Optimizer
-    if best_params["optimizer"] == "Adam":
-        optimizer = torch.optim.Adam(model.parameters(), lr=best_params["lr"])
-    elif best_params["optimizer"] == "AdamW":
-        optimizer = torch.optim.AdamW(
-            model.parameters(),
-            lr=best_params["lr"],
-            weight_decay=best_params.get("weight_decay", 0)
+    try:
+        # 创建预测器（会自动加载模型）
+        predictor = CrackDepthPredictor(
+            model_path=MODEL_PATH,
+            train_data_path=train_data_path,
+            device="cuda" if torch.cuda.is_available() else "cpu"
         )
-    else:
-        optimizer = torch.optim.RMSprop(model.parameters(), lr=best_params["lr"])
-    
-    # Loss function
-    loss_fn = PhysicsInformedLoss(
-        lambda_complexity=best_params.get("lambda_complexity", 0),
-        lambda_physics=best_params.get("lambda_physics", 0.1)
-    )
-    
-    # Training data
-    train_materials = torch.LongTensor(train_data['material_ids']).to(device)
-    train_features = torch.FloatTensor(train_data['numeric_features']).to(device)
-    train_target = torch.FloatTensor(train_data['target']).unsqueeze(1).to(device)
-    train_weights = torch.FloatTensor(train_data['sample_weights']).to(device)  # 使用样本权重
-    
-    test_materials = torch.LongTensor(test_data['material_ids']).to(device)
-    test_features = torch.FloatTensor(test_data['numeric_features']).to(device)
-    test_target = torch.FloatTensor(test_data['target']).unsqueeze(1).to(device)
-    
-    # Train
-    train_losses = []
-    val_losses = []
-    
-    for epoch in range(best_params["epochs"]):
-        model.train()
-        optimizer.zero_grad()
         
-        pred, uncertainty, _, _ = model(train_materials, train_features)
-        loss, _ = loss_fn(pred, uncertainty, train_target, model, train_features)
-        loss = (loss * train_weights).mean()  # 加权损失
+        print(f"模型加载成功！")
+        print(f"使用设备: {predictor.device}")
         
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        # 准备测试数据
+        # 创建临时CSV文件用于预测
+        temp_test_file = "temp_test_data.csv"
+        df_test.to_csv(temp_test_file, index=False)
         
-        train_losses.append(loss.item())
+        # 使用预测器进行预测
+        result_df = predictor.predict(
+            input_data_path=temp_test_file,
+            output_path=None,  # 不保存文件
+            use_mc_dropout=False
+        )
         
-        if (epoch + 1) % 100 == 0:
-            print(f"Epoch {epoch+1}/{best_params['epochs']}: Loss={loss.item():.4f}")
-    
-    # Evaluate PGNN
-    model.eval()
-    with torch.no_grad():
-        preds, *_ = model(test_materials, test_features)
-        preds = preds.cpu().squeeze().numpy()
-    
-    pgnn_r2 = r2_score(test_target.cpu().squeeze().numpy(), preds)
-    pgnn_rmse = np.sqrt(mean_squared_error(test_target.cpu().squeeze().numpy(), preds))
-    pgnn_mae = mean_absolute_error(test_target.cpu().squeeze().numpy(), preds)
-    
-    print(f"\nPGNN => R²={pgnn_r2:.3f}, RMSE={pgnn_rmse:.3f}, MAE={pgnn_mae:.3f}")
-    
-    baseline_results["PGNN (Optimized)" if USE_HYPEROPT else "PGNN"] = {
-        "model": model,
-        "predictions": preds,
-        "test_r2": pgnn_r2,
-        "test_mse": pgnn_rmse ** 2,
-        "test_mae": pgnn_mae,
-    }
+        # 获取预测结果
+        preds = result_df["预测裂纹深度"].values
+        
+        # 删除临时文件
+        if os.path.exists(temp_test_file):
+            os.remove(temp_test_file)
+        
+        # 计算评估指标
+        pgnn_r2 = r2_score(y_test, preds)
+        pgnn_rmse = np.sqrt(mean_squared_error(y_test, preds))
+        pgnn_mae = mean_absolute_error(y_test, preds)
+        
+        print(f"\nPGNN结果 => R²={pgnn_r2:.3f}, RMSE={pgnn_rmse:.3f}, MAE={pgnn_mae:.3f}")
+        
+        baseline_results["PGNN (Pre-trained)"] = {
+            "model": predictor.model,
+            "predictions": preds,
+            "test_r2": pgnn_r2,
+            "test_mse": pgnn_rmse ** 2,
+            "test_mae": pgnn_mae,
+        }
+        
+    except Exception as e:
+        print(f"\n加载或评估PGNN模型时出错: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        print("\n将仅显示传统ML模型的对比结果")
+        # 继续执行，只是不包含PGNN结果
     
     # Plot comparisons
-    plot_model_comparison(baseline_results, test_target.cpu().squeeze().numpy())
-    
-    # Plot training curve
-    plt.figure()
-    plt.plot(train_losses)
-    plt.yscale("log")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss")
-    plt.title("PGNN Training Loss")
-    plt.grid(True, alpha=0.3)
-    plt.savefig(os.path.join("results", "pgnn_training_loss.png"), dpi=300)
-    plt.show()
+    if len(baseline_results) > 0:
+        print("\n生成对比图...")
+        plot_model_comparison(baseline_results, y_test)
     
     # Print summary
     print("\n" + "="*60)
-    print("FINAL RESULTS SUMMARY")
+    print("最终结果汇总")
     print("="*60)
     for name, res in sorted(baseline_results.items(), key=lambda x: x[1]["test_r2"], reverse=True):
-        print(f"{name:20s} | R²: {res['test_r2']:.4f} | RMSE: {np.sqrt(res['test_mse']):.4f}")
+        print(f"{name:30s} | R²: {res['test_r2']:.4f} | RMSE: {np.sqrt(res['test_mse']):.4f} | MAE: {res['test_mae']:.4f}")
+    
+    print("\n" + "="*60)
+    print("实验完成！")
+    print("="*60)
 
 if __name__ == "__main__":
     main()

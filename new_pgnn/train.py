@@ -46,8 +46,8 @@ PARAMS = {
     "epochs": 350,               # 训练轮数
     "batch_size": 16,            # 批次大小
     "lr": 0.0011173842752625436, # 学习率
-    "patience": 55,              # 早停参数
-    "augmentation": False,       # 是否使用数据增强
+    "patience": 40,              # 早停参数
+    "augmentation": True,       # 是否使用数据增强
     "optimizer": "AdamW",        # 优化器
     "weight_decay": 0.0066923795400554925,      # 权重衰减
     "lambda_complexity": 3.4069890537972935e-05,  # 复杂度损失权重
@@ -376,8 +376,8 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
     plt.close()
     
     # 保存模型
-    torch.save(model.state_dict(), "results/improved_model.pth")
-    print("模型已保存至 results/improved_model.pth")
+    torch.save(model.state_dict(), "results/train_model.pth")
+    print("模型已保存至 results/train_model.pth")
     
     # 不确定性可视化
     plt.figure(figsize=(10, 8))
@@ -556,6 +556,3 @@ if __name__ == "__main__":
     print(f"模型训练与评估完成，测试集 R² = {results['test_r2']:.4f}")
     print("="*50)
     
-    # 如果需要加载已保存的模型并在新数据上进行预测，可以取消下面的注释
-    # model = load_model_and_predict("results/improved_model.pth", DATA_PATH)
-    # 例如: predict_on_new_data(model, "new_data.csv")

@@ -591,18 +591,18 @@ def main():
         epilog="""
 使用示例:
   # 基本预测 (使用默认路径)
-  python model_pre.py --model ../results/improved_model.pth --train_data 3011916164精确材料性能数据.csv --input test.csv --output predictions.csv
+  python model_pre.py --model ../results/select_model.pth --train_data 3011916164精确材料性能数据.csv --input test.csv --output predictions.csv
   
   # 使用MC Dropout估计不确定度
-  python model_pre.py --model ../results/improved_model.pth --train_data 3011916164精确材料性能数据.csv --input test.csv --output predictions.csv --mc_dropout --n_samples 20
+  python model_pre.py --model ../results/select_model.pth --train_data 3011916164精确材料性能数据.csv --input test.csv --output predictions.csv --mc_dropout --n_samples 20
   
   # 单样本预测
-  python model_pre.py --model ../results/improved_model.pth --train_data 3011916164精确材料性能数据.csv --single --material 碳化硅 --hardness 9.5 --elastic_modulus 450 --fracture_toughness 4.5 --grain_size 0.00001 --pressure 8.5 --velocity 40
+  python model_pre.py --model ../results/select_model.pth --train_data 3011916164精确材料性能数据.csv --single --material 碳化硅 --hardness 9.5 --elastic_modulus 450 --fracture_toughness 4.5 --grain_size 0.00001 --pressure 8.5 --velocity 40
         """
     )
     
     # 修改为默认参数，与debug结果一致
-    parser.add_argument("--model", default="../results/improved_model.pth", help="训练好的模型文件路径")
+    parser.add_argument("--model", default="../results/select_model.pth", help="训练好的模型文件路径")
     parser.add_argument("--train_data", default="3011916164精确材料性能数据.csv", help="训练数据CSV文件路径")
     parser.add_argument("--input", help="输入数据CSV文件路径")
     parser.add_argument("--output", help="输出结果CSV文件路径")
