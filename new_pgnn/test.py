@@ -14,6 +14,7 @@ from matplotlib import font_manager
 from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from torch.utils.data import TensorDataset, DataLoader
+from interpretability_analysis import run_interpretability_analysis
 
 # 配置matplotlib支持中文显示
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'SimSun', 'KaiTi', 'FangSong']
@@ -1087,47 +1088,59 @@ if __name__ == "__main__":
     # 确保结果目录存在
     os.makedirs("results", exist_ok=True)
     
-    # 指定study文件路径 (请根据实际文件名修改)
-    STUDY_PATH = "results\\best_hyperopt_study.pkl"  # 修改为您的study文件路径
+    # 指定study文件路径
+    STUDY_PATH = "results\\best_hyperopt_study.pkl"
     
     # 检查study文件是否存在
     if not os.path.exists(STUDY_PATH):
-        print(f"\n错误: 找不到study文件 '{STUDY_PATH}'")
-        print("请确保study文件存在，或修改STUDY_PATH变量指向正确的文件路径")
-        print("\n可用的.pkl文件:")
-        pkl_files = [f for f in os.listdir(".") if f.endswith(".pkl")]
-        if pkl_files:
-            for f in pkl_files:
-                print(f"  - {f}")
-        else:
-            print("  当前目录下没有找到.pkl文件")
+        print(f"错误: 找不到study文件 {STUDY_PATH}")
         exit(1)
     
     # 从study中加载最佳参数
     best_params = load_best_params_from_study(STUDY_PATH)
     
     if best_params is None:
-        print("\n加载参数失败，程序退出")
+        print("错误: 无法加载最佳参数")
         exit(1)
     
-    # 添加交叉验证参数（如果没有的话）
+    # 添加交叉验证参数
     if 'use_cross_validation' not in best_params:
         best_params['use_cross_validation'] = USE_CROSS_VALIDATION
         best_params['cv_folds'] = CV_FOLDS
-        print(f"\n添加交叉验证参数: {'启用' if USE_CROSS_VALIDATION else '禁用'} {CV_FOLDS}折交叉验证")
     
     # 使用最佳参数训练模型
     print("\n" + "="*70)
     results = train_with_fixed_params(best_params, DATA_PATH, SEED)
     
+    # 获取模型和测试数据
+    model = results.get("model") or results.get("best_model")
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    
+    # 准备测试数据
+    df = pd.read_csv(DATA_PATH)
+    train_df, test_df = train_test_split(
+        df, test_size=0.2, random_state=SEED, stratify=df["材料种类"]
+    )
+    
+    train_data = prepare_material_data(train_df)
+    test_data = prepare_material_data(
+        test_df,
+        scaler=train_data["scaler"],
+        le=train_data["label_encoder"],
+    )
+    
+    # ========== 运行可解释性分析 ==========
     print("\n" + "="*70)
-    # 区分交叉验证结果和普通测试结果
-    if 'mean_test_r2' in results:
-        print(f"模型训练与评估完成，交叉验证平均 R² = {results['mean_test_r2']:.4f} ± {results['std_test_r2']:.4f}")
-    elif 'test_r2' in results:
-        print(f"模型训练完成!")
-        print(f"  最终测试集 R² = {results['test_r2']:.4f}")
-        print(f"  最终测试集 RMSE = {results['test_rmse']:.4f}")
-        print(f"  最终测试集 MAE = {results['test_mae']:.4f}")
+    print("开始可解释性分析")
     print("="*70)
     
+    interpretability_report = run_interpretability_analysis(
+        model=model,
+        test_data=test_data,
+        device=device,
+        batch_size=32
+    )
+    
+    print("\n" + "="*70)
+    print("所有分析完成！")
+    print("="*70)
