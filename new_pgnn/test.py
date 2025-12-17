@@ -6,6 +6,7 @@ import copy
 import joblib
 import json
 import torch
+from datetime import datetime
 from torch.optim.lr_scheduler import OneCycleLR
 import numpy as np
 import pandas as pd
@@ -134,6 +135,10 @@ warnings.filterwarnings("ignore")
 # 数据路径
 DATA_PATH = "3011916164精确材料性能数据.csv"
 
+# 创建带时间戳的结果目录
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+RESULTS_DIR = f"results/run_{TIMESTAMP}"
+
 # 固定随机种子,确保结果可重复
 SEED = 66
 torch.manual_seed(SEED)
@@ -166,10 +171,11 @@ def load_best_params_from_study(study_path):
             print(f"  {key}: {value}")
         
         # 保存最佳参数到JSON文件
-        os.makedirs("results", exist_ok=True)
-        with open("results/loaded_best_params.json", "w", encoding="utf-8") as f:
+        os.makedirs(RESULTS_DIR, exist_ok=True)
+        params_path = os.path.join(RESULTS_DIR, "loaded_best_params.json")
+        with open(params_path, "w", encoding="utf-8") as f:
             json.dump(best_params, f, indent=4, ensure_ascii=False)
-        print(f"\n最佳参数已保存至 results/loaded_best_params.json")
+        print(f"\n最佳参数已保存至 {params_path}")
         
         return best_params
         
@@ -578,7 +584,7 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         print("\n生成交叉验证结果可视化...")
         
         # 创建结果目录
-        os.makedirs("results", exist_ok=True)
+        os.makedirs(RESULTS_DIR, exist_ok=True)
         
         # 折叠性能对比
         fig, ax = plt.subplots(figsize=(10, 6))
@@ -600,7 +606,8 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         # 应用样式
         fig, ax = setup_plot_style(fig, ax)
         
-        plt.savefig("results/cv_performance.png", dpi=300, bbox_inches='tight')
+        cv_perf_path = os.path.join(RESULTS_DIR, "cv_performance.png")
+        plt.savefig(cv_perf_path, dpi=300, bbox_inches='tight')
         plt.close()
         
         # 所有折叠的预测散点图
@@ -633,13 +640,15 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         # 应用样式
         fig, ax = setup_plot_style(fig, ax)
         
-        plt.savefig("results/cv_predictions.png", dpi=300, bbox_inches='tight')
+        cv_pred_path = os.path.join(RESULTS_DIR, "cv_predictions.png")
+        plt.savefig(cv_pred_path, dpi=300, bbox_inches='tight')
         plt.close()
         
         # 保存最佳模型
         if best_model is not None:
-            torch.save(best_model.state_dict(), "results/best_model.pth")
-            print("\n最佳交叉验证模型已保存至 results/best_model.pth")
+            model_path = os.path.join(RESULTS_DIR, "best_model.pth")
+            torch.save(best_model.state_dict(), model_path)
+            print(f"\n最佳交叉验证模型已保存至 {model_path}")
         
         # 返回交叉验证结果
         return {
@@ -754,9 +763,10 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         plt.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig("results/training_results.png", dpi=150)
+        train_results_path = os.path.join(RESULTS_DIR, "training_results.png")
+        plt.savefig(train_results_path, dpi=150)
         plt.close()
-        print("训练结果图已保存至 results/training_results.png")
+        print(f"训练结果图已保存至 {train_results_path}")
     
     # 门控权重可视化
     if hasattr(model, 'last_gate') and model.last_gate is not None:
@@ -783,9 +793,10 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         plt.grid(True, alpha=0.3)
         
         plt.tight_layout()
-        plt.savefig("results/gate_analysis.png", dpi=150)
+        gate_path = os.path.join(RESULTS_DIR, "gate_analysis.png")
+        plt.savefig(gate_path, dpi=150)
         plt.close()
-        print("门控分析图已保存至 results/gate_analysis.png")
+        print(f"门控分析图已保存至 {gate_path}")
     
         # 不确定性可视化
         test_uncertainty_np = eval_results["test_uncertainty"]
@@ -800,12 +811,13 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         plt.legend(prop=chinese_font_prop)
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig("results/uncertainty_visualization.png", dpi=150)
+        uncertainty_path = os.path.join(RESULTS_DIR, "uncertainty_visualization.png")
+        plt.savefig(uncertainty_path, dpi=150)
         plt.close()
-        print("不确定性可视化已保存至 results/uncertainty_visualization.png")
+        print(f"不确定性可视化已保存至 {uncertainty_path}")
     
         # 保存模型
-        model_save_path = "results/best_model_from_study.pth"
+        model_save_path = os.path.join(RESULTS_DIR, "best_model_from_study.pth")
         torch.save(model.state_dict(), model_save_path)
         print(f"模型已保存至 {model_save_path}")
         
@@ -820,9 +832,10 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
             "parameters": params
         }
         
-        with open("results/training_summary.json", "w", encoding="utf-8") as f:
+        summary_path = os.path.join(RESULTS_DIR, "training_summary.json")
+        with open(summary_path, "w", encoding="utf-8") as f:
             json.dump(results_summary, f, indent=4, ensure_ascii=False)
-        print("训练摘要已保存至 results/training_summary.json")
+        print(f"训练摘要已保存至 {summary_path}")
     
     # 返回结果
     results = {
@@ -899,13 +912,15 @@ def predict_on_new_data(model, new_data_path, train_data_path=DATA_PATH):
         plt.title(f'新数据预测结果 (R²={r2:.4f})')
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.savefig("results/new_data_predictions.png", dpi=300, bbox_inches='tight')
+        new_data_pred_path = os.path.join(RESULTS_DIR, "new_data_predictions.png")
+        plt.savefig(new_data_pred_path, dpi=300, bbox_inches='tight')
         plt.close()
-        print("预测结果图已保存至 results/new_data_predictions.png")
+        print(f"预测结果图已保存至 {new_data_pred_path}")
     
     # 保存预测结果
-    results_df.to_csv("results/prediction_results.csv", index=False, encoding="utf-8-sig")
-    print("预测结果已保存至 results/prediction_results.csv")
+    pred_results_path = os.path.join(RESULTS_DIR, "prediction_results.csv")
+    results_df.to_csv(pred_results_path, index=False, encoding="utf-8-sig")
+    print(f"预测结果已保存至 {pred_results_path}")
     
     return results_df
 
@@ -1043,12 +1058,13 @@ def train_with_best_params(params, data_path=DATA_PATH, seed=SEED):
     plt.grid(True, alpha=0.3)
     
     plt.tight_layout()
-    plt.savefig("results/training_results.png", dpi=150)
+    train_results_path = os.path.join(RESULTS_DIR, "training_results.png")
+    plt.savefig(train_results_path, dpi=150)
     plt.close()
-    print("训练结果图已保存至 results/training_results.png")
+    print(f"训练结果图已保存至 {train_results_path}")
     
     # 保存模型
-    model_save_path = "results/best_model_from_study.pth"
+    model_save_path = os.path.join(RESULTS_DIR, "best_model_from_study.pth")
     torch.save(model.state_dict(), model_save_path)
     print(f"模型已保存至 {model_save_path}")
     
@@ -1062,9 +1078,10 @@ def train_with_best_params(params, data_path=DATA_PATH, seed=SEED):
         "parameters": params
     }
     
-    with open("results/training_summary.json", "w", encoding="utf-8") as f:
+    summary_path = os.path.join(RESULTS_DIR, "training_summary.json")
+    with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(results_summary, f, indent=4, ensure_ascii=False)
-    print("训练摘要已保存至 results/training_summary.json")
+    print(f"训练摘要已保存至 {summary_path}")
     
     # 返回结果
     results = {
@@ -1085,11 +1102,12 @@ if __name__ == "__main__":
     print("材料裂纹深度预测 - 从Optuna Study加载最佳参数并训练")
     print("="*70)
     
-    # 确保结果目录存在
-    os.makedirs("results", exist_ok=True)
+    # 确保带时间戳的结果目录存在
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    print(f"结果将保存至: {RESULTS_DIR}\n")
     
     # 指定study文件路径
-    STUDY_PATH = "results\\best_hyperopt_study.pkl"
+    STUDY_PATH = "results\\run_20251216_215109\\hyperopt_study.pkl"
     
     # 检查study文件是否存在
     if not os.path.exists(STUDY_PATH):
@@ -1134,13 +1152,62 @@ if __name__ == "__main__":
     print("开始可解释性分析")
     print("="*70)
     
+    # 确保可解释性分析结果也保存到时间戳子文件夹
     interpretability_report = run_interpretability_analysis(
         model=model,
         test_data=test_data,
         device=device,
-        batch_size=32
+        batch_size=32,
+        save_dir=RESULTS_DIR  # 传入时间戳子文件夹路径
     )
+    
+    # ========== 生成运行摘要 ==========
+    print("\n生成运行摘要...")
+    
+    summary_lines = [
+        "="*70,
+        f"运行时间戳: {TIMESTAMP}",
+        f"数据文件: {DATA_PATH}",
+        f"Study文件: {STUDY_PATH}",
+        "="*70,
+        "\n最佳参数:",
+    ]
+    
+    for key, value in best_params.items():
+        summary_lines.append(f"  {key}: {value}")
+    
+    summary_lines.append("\n模型性能:")
+    if 'mean_test_r2' in results:
+        # 交叉验证结果
+        summary_lines.append(f"  测试集 R² (平均): {results['mean_test_r2']:.4f} ± {results['std_test_r2']:.4f}")
+        summary_lines.append(f"  测试集 RMSE (平均): {results['mean_test_rmse']:.4f}")
+        summary_lines.append(f"  测试集 MAE (平均): {results['mean_test_mae']:.4f}")
+        summary_lines.append(f"  交叉验证折数: {best_params.get('cv_folds', 5)}")
+    else:
+        # 单次分割结果
+        summary_lines.append(f"  测试集 R²: {results['test_r2']:.4f}")
+        summary_lines.append(f"  测试集 RMSE: {results['test_rmse']:.4f}")
+        summary_lines.append(f"  测试集 MAE: {results['test_mae']:.4f}")
+    
+    summary_lines.append("\n可解释性分析:")
+    summary_lines.append(f"  分析报告已生成")
+    
+    summary_lines.append("\n保存的文件:")
+    summary_lines.append(f"  结果目录: {RESULTS_DIR}")
+    
+    summary_text = "\n".join(summary_lines)
+    
+    # 保存摘要到文件
+    summary_file = os.path.join(RESULTS_DIR, "run_summary.txt")
+    with open(summary_file, "w", encoding="utf-8") as f:
+        f.write(summary_text)
+    
+    print(f"\n运行摘要已保存至: {summary_file}")
+    
+    # 同时打印到控制台
+    print("\n" + summary_text)
     
     print("\n" + "="*70)
     print("所有分析完成！")
+    print(f"结果已保存至: {RESULTS_DIR}")
     print("="*70)

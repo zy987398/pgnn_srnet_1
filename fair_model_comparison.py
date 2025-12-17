@@ -63,6 +63,9 @@ USE_PHYSICS_FEATURES_FOR_ML = False  # True: 传统模型使用物理特征, Fal
 # 数据路径
 DATA_PATH = "3011916164精确材料性能数据.csv"
 
+# 结果保存路径
+RESULTS_DIR = os.path.join("results", "compare")
+
 # PGNN超参数 - 从new_pgnn/train.py复制
 PGNN_PARAMS = {
     # 模型架构参数
@@ -84,7 +87,7 @@ PGNN_PARAMS = {
 }
 
 # 预训练模型路径
-PRETRAINED_MODEL_PATH = "results/best_cv_model.pth"
+PRETRAINED_MODEL_PATH = "results\\run_20251217_100959\\best_model.pth"
 
 # ---------------------------------------------------------------------------
 # 传统ML特征工程
@@ -357,7 +360,7 @@ def evaluate_pretrained_pgnn(train_df, test_df, default_params, model_path, devi
 # 可视化
 # ---------------------------------------------------------------------------
 
-def plot_comparison(results, y_test, save_dir="results"):
+def plot_comparison(results, y_test, save_dir=RESULTS_DIR):
     """绘制模型对比图"""
     
     os.makedirs(save_dir, exist_ok=True)
@@ -453,23 +456,19 @@ def main():
     print("公平的模型对比实验 - 传统ML vs PGNN")
     print("="*80)
     print(f"\n数据文件: {DATA_PATH}")
+    print(f"结果保存路径: {RESULTS_DIR}")
     print(f"随机种子: {SEED}")
-    print(f"测试集比例: 20%")
-    print(f"\n特征配置:")
-    print(f"  - PGNN: 使用物理特征（内置）")
-    print(f"  - 传统ML: {'使用物理特征' if USE_PHYSICS_FEATURES_FOR_ML else '仅使用原始特征（公平对比）'}")
     
     # 设置设备
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"使用设备: {device}")
     
-    # 读取数据
-    print("\n读取数据...")
-    df = pd.read_csv(DATA_PATH)
-    print(f"数据集大小: {len(df)} 样本")
+    # 创建结果保存目录
+    os.makedirs(RESULTS_DIR, exist_ok=True)
     
     # 数据划分 - 与new_pgnn/train.py保持一致
     print("\n划分数据集...")
+    df = pd.read_csv(DATA_PATH)
     train_df, test_df = train_test_split(
         df, test_size=0.2, random_state=SEED, stratify=df["材料种类"]
     )
@@ -553,8 +552,7 @@ def main():
         }
     }
     
-    os.makedirs("results", exist_ok=True)
-    results_file = f"results/fair_comparison_results_{'physics' if USE_PHYSICS_FEATURES_FOR_ML else 'basic'}.json"
+    results_file = os.path.join(RESULTS_DIR, f"fair_comparison_results_{'physics' if USE_PHYSICS_FEATURES_FOR_ML else 'basic'}.json")
     with open(results_file, "w", encoding="utf-8") as f:
         json.dump(results_summary, f, indent=4, ensure_ascii=False)
     print(f"\n结果已保存到: {results_file}")

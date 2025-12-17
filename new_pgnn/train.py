@@ -3,6 +3,7 @@ import time
 import warnings
 import copy
 import torch
+from datetime import datetime
 from torch.optim.lr_scheduler import OneCycleLR
 import numpy as np
 import pandas as pd
@@ -26,6 +27,10 @@ warnings.filterwarnings("ignore")
 
 # 数据路径
 DATA_PATH = "3011916164精确材料性能数据.csv"
+
+# 创建带时间戳的结果目录
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+RESULTS_DIR = f"results/run_{TIMESTAMP}"
 
 # 固定随机种子，确保结果可重复
 SEED = 66
@@ -333,10 +338,12 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
     plt.title('验证和测试R²')
     
     # 保存图表
-    os.makedirs("results", exist_ok=True)
+    os.makedirs(RESULTS_DIR, exist_ok=True)
     plt.tight_layout()
-    plt.savefig("results/training_plots.png")
+    training_plots_path = os.path.join(RESULTS_DIR, "training_plots.png")
+    plt.savefig(training_plots_path)
     plt.close()
+    print(f"训练图表已保存至 {training_plots_path}")
     
     # 门控权重可视化（如果模型支持）
     if hasattr(model, 'last_gate') and model.last_gate is not None:
@@ -360,9 +367,10 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
         plt.legend()
         
         plt.tight_layout()
-        plt.savefig("results/gate_analysis.png")
+        gate_path = os.path.join(RESULTS_DIR, "gate_analysis.png")
+        plt.savefig(gate_path)
         plt.close()
-        print("门控分析图已保存至 results/gate_analysis.png")
+        print(f"门控分析图已保存至 {gate_path}")
     
     # 预测可视化
     plt.figure(figsize=(10, 8))
@@ -371,13 +379,16 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
              [test_target_np.min(), test_target_np.max()], 'r--')
     plt.xlabel('实际裂纹深度')
     plt.ylabel('预测裂纹深度')
-    plt.title(f'实际值 vs 预测值 (测试集 R² = {test_r2:.4f})')
-    plt.savefig("results/predictions_visualization.png")
+    plt.title(f'实际值 vs 预测值 (测试集 R² = {test_r2:.4f}')
+    pred_vis_path = os.path.join(RESULTS_DIR, "predictions_visualization.png")
+    plt.savefig(pred_vis_path)
     plt.close()
+    print(f"预测可视化已保存至 {pred_vis_path}")
     
     # 保存模型
-    torch.save(model.state_dict(), "results/train_model.pth")
-    print("模型已保存至 results/train_model.pth")
+    model_path = os.path.join(RESULTS_DIR, "train_model.pth")
+    torch.save(model.state_dict(), model_path)
+    print(f"模型已保存至 {model_path}")
     
     # 不确定性可视化
     plt.figure(figsize=(10, 8))
@@ -388,8 +399,10 @@ def train_with_fixed_params(params, data_path=DATA_PATH, seed=SEED):
     plt.ylabel('裂纹深度')
     plt.title('预测值与不确定性')
     plt.legend()
-    plt.savefig("results/uncertainty_visualization.png")
+    uncertainty_path = os.path.join(RESULTS_DIR, "uncertainty_visualization.png")
+    plt.savefig(uncertainty_path)
     plt.close()
+    print(f"不确定性可视化已保存至 {uncertainty_path}")
     
     # 返回模型和指标
     results = {
@@ -463,13 +476,16 @@ def predict_on_new_data(model, new_data_path, train_data_path=DATA_PATH):
                 [results_df["亚表面裂纹深度"].min(), results_df["亚表面裂纹深度"].max()], 'r--')
         plt.xlabel('实际裂纹深度')
         plt.ylabel('预测裂纹深度')
-        plt.title(f'实际值 vs 预测值 (R² = {r2:.4f})')
-        plt.savefig("results/new_data_predictions.png")
+        plt.title(f'实际值 vs 预测值 (R² = {r2:.4f}')
+        new_pred_path = os.path.join(RESULTS_DIR, "new_data_predictions.png")
+        plt.savefig(new_pred_path)
         plt.close()
+        print(f"新数据预测图已保存至 {new_pred_path}")
     
     # 保存预测结果
-    results_df.to_csv("results/prediction_results.csv", index=False)
-    print("预测结果已保存至 results/prediction_results.csv")
+    pred_results_path = os.path.join(RESULTS_DIR, "prediction_results.csv")
+    results_df.to_csv(pred_results_path, index=False)
+    print(f"预测结果已保存至 {pred_results_path}")
     
     return results_df
 
@@ -546,8 +562,9 @@ if __name__ == "__main__":
     print("使用固定超参数训练PGNN模型")
     print("="*50)
     
-    # 确保结果目录存在
-    os.makedirs("results", exist_ok=True)
+    # 确保带时间戳的结果目录存在
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    print(f"结果将保存至: {RESULTS_DIR}\n")
     
     # 使用固定超参数训练和评估模型
     results = train_with_fixed_params(PARAMS)

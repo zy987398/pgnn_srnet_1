@@ -204,6 +204,16 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda",
         traceback.print_exc()
         return -1.0
 
+    # 准备数据 - 先重构DataFrame
+    train_df = reconstruct_df(train_data)
+    original_size = len(train_df)
+    
+    # 显式应用数据增强
+    if use_augmentation:
+        train_df = augment_dataset(train_df)
+        # 记录增强前后的大小变化，便于调试
+        if len(train_df) > original_size:
+            print(f"  Trial {trial.number}: 应用数据增强 {original_size} -> {len(train_df)} 样本")
 
     augmented_train_data = prepare_material_data(
         train_df,
@@ -265,41 +275,6 @@ def train_with_trial(trial, train_data, val_data, num_materials, device="cuda",
         weight_decay=0.0,
     )
     loss_fn.total_epochs = epochs
-
-    # 准备数据 - 可选数据增强
-    train_df = reconstruct_df(train_data)
-    original_size = len(train_df)
-    
-    # 显式应用数据增强
-    if use_augmentation:
-        train_df = augment_dataset(train_df)
-        # 记录增强前后的大小变化，便于调试
-        if len(train_df) > original_size:
-            print(f"  Trial {trial.number}: 应用数据增强 {original_size} -> {len(train_df)} 样本")
-
-    augmented_train_data = prepare_material_data(
-        train_df,
-        scaler=train_data["scaler"],
-        le=train_data["label_encoder"],
-        # augment参数在函数内部未实际使用，保持为False
-        augment=False,
-    )
-
-    # 创建DataLoader
-    train_dataset = TensorDataset(
-        torch.LongTensor(augmented_train_data["material_ids"]),
-        torch.FloatTensor(augmented_train_data["numeric_features"]),
-        torch.FloatTensor(augmented_train_data["numeric_raw"]),
-        torch.FloatTensor(augmented_train_data["target"]).unsqueeze(1),
-    )
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        drop_last=False,  # 改为False以使用所有数据
-        pin_memory=True,  # 加速数据传输
-        num_workers=0,  # 单进程加载避免额外开销
-    )
 
     val_materials = torch.LongTensor(val_data["material_ids"]).to(device)
     val_raw = torch.FloatTensor(val_data["numeric_raw"]).to(device)
@@ -482,7 +457,7 @@ def objective(trial, df, device, seed, space=None, fixed_params=None):
     return float(np.mean(fold_scores))
 
 
-def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_stage1=30, n_trials_stage2=20, top_k=5, seed=66, symbolic_type="advanced"):
+def run_hyperopt(data_path="new_pgnn/3011916164精确材料性能数据.csv", n_trials_stage1=30, n_trials_stage2=20, top_k=5, seed=66, symbolic_type="advanced", result_dir="results"):
     """
     运行双阶段超参数优化
     
@@ -493,6 +468,7 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_st
         top_k: 用于精炼搜索空间的最佳试验数量
         seed: 随机种子
         symbolic_type: 要使用的符号层类型 ("improved", "advanced", "lightweight")
+        result_dir: 保存结果的目录
     """
     # 设置随机种子
     torch.manual_seed(seed)
@@ -553,14 +529,14 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_st
             "augmentation": True,
             "optimizer": "AdamW",
         }
-        # 创建一个虚拟的完成试验
-        dummy_trial = optuna.trial.create_trial(
-            params=default_params,
-            distributions={},
-            value=0.0,  # 占位值
-            state=TrialState.COMPLETE,
-        )
-        completed_trials = [dummy_trial]
+        # 创建一个简单对象代替虚拟trial
+        class DummyTrial:
+            def __init__(self, params, value):
+                self.params = params
+                self.value = value
+                self.state = TrialState.COMPLETE
+        
+        completed_trials = [DummyTrial(default_params, 0.0)]
         space = define_refined_space(completed_trials, 1)
     else:
         space = define_refined_space(completed_trials, top_k)
@@ -627,26 +603,22 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_st
         # 如果两个阶段都没有完成的试验，创建一个默认study
         print("\n两个阶段都没有完成的试验。使用默认参数。")
         default_study = optuna.create_study(direction="maximize")
-        default_trial = optuna.trial.create_trial(
-            params={
-                "material_embed_dim": 16,
-                "latent_dim": 32,
-                "dropout_rate": 0.15,
-                "lr": 0.001,
-                "epochs": 300,
-                "batch_size": 32,
-                "weight_decay": 0.001,
-                "lambda_complexity": 1e-4,
-                "lambda_physics": 0.2,
-                "patience": 30,
-                "augmentation": True,
-                "optimizer": "AdamW",
-            },
-            distributions={},
-            value=0.0,
-            state=TrialState.COMPLETE,
-        )
-        default_study.add_trial(default_trial)
+        # 直接设置默认参数而不创建trial
+        default_study._best_params = {
+            "material_embed_dim": 16,
+            "latent_dim": 32,
+            "dropout_rate": 0.15,
+            "lr": 0.001,
+            "epochs": 300,
+            "batch_size": 32,
+            "weight_decay": 0.001,
+            "lambda_complexity": 1e-4,
+            "lambda_physics": 0.2,
+            "patience": 30,
+            "augmentation": True,
+            "optimizer": "AdamW",
+        }
+        default_study._best_value = 0.0
         final_study = default_study
     
     # 为了可视化，在final_study中保存两个阶段的study对象
@@ -703,12 +675,17 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_st
         print(f"\n计算超参数重要性时出错: {str(e)}")
     
     # 确保结果目录存在
-    os.makedirs("results", exist_ok=True)
+    os.makedirs(result_dir, exist_ok=True)
+    print(f"\n保存结果到目录: {result_dir}")
     
-    # 保存study对象，以便后续可以恢复
+    # 生成时间戳用于索引
+    timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+    
+    # 保存study对象到结果目录
     try:
-        joblib.dump(final_study, "results/best_hyperopt_study.pkl")
-        print("成功保存study对象到results/best_hyperopt_study.pkl")
+        study_file = f"{result_dir}/hyperopt_study.pkl"
+        joblib.dump(final_study, study_file)
+        print(f"成功保存study对象到{study_file}")
     except Exception as e:
         print(f"保存study对象时出错: {str(e)}")
 
@@ -717,7 +694,7 @@ def run_hyperopt(data_path="3011916164精确材料性能数据.csv", n_trials_st
 
 # 使用最佳超参数重新训练
 def retrain_with_best_params(
-    study, data_path="3011916164精确材料性能数据.csv", seed=66, symbolic_type="advanced"
+    study, data_path="new_pgnn/3011916164精确材料性能数据.csv", seed=66, symbolic_type="advanced", result_dir="results"
 ):
     """
     使用最佳超参数重新训练并评估
@@ -727,6 +704,7 @@ def retrain_with_best_params(
         data_path: 数据文件路径
         seed: 随机种子
         symbolic_type: 要使用的符号层类型 ("improved", "advanced", "lightweight")
+        result_dir: 保存结果的目录
     """
 
     # 读取数据
@@ -1120,9 +1098,15 @@ if __name__ == "__main__":
     # 确保结果目录存在
     os.makedirs("results", exist_ok=True)
 
-    # 设置日志文件
+    # 生成时间戳
     timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-    log_file = f"results/hyperopt_run_{timestamp}.log"
+    
+    # 创建带时间戳的结果子目录
+    result_dir = f"results/run_{timestamp}"
+    os.makedirs(result_dir, exist_ok=True)
+    
+    # 设置日志文件（保存在子目录中）
+    log_file = f"{result_dir}/training.log"
 
     # 重定向所有print输出到日志文件和控制台
     logger = Logger(log_file)
@@ -1148,15 +1132,15 @@ if __name__ == "__main__":
         top_k = 1
         print("[警告] 调试模式: 仅运行少量试验")
     else:
-        n_trials_stage1 = 10
-        n_trials_stage2 = 5
+        n_trials_stage1 = 30
+        n_trials_stage2 = 10
         top_k = 5
         print("正式模式: 运行完整优化过程")
 
     try:
         # 运行双阶段超参数优化
         print(f"开始双阶段超参数优化 (阶段1: {n_trials_stage1}次, 阶段2: {n_trials_stage2}次, 前{top_k}个最佳结果)")
-        study = run_hyperopt(n_trials_stage1=n_trials_stage1, n_trials_stage2=n_trials_stage2, top_k=top_k)
+        study = run_hyperopt(n_trials_stage1=n_trials_stage1, n_trials_stage2=n_trials_stage2, top_k=top_k, result_dir=result_dir)
     except Exception as e:
         print(f"超参数优化过程出错: {str(e)}")
         print(f"错误详情: {traceback.format_exc()}")
@@ -1193,14 +1177,13 @@ if __name__ == "__main__":
     try:
         # 使用最佳参数重新训练
         print("\n开始使用最佳超参数重新训练模型...")
-        # 获取所使用的符号层类型（如果有），否则使用 "lightweight"
         symbolic_type = study.best_params.get("symbolic_type", "advanced")
         print(f"使用符号层类型: {symbolic_type}")
-        model, train_losses, test_r2_history = retrain_with_best_params(study, symbolic_type=symbolic_type)
+        model, train_losses, test_r2_history = retrain_with_best_params(study, symbolic_type=symbolic_type, result_dir=result_dir)
 
         # 详细评估
         print("\n开始详细评估模型...")
-        df = pd.read_csv("3011916164精确材料性能数据.csv")
+        df = pd.read_csv("new_pgnn/3011916164精确材料性能数据.csv")
         train_df, test_df = train_test_split(df, test_size=0.2, random_state=66)
         train_data = prepare_material_data(train_df)
         test_data = prepare_material_data(
@@ -1211,17 +1194,17 @@ if __name__ == "__main__":
 
         results = evaluate_model_detailed(model, test_data)
 
-        # 保存模型
+        # 保存模型和历史到时间戳子目录
         try:
-            torch.save(model.state_dict(), "results/select_model.pth")
-            print("模型已保存至 results/select_model.pth")
+            # 保存模型到时间戳子目录
+            model_file = f"{result_dir}/model.pth"
+            torch.save(model.state_dict(), model_file)
+            print(f"模型已保存至 {model_file}")
 
-            # 保存训练历史
             # 获取完整参数集
             if hasattr(study, "_complete_params") and study._complete_params:
                 complete_params = study._complete_params
             else:
-                # 尝试合并第一阶段参数
                 complete_params = {}
                 if hasattr(study, "_study1") and hasattr(study._study1, "best_params"):
                     complete_params.update(study._study1.best_params)
@@ -1233,11 +1216,16 @@ if __name__ == "__main__":
             history_dict = {
                 "train_losses": train_losses,
                 "test_r2_history": test_r2_history,
-                "best_params": complete_params,  # 使用完整参数
+                "best_params": complete_params,
                 "best_value": study.best_value,
+                "timestamp": timestamp,
+                "symbolic_type": symbolic_type,
             }
-            joblib.dump(history_dict, "results/training_history.pkl")
-            print("训练历史已保存至 results/training_history.pkl")
+            
+            # 保存训练历史到时间戳子目录
+            history_file = f"{result_dir}/training_history.pkl"
+            joblib.dump(history_dict, history_file)
+            print(f"训练历史已保存至 {history_file}")
 
         except Exception as save_err:
             print(f"保存模型时出错: {str(save_err)}")
@@ -1245,13 +1233,11 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"训练或评估过程中出错: {str(e)}")
         print(f"错误详情: {traceback.format_exc()}")
-        model = None
-        train_losses = []
-        test_r2_history = []
-        results = None
 
     try:
         print("\n生成可视化图表...")
+        
+        # 可视化图表也使用时间戳
         # 可视化优化历史 - 双阶段
         fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
 
@@ -1303,11 +1289,11 @@ if __name__ == "__main__":
         ax2.grid(True, alpha=0.3)
 
         plt.tight_layout()
-        plt.savefig("results/improved_hyperopt_results.png", dpi=300)
+        plt.savefig(f"{result_dir}/hyperopt_results.png", dpi=300)
         plt.close(fig)
 
-        if results:  # 只有在有结果时才可视化预测
-            # 预测vs真实值可视化
+        if results:
+            # 预测可视化
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 5))
 
             # 标准预测
@@ -1337,7 +1323,7 @@ if __name__ == "__main__":
             cbar.set_label("预测不确定性", fontproperties=chinese_font_prop)
 
             plt.tight_layout()
-            plt.savefig("results/predictions_visualization.png", dpi=300)
+            plt.savefig(f"{result_dir}/predictions.png", dpi=300)
             plt.close(fig)
 
             # 不确定性可视化
@@ -1372,12 +1358,42 @@ if __name__ == "__main__":
                 ax.grid(True, alpha=0.3)
 
                 plt.tight_layout()
-                plt.savefig("results/uncertainty_visualization.png", dpi=300)
+                plt.savefig(f"{result_dir}/uncertainty.png", dpi=300)
                 plt.close(fig)
             except Exception as e:
                 print(f"绘制不确定性可视化时出错: {str(e)}")
 
-        print("可视化图表已保存到results文件夹")
+        print(f"可视化图表已保存到 {result_dir}")
+        
+        # 在子目录中保存运行摘要
+        summary_file = f"{result_dir}/run_summary.txt"
+        with open(summary_file, 'w', encoding='utf-8') as f:
+            f.write(f"运行时间: {timestamp}\n")
+            f.write(f"最佳验证R²: {study.best_value:.4f}\n")
+            f.write(f"符号层类型: {symbolic_type}\n\n")
+            f.write(f"保存的文件:\n")
+            f.write(f"  - Study对象: hyperopt_study.pkl\n")
+            f.write(f"  - 模型: model.pth\n")
+            f.write(f"  - 训练历史: training_history.pkl\n")
+            f.write(f"  - 优化历史图: hyperopt_results.png\n")
+            f.write(f"  - 预测图: predictions.png\n")
+            f.write(f"  - 不确定性图: uncertainty.png\n")
+            f.write(f"  - 日志文件: ../hyperopt_run_{timestamp}.log\n\n")
+            if complete_params:
+                f.write(f"最佳超参数:\n")
+                for k, v in complete_params.items():
+                    f.write(f"  {k}: {v}\n")
+        print(f"运行摘要已保存到 {summary_file}")
+        
+        # 更新全局索引文件
+        index_file = "results/runs_index.txt"
+        with open(index_file, 'a', encoding='utf-8') as f:
+            f.write(f"\n{'='*60}\n")
+            f.write(f"运行时间: {timestamp}\n")
+            f.write(f"结果目录: run_{timestamp}/\n")
+            f.write(f"最佳R²: {study.best_value:.4f}\n")
+            f.write(f"符号层类型: {symbolic_type}\n")
+        print(f"全局索引已更新: {index_file}")
 
     except Exception as e:
         print(f"生成可视化过程出错: {str(e)}")

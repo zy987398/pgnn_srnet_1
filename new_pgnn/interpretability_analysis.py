@@ -101,13 +101,14 @@ class InterpretabilityAnalyzer:
             "脆性指数 B", "韧性模量比 KIC/E", "应变能密度 U"
         ]
     
-    def analyze_mechanism_attention(self, data_loader, material_type_filter=None):
+    def analyze_mechanism_attention(self, data_loader, material_type_filter=None, save_dir="results"):
         """
         4.4.2.1 物理机理注意力分布分析
         
         参数:
             data_loader: 数据加载器
             material_type_filter: 材料类型过滤 (如 "脆性材料")
+            save_dir: 保存目录路径
         
         返回:
             attention_analysis: 注意力权重分析结果
@@ -161,8 +162,9 @@ class InterpretabilityAnalyzer:
         # 识别主导物理机制
         self._identify_dominant_mechanisms(mean_importance, sorted_indices)
         
-        # 可视化
-        self._plot_attention_heatmap(all_var_weights, all_material_ids)
+        # 可视化 - 使用save_dir
+        save_path = os.path.join(save_dir, "attention_heatmap.png")
+        self._plot_attention_heatmap(all_var_weights, all_material_ids, save_path=save_path)
         
         return {
             'mean_importance': mean_importance,
@@ -206,8 +208,11 @@ class InterpretabilityAnalyzer:
         if importance[15] > 0.10:  # 脆性指数
             print("  ✓ 模型区分了脆性/韧性断裂模式")
     
-    def _plot_attention_heatmap(self, weights, material_ids, save_path="results/attention_heatmap.png"):
+    def _plot_attention_heatmap(self, weights, material_ids, save_path):
         """绘制注意力热图"""
+        # 确保保存目录存在
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
         fig, axes = plt.subplots(1, 2, figsize=(16, 6))
         
         # 左图: 所有样本的注意力热图
@@ -251,9 +256,12 @@ class InterpretabilityAnalyzer:
         plt.close()
         print(f"\n注意力热图已保存: {save_path}")
     
-    def analyze_symbolic_topology(self, data_loader):
+    def analyze_symbolic_topology(self, data_loader, save_dir="results"):
         """
         4.4.2.2 符号算子拓扑分析
+        
+        参数:
+            save_dir: 保存目录路径
         
         返回:
             topology_analysis: 算子使用频率和拓扑结构
@@ -308,8 +316,9 @@ class InterpretabilityAnalyzer:
         # 物理意义解释
         self._interpret_operator_topology(mean_op_weights, operators)
         
-        # 可视化
-        self._plot_operator_topology(all_op_weights, operators)
+        # 可视化 - 使用save_dir
+        save_path = os.path.join(save_dir, "operator_topology.png")
+        self._plot_operator_topology(all_op_weights, operators, save_path=save_path)
         
         return {
             'mean_weights': mean_op_weights,
@@ -346,8 +355,11 @@ class InterpretabilityAnalyzer:
         if weights[operators.index('^2')] > 0.15:
             print("  ✓ 高频激活^2算子 → 模型识别能量密度关系")
     
-    def _plot_operator_topology(self, weights, operators, save_path="results/operator_topology.png"):
+    def _plot_operator_topology(self, weights, operators, save_path):
         """绘制算子拓扑图"""
+        # 确保保存目录存在
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
         fig, axes = plt.subplots(1, 2, figsize=(14, 5))
         
         # 左图: 算子权重箱线图
@@ -391,13 +403,14 @@ class InterpretabilityAnalyzer:
         plt.close()
         print(f"\n算子拓扑图已保存: {save_path}")
     
-    def analyze_coefficient_sensitivity(self, data_loader, varying_feature_idx=0):
+    def analyze_coefficient_sensitivity(self, data_loader, varying_feature_idx=0, save_dir="results"):
         """
         4.4.2.3 唯象系数敏感度分析
         
         参数:
             data_loader: 数据加载器
             varying_feature_idx: 要分析的变化特征索引 (默认0=莫氏硬度H)
+            save_dir: 保存目录路径
         
         返回:
             sensitivity_analysis: 系数随材料属性的演化轨迹
@@ -456,8 +469,9 @@ class InterpretabilityAnalyzer:
             trend = "正相关" if correlation > 0.1 else ("负相关" if correlation < -0.1 else "无关")
             print(f"{coeff_name:15s}: 相关系数 r={correlation:6.3f} ({trend})")
         
-        # 可视化
-        self._plot_coefficient_evolution(all_coeffs, varying_feature, feature_name, coeff_names)
+        # 可视化 - 使用save_dir
+        save_path = os.path.join(save_dir, "coefficient_sensitivity.png")
+        self._plot_coefficient_evolution(all_coeffs, varying_feature, feature_name, coeff_names, save_path=save_path)
         
         # 发现潜在的无量纲物理数
         self._discover_dimensionless_numbers(all_coeffs, all_features)
@@ -469,9 +483,11 @@ class InterpretabilityAnalyzer:
             'coeff_names': coeff_names
         }
     
-    def _plot_coefficient_evolution(self, coeffs, feature, feature_name, coeff_names, 
-                                    save_path="results/coefficient_sensitivity.png"):
+    def _plot_coefficient_evolution(self, coeffs, feature, feature_name, coeff_names, save_path):
         """绘制系数演化图"""
+        # 确保保存目录存在
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        
         fig, axes = plt.subplots(2, 2, figsize=(14, 10))
         axes = axes.flatten()
         
@@ -541,14 +557,18 @@ class InterpretabilityAnalyzer:
         print("生成完整可解释性分析报告")
         print("="*70)
         
-        # 1. 物理机理注意力分析
-        attention_result = self.analyze_mechanism_attention(data_loader)
+        # 1. 物理机理注意力分析 - 传递save_dir
+        attention_result = self.analyze_mechanism_attention(data_loader, save_dir=save_dir)
         
-        # 2. 符号算子拓扑分析
-        topology_result = self.analyze_symbolic_topology(data_loader)
+        # 2. 符号算子拓扑分析 - 传递save_dir
+        topology_result = self.analyze_symbolic_topology(data_loader, save_dir=save_dir)
         
-        # 3. 唯象系数敏感度分析
-        sensitivity_result = self.analyze_coefficient_sensitivity(data_loader, varying_feature_idx=0)
+        # 3. 唯象系数敏感度分析 - 传递save_dir
+        sensitivity_result = self.analyze_coefficient_sensitivity(
+            data_loader, 
+            varying_feature_idx=0, 
+            save_dir=save_dir
+        )
         
         # 保存JSON报告
         report = {
@@ -590,7 +610,7 @@ class InterpretabilityAnalyzer:
 
 
 # ========== 使用示例 ==========
-def run_interpretability_analysis(model, test_data, device, batch_size=32):
+def run_interpretability_analysis(model, test_data, device, batch_size=32, save_dir="results"):
     """
     运行完整的可解释性分析
     
@@ -599,6 +619,7 @@ def run_interpretability_analysis(model, test_data, device, batch_size=32):
         test_data: 测试数据字典
         device: 设备
         batch_size: 批次大小
+        save_dir: 保存目录路径
     """
     from torch.utils.data import TensorDataset, DataLoader
     
@@ -614,7 +635,7 @@ def run_interpretability_analysis(model, test_data, device, batch_size=32):
     # 创建分析器
     analyzer = InterpretabilityAnalyzer(model)
     
-    # 生成完整报告
-    report = analyzer.generate_full_report(test_loader)
+    # 生成完整报告 - 传递save_dir
+    report = analyzer.generate_full_report(test_loader, save_dir=save_dir)
     
     return report
