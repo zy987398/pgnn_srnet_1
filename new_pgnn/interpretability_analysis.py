@@ -213,43 +213,57 @@ class InterpretabilityAnalyzer:
         # 确保保存目录存在
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
-        fig, axes = plt.subplots(1, 2, figsize=(16, 6))
+        # 只显示单图（垂直条形图）
+        fig, ax = plt.subplots(figsize=(14, 8))
         
-        # 左图: 所有样本的注意力热图
-        ax1 = axes[0]
-        im1 = ax1.imshow(weights.T, aspect='auto', cmap='YlOrRd', interpolation='nearest')
-        ax1.set_xlabel('样本索引', fontsize=12, fontproperties=chinese_font_prop)
-        ax1.set_ylabel('物理特征', fontsize=12, fontproperties=chinese_font_prop)
-        ax1.set_title('物理机理注意力分布热图', fontsize=14, fontweight='bold', fontproperties=chinese_font_prop)
-        ax1.set_yticks(range(len(self.feature_names)))
-        ax1.set_yticklabels(self.feature_names, fontsize=9, fontproperties=chinese_font_prop)
+        # # 左图: 所有样本的注意力热图 (已注释)
+        # ax1 = axes[0]
+        # im1 = ax1.imshow(weights.T, aspect='auto', cmap='YlOrRd', interpolation='nearest')
+        # ax1.set_xlabel('样本索引', fontsize=12, fontproperties=chinese_font_prop)
+        # ax1.set_ylabel('物理特征', fontsize=12, fontproperties=chinese_font_prop)
+        # ax1.set_title('物理机理注意力分布热图', fontsize=14, fontweight='bold', fontproperties=chinese_font_prop)
+        # ax1.set_yticks(range(len(self.feature_names)))
+        # ax1.set_yticklabels(self.feature_names, fontsize=9, fontproperties=chinese_font_prop)
+        # cbar1 = plt.colorbar(im1, ax=ax1)
+        # cbar1.set_label('注意力权重', fontproperties=chinese_font_prop)
+        # for label in ax1.get_xticklabels():
+        #     label.set_fontproperties(chinese_font_prop)
         
-        # 为colorbar添加中文标签
-        cbar1 = plt.colorbar(im1, ax=ax1)
-        cbar1.set_label('注意力权重', fontproperties=chinese_font_prop)
-        
-        # 应用中文字体到所有刻度标签
-        for label in ax1.get_xticklabels():
-            label.set_fontproperties(chinese_font_prop)
-        
-        # 右图: 平均注意力柱状图
-        ax2 = axes[1]
+        # 计算平均注意力权重
         mean_weights = weights.mean(axis=0)
         std_weights = weights.std(axis=0)
         indices = np.argsort(mean_weights)[::-1][:15]  # 显示前15个
         
-        y_pos = np.arange(len(indices))
-        ax2.barh(y_pos, mean_weights[indices], xerr=std_weights[indices], 
-                 color='steelblue', alpha=0.8, capsize=3)
-        ax2.set_yticks(y_pos)
-        ax2.set_yticklabels([self.feature_names[i] for i in indices], fontsize=10, fontproperties=chinese_font_prop)
-        ax2.set_xlabel('平均注意力权重', fontsize=12, fontproperties=chinese_font_prop)
-        ax2.set_title('Top-15 物理特征重要性', fontsize=14, fontweight='bold', fontproperties=chinese_font_prop)
-        ax2.grid(axis='x', alpha=0.3)
+        # 获取排序后的数据
+        sorted_means = mean_weights[indices]
+        sorted_stds = std_weights[indices]
+        sorted_labels = [self.feature_names[i] for i in indices]
         
-        # 应用中文字体到所有刻度标签
-        for label in ax2.get_xticklabels():
+        # 垂直条形图：横坐标是物理特征，纵坐标是数值
+        x_positions = np.arange(len(indices))
+        bars = ax.bar(x_positions, sorted_means, yerr=sorted_stds,
+                      capsize=4, color='steelblue', edgecolor='black', alpha=0.8)
+        
+        # 设置坐标轴
+        ax.set_xticks(x_positions)
+        ax.set_xticklabels(sorted_labels, rotation=45, ha='right', fontsize=10, 
+                          fontproperties=chinese_font_prop)
+        ax.set_xlabel('物理特征', fontsize=12, fontweight='bold', fontproperties=chinese_font_prop)
+        ax.set_ylabel('平均注意力权重', fontsize=12, fontweight='bold', fontproperties=chinese_font_prop)
+        ax.set_title('Top-15 物理特征重要性', fontsize=14, fontweight='bold', fontproperties=chinese_font_prop)
+        
+        # 添加网格线
+        ax.yaxis.grid(True, linestyle='--', alpha=0.7)
+        ax.set_axisbelow(True)
+        
+        # 应用中文字体到刻度标签
+        for label in ax.get_yticklabels():
             label.set_fontproperties(chinese_font_prop)
+        
+        # 在条形上方添加数值标注
+        for i, (bar, mean_val) in enumerate(zip(bars, sorted_means)):
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + sorted_stds[i] + 0.01,
+                   f'{mean_val:.3f}', ha='center', va='bottom', fontsize=8)
         
         plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches='tight')

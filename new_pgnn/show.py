@@ -4,7 +4,7 @@ import os
 print("=== 提取最佳超参数 ===")
 
 # 首先尝试从study对象获取参数
-study_path = "results/best_hyperopt_study.pkl"
+study_path = "results\\run_20251216_215109\\hyperopt_study.pkl"
 if os.path.exists(study_path):
     print(f"从 {study_path} 加载study对象...")
     study = joblib.load(study_path)

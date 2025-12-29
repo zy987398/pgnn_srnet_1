@@ -51,8 +51,8 @@ PARAMS = {
     "epochs": 350,               # 训练轮数
     "batch_size": 16,            # 批次大小
     "lr": 0.0011173842752625436, # 学习率
-    "patience": 40,              # 早停参数
-    "augmentation": True,       # 是否使用数据增强
+    "patience": 55,              # 早停参数
+    "augmentation": False,       # 是否使用数据增强
     "optimizer": "AdamW",        # 优化器
     "weight_decay": 0.0066923795400554925,      # 权重衰减
     "lambda_complexity": 3.4069890537972935e-05,  # 复杂度损失权重

@@ -16,6 +16,7 @@ from sklearn.model_selection import train_test_split, StratifiedKFold
 from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
 from torch.utils.data import TensorDataset, DataLoader
 from interpretability_analysis import run_interpretability_analysis
+from symbolic_decoder import SymbolicDecoder, extract_formula
 
 # 配置matplotlib支持中文显示
 plt.rcParams['font.sans-serif'] = ['Microsoft YaHei', 'SimHei', 'SimSun', 'KaiTi', 'FangSong']
@@ -1206,6 +1207,92 @@ if __name__ == "__main__":
     
     # 同时打印到控制台
     print("\n" + summary_text)
+    
+    # ========== 提取符号公式 ==========
+    print("\n" + "="*70)
+    print("提取符号物理公式")
+    print("="*70)
+    
+    try:
+        # 准备测试数据张量
+        test_materials = torch.LongTensor(test_data["material_ids"]).to(device)
+        test_features = torch.FloatTensor(test_data["numeric_features"]).to(device)
+        
+        # 创建符号解码器 - 使用原始物理特征
+        decoder = SymbolicDecoder(
+            model,
+            feature_threshold=0.08,  # 特征权重阈值
+            coeff_threshold=1e-3,    # 系数阈值
+            simplify_coeffs=True,
+            decimal_places=3,
+            use_raw_features=True,   # 使用原始物理特征而非聚合符号
+            expand_formula=True      # 展开多项式
+        )
+        
+        # 解码公式
+        formula = decoder.decode(test_materials, test_features)
+        
+        # 打印完整报告
+        print(decoder.get_full_report(formula))
+        
+        # 保存公式到文件
+        formula_dir = os.path.join(RESULTS_DIR, "formula")
+        os.makedirs(formula_dir, exist_ok=True)
+        
+        # 保存文本报告
+        formula_txt_path = os.path.join(formula_dir, "extracted_formula.txt")
+        with open(formula_txt_path, 'w', encoding='utf-8') as f:
+            f.write(decoder.get_full_report(formula))
+        print(f"\n公式报告已保存至: {formula_txt_path}")
+        
+        # 保存JSON格式（包含易读公式）
+        readable_formula = str(formula.sympy_expr).replace('**', '^').replace('*', '·').replace('K_{IC}', 'K_IC').replace('sqrt', '√').replace('pi', 'π')
+        formula_json_path = os.path.join(formula_dir, "extracted_formula.json")
+        formula_json = {
+            'readable_formula': readable_formula,
+            'feature_aggregation': formula.feature_aggregation,
+            'polynomial_terms': formula.polynomial_terms,
+            'operator_term': formula.operator_term,
+            'gate_value': float(formula.gate_value),
+            'latex_formula': formula.simplified_latex,
+            'dominant_features': formula.dominant_features,
+            'dominant_operator': formula.dominant_operator
+        }
+        with open(formula_json_path, 'w', encoding='utf-8') as f:
+            json.dump(formula_json, f, ensure_ascii=False, indent=2)
+        print(f"公式JSON已保存至: {formula_json_path}")
+        
+        # 打印易读的公式和符号说明
+        print("\n" + "="*70)
+        print("                    提取的物理公式")
+        print("="*70)
+        print(f"\n  h = {readable_formula}")
+        print("\n" + "-"*70)
+        print("符号说明:")
+        print("-"*70)
+        print("  H      = 莫氏硬度 (Hardness) [GPa]")
+        print("  E      = 弹性模量 (Elastic Modulus) [GPa]")
+        print("  K_c    = 断裂韧性 (Fracture Toughness) [MPa·√m]")
+        print("  d      = 磨粒粒径 (Grain Size) [μm]")
+        print("  σ      = 磨削压力 (Stress) [MPa]")
+        print("  v      = 磨削速度 (Velocity) [m/s]")
+        print("  π      = 圆周率 ≈ 3.14159")
+        print("="*70)
+        
+        # 添加到摘要
+        summary_lines.append("\n符号公式提取:")
+        summary_lines.append(f"  主导特征: {', '.join([f[0] for f in formula.dominant_features[:3]])}")
+        summary_lines.append(f"  主导算子: {formula.dominant_operator}")
+        summary_lines.append(f"  门控值: {formula.gate_value:.3f}")
+        summary_lines.append(f"  公式文件: {formula_txt_path}")
+        
+        # 更新摘要文件
+        with open(summary_file, "w", encoding="utf-8") as f:
+            f.write("\n".join(summary_lines))
+            
+    except Exception as e:
+        print(f"公式提取失败: {e}")
+        traceback.print_exc()
     
     print("\n" + "="*70)
     print("所有分析完成！")
