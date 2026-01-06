@@ -101,6 +101,32 @@ class InterpretabilityAnalyzer:
             "脆性指数 B", "韧性模量比 KIC/E", "应变能密度 U"
         ]
     
+    def _get_feature_symbols(self):
+        """获取特征符号（用于图表显示）- 与论文表格对应"""
+        return [
+            # 原始特征 (6个) - 对应论文中的输入特征
+            r"$H$",              # Mohs hardness
+            r"$E$",              # Elastic modulus
+            r"$K_c$",            # Fracture toughness
+            r"$d$",              # Abrasive grain size
+            r"$\sigma$",         # Grinding pressure
+            r"$v$",              # Grinding velocity
+            # 物理特征 (12个) - 按表格顺序
+            r"$G$",              # Griffith Energy
+            r"$K_r$",            # Stress Intensity Ratio
+            r"$H_p$",            # Hall-Petch Term
+            r"$\chi$",           # Crack Shielding Factor
+            r"$\rho_1$",         # Load-Strength Ratio
+            r"$\rho_2$",         # Power-Strength Ratio
+            r"$d_c$",            # Critical BDT Depth
+            r"$R_a$",            # Critical Crack Ratio
+            r"$R_p$",            # Plastic Zone Ratio
+            r"$B$",              # Brittleness Index
+            r"$R_k$",            # Toughness-Modulus Ratio
+            r"$U$"               # Strain Energy Density
+        ]
+
+    
     def analyze_mechanism_attention(self, data_loader, material_type_filter=None, save_dir="results"):
         """
         4.4.2.1 物理机理注意力分布分析
@@ -213,21 +239,13 @@ class InterpretabilityAnalyzer:
         # 确保保存目录存在
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
         
-        # 只显示单图（垂直条形图）
-        fig, ax = plt.subplots(figsize=(14, 8))
+        # 设置 Times New Roman 字体
+        plt.rcParams['font.family'] = 'serif'
+        plt.rcParams['font.serif'] = ['Times New Roman']
+        plt.rcParams['mathtext.fontset'] = 'stix'  # 数学符号使用STIX字体（类似Times）
         
-        # # 左图: 所有样本的注意力热图 (已注释)
-        # ax1 = axes[0]
-        # im1 = ax1.imshow(weights.T, aspect='auto', cmap='YlOrRd', interpolation='nearest')
-        # ax1.set_xlabel('样本索引', fontsize=12, fontproperties=chinese_font_prop)
-        # ax1.set_ylabel('物理特征', fontsize=12, fontproperties=chinese_font_prop)
-        # ax1.set_title('物理机理注意力分布热图', fontsize=14, fontweight='bold', fontproperties=chinese_font_prop)
-        # ax1.set_yticks(range(len(self.feature_names)))
-        # ax1.set_yticklabels(self.feature_names, fontsize=9, fontproperties=chinese_font_prop)
-        # cbar1 = plt.colorbar(im1, ax=ax1)
-        # cbar1.set_label('注意力权重', fontproperties=chinese_font_prop)
-        # for label in ax1.get_xticklabels():
-        #     label.set_fontproperties(chinese_font_prop)
+        # 只显示单图（垂直条形图）
+        fig, ax = plt.subplots(figsize=(14, 7))
         
         # 计算平均注意力权重
         mean_weights = weights.mean(axis=0)
@@ -237,37 +255,42 @@ class InterpretabilityAnalyzer:
         # 获取排序后的数据
         sorted_means = mean_weights[indices]
         sorted_stds = std_weights[indices]
-        sorted_labels = [self.feature_names[i] for i in indices]
+        
+        # 使用符号而非中文名称
+        feature_symbols = self._get_feature_symbols()
+        sorted_labels = [feature_symbols[i] for i in indices]
         
         # 垂直条形图：横坐标是物理特征，纵坐标是数值
         x_positions = np.arange(len(indices))
         bars = ax.bar(x_positions, sorted_means, yerr=sorted_stds,
                       capsize=4, color='steelblue', edgecolor='black', alpha=0.8)
         
-        # 设置坐标轴
+        # 设置坐标轴（英文标签）- 横坐标标签水平显示
         ax.set_xticks(x_positions)
-        ax.set_xticklabels(sorted_labels, rotation=45, ha='right', fontsize=10, 
-                          fontproperties=chinese_font_prop)
-        ax.set_xlabel('物理特征', fontsize=12, fontweight='bold', fontproperties=chinese_font_prop)
-        ax.set_ylabel('平均注意力权重', fontsize=12, fontweight='bold', fontproperties=chinese_font_prop)
-        ax.set_title('Top-15 物理特征重要性', fontsize=14, fontweight='bold', fontproperties=chinese_font_prop)
+        ax.set_xticklabels(sorted_labels, rotation=0, ha='center', fontsize=14)
+        ax.set_xlabel('Physical Features', fontsize=20)
+        ax.set_ylabel('Mean Attention Weight', fontsize=20)
         
         # 添加网格线
         ax.yaxis.grid(True, linestyle='--', alpha=0.7)
         ax.set_axisbelow(True)
         
-        # 应用中文字体到刻度标签
+        # 设置刻度标签字体大小
         for label in ax.get_yticklabels():
-            label.set_fontproperties(chinese_font_prop)
+            label.set_fontsize(12)
         
         # 在条形上方添加数值标注
         for i, (bar, mean_val) in enumerate(zip(bars, sorted_means)):
-            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + sorted_stds[i] + 0.01,
-                   f'{mean_val:.3f}', ha='center', va='bottom', fontsize=8)
+            ax.text(bar.get_x() + bar.get_width()/2, bar.get_height() + sorted_stds[i] + 0.005,
+                   f'{mean_val:.3f}', ha='center', va='bottom', fontsize=9)
         
         plt.tight_layout()
         plt.savefig(save_path, dpi=300, bbox_inches='tight')
         plt.close()
+        
+        # 恢复默认字体设置
+        plt.rcParams['font.family'] = 'sans-serif'
+        
         print(f"\n注意力热图已保存: {save_path}")
     
     def analyze_symbolic_topology(self, data_loader, save_dir="results"):

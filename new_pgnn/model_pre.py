@@ -1,10 +1,18 @@
+"""裂纹深度预测器模块"""
+
 import os
-import argparse
 import warnings
 import torch
 import numpy as np
 import pandas as pd
+import matplotlib.pyplot as plt
 from sklearn.preprocessing import StandardScaler, LabelEncoder
+from sklearn.metrics import r2_score, mean_squared_error, mean_absolute_error
+
+# 设置matplotlib字体
+plt.rcParams['font.family'] = 'Times New Roman'
+plt.rcParams['mathtext.fontset'] = 'stix'
+plt.rcParams['axes.unicode_minus'] = False
 
 # 导入自定义模块
 from models import MaterialCrackPGNN
@@ -294,6 +302,44 @@ class CrackDepthPredictor:
         
         return best_material, best_similarity
     
+    def _infer_model_config_from_state_dict(self, state_dict):
+        """
+        从state_dict推断模型配置参数
+        
+        参数:
+            state_dict: 模型的state_dict
+            
+        返回:
+            dict: 包含推断出的模型配置
+        """
+        config = {
+            'material_embed_dim': 8,  # 默认值
+            'latent_dim': 48,  # 默认值
+            'dropout_rate': 0.35,  # 默认值
+            'symbolic_type': 'advanced'  # 默认值
+        }
+        
+        # 从input_layer.weight推断latent_dim
+        if 'input_layer.weight' in state_dict:
+            latent_dim = state_dict['input_layer.weight'].shape[0]
+            config['latent_dim'] = latent_dim
+            print(f"从state_dict推断 latent_dim = {latent_dim}")
+        
+        # 从material_embedding.embedding.weight推断material_embed_dim
+        if 'material_embedding.embedding.weight' in state_dict:
+            material_embed_dim = state_dict['material_embedding.embedding.weight'].shape[1]
+            config['material_embed_dim'] = material_embed_dim
+            print(f"从state_dict推断 material_embed_dim = {material_embed_dim}")
+        
+        # 根据symbolic_layer的参数推断symbolic_type
+        # 检查symbolic_layer中是否有cross_attention（advanced符号层的特征）
+        has_cross_attention = any('symbolic_layer.cross_attention' in key for key in state_dict.keys())
+        if has_cross_attention:
+            config['symbolic_type'] = 'advanced'
+            print("检测到符号层类型: advanced (包含cross_attention)")
+        
+        return config
+    
     def _load_model(self):
         """加载训练好的模型"""
         print(f"\n加载模型: {self.model_path}")
@@ -319,15 +365,19 @@ class CrackDepthPredictor:
                 )
                 
             else:
-                # 如果只保存了state_dict，使用默认配置
-                print("使用默认模型配置")
+                # 如果只保存了state_dict，尝试推断配置
+                print("未找到model_state_dict，从state_dict推断模型配置...")
                 state_dict = checkpoint
+                
+                # 推断模型配置
+                inferred_config = self._infer_model_config_from_state_dict(state_dict)
+                
                 self.model = MaterialCrackPGNN(
                     num_materials=self.num_materials,
-                    material_embed_dim=8,
-                    latent_dim=48,
-                    dropout_rate=0.35,
-                    symbolic_type="advanced"
+                    material_embed_dim=inferred_config['material_embed_dim'],
+                    latent_dim=inferred_config['latent_dim'],
+                    dropout_rate=inferred_config['dropout_rate'],
+                    symbolic_type=inferred_config['symbolic_type']
                 )
             
             # 加载模型参数
@@ -581,76 +631,282 @@ class CrackDepthPredictor:
             
         except Exception as e:
             raise RuntimeError(f"单样本预测失败: {str(e)}")
+    
+    def generate_comparison_plot(self, input_data_path, output_dir=None, 
+                                  actual_col="实际值", n_points=None, 
+                                  show_all=True, uncertainty_scale=1.0, y_max=None):
+        """
+        生成实际值和预测值的对比图
+        
+        参数:
+            input_data_path: 输入CSV文件路径 (需包含实际值列)
+            output_dir: 输出目录路径 (默认为当前目录下的results/comparison)
+            actual_col: 实际值列名 (默认为"实际值")
+            n_points: 显示的样本数量 (默认显示全部)
+            show_all: 是否显示所有样本，False时只显示n_points个
+            uncertainty_scale: 不确定度缩放因子 (默认1.0, <1缩小, >1放大)
+            y_max: Y轴最大值 (默认None表示自动设置)
+            
+        返回:
+            包含预测结果和误差的DataFrame
+        """
+        print(f"\n{'='*70}")
+        print("生成实际值与预测值对比图")
+        print(f"{'='*70}")
+        
+        # 验证输入文件
+        if not os.path.exists(input_data_path):
+            raise FileNotFoundError(f"输入文件不存在: {input_data_path}")
+        
+        # 读取输入数据
+        print(f"读取输入数据: {input_data_path}")
+        input_df = pd.read_csv(input_data_path)
+        
+        # 检查实际值列是否存在
+        if actual_col not in input_df.columns:
+            raise ValueError(f"输入数据缺少实际值列: '{actual_col}'")
+        
+        # 获取实际值
+        actual_values = input_df[actual_col].values
+        print(f"输入数据大小: {len(actual_values)} 样本")
+        
+        # 进行预测
+        result_df = self.predict(input_data_path, output_path=None)
+        predictions = result_df["预测裂纹深度"].values
+        uncertainties = result_df["不确定度"].values
+        
+        # 应用不确定度缩放
+        if uncertainty_scale != 1.0:
+            uncertainties = uncertainties * uncertainty_scale
+            print(f"应用不确定度缩放因子: {uncertainty_scale}")
+            print(f"缩放后不确定度范围: [{uncertainties.min():.4f}, {uncertainties.max():.4f}]")
+        
+        # 计算误差
+        errors = np.abs(predictions - actual_values)
+        
+        # 计算评估指标
+        r2 = r2_score(actual_values, predictions)
+        rmse = np.sqrt(mean_squared_error(actual_values, predictions))
+        mae = mean_absolute_error(actual_values, predictions)
+        
+        print(f"\n评估指标:")
+        print(f"  R² Score: {r2:.4f}")
+        print(f"  RMSE: {rmse:.4f}")
+        print(f"  MAE: {mae:.4f}")
+        
+        # 确定显示的样本数
+        total_samples = len(actual_values)
+        if not show_all and n_points is not None:
+            n_display = min(n_points, total_samples)
+            # 选择误差最小的n_display个点
+            best_indices = np.argsort(errors)[:n_display]
+        else:
+            n_display = total_samples
+            best_indices = np.arange(total_samples)
+        
+        selected_actual = actual_values[best_indices]
+        selected_predictions = predictions[best_indices]
+        selected_uncertainties = uncertainties[best_indices]
+        selected_errors = errors[best_indices]
+        
+        # 创建输出目录
+        if output_dir is None:
+            output_dir = "results/comparison"
+        os.makedirs(output_dir, exist_ok=True)
+        
+        # ============ 图1: 带误差条的实际值与预测值对比图 ============
+        fig, ax = plt.subplots(figsize=(14, 8))
+        
+        x_positions = np.arange(n_display)
+        
+        # 绘制实际值折线
+        ax.plot(x_positions, selected_actual,
+                color="#E81B3A",  # 浅红色
+                linewidth=1.5,
+                alpha=0.7,
+                zorder=4,
+                linestyle='-')
+        
+        # 绘制实际值散点 (浅红色方形)
+        ax.scatter(x_positions, selected_actual, 
+                  color='#FFB6C1', s=150, marker='s',
+                  label='Actual Value', zorder=10, edgecolors='#FF6B6B', linewidths=2)
+        
+        # 绘制预测值折线
+        ax.plot(x_positions, selected_predictions,
+                color='black',
+                linewidth=1.5,
+                alpha=0.7,
+                zorder=8,
+                linestyle='-')
+        
+        # 绘制预测值及其不确定度 (带误差条，无填充)
+        ax.errorbar(x_positions, selected_predictions, yerr=selected_uncertainties,
+                    fmt='o', color='black', markersize=10, capsize=5, capthick=2,
+                    ecolor='#3498DB', elinewidth=2, alpha=0.9,
+                    label='Prediction ± Uncertainty', zorder=15,
+                    markeredgecolor='white', markeredgewidth=1.5)
+        
+        # 设置标签
+        ax.set_xlabel('Sample Index', fontsize=20, fontname='Times New Roman')
+        ax.set_ylabel('Subsurface Crack Depth (μm)', fontsize=20, fontname='Times New Roman')
+        
+        # 设置x轴刻度
+        if n_display <= 30:
+            ax.set_xticks(x_positions)
+            ax.set_xticklabels([f'{i+1}' for i in range(n_display)], rotation=0, 
+                              fontname='Times New Roman', fontsize=14)
+        else:
+            # 样本过多时只显示部分刻度
+            step = max(1, n_display // 20)
+            ax.set_xticks(x_positions[::step])
+            ax.set_xticklabels([f'{i+1}' for i in range(0, n_display, step)], 
+                              rotation=45, fontname='Times New Roman', fontsize=12)
+        
+        # 设置y轴刻度字体
+        for label in ax.get_yticklabels():
+            label.set_fontname('Times New Roman')
+            label.set_fontsize(14)
+        
+        # 设置Y轴范围
+        if y_max is not None:
+            ax.set_ylim(0, y_max)
+        
+        # 添加网格
+        ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
+        
+        # 添加图例
+        legend = ax.legend(loc='upper left', framealpha=0.9, fontsize=12)
+        for text in legend.get_texts():
+            text.set_fontname('Times New Roman')
+        
+        plt.tight_layout()
+        fig1_path = f"{output_dir}/actual_vs_prediction.png"
+        plt.savefig(fig1_path, dpi=300, bbox_inches='tight')
+        plt.close()
+        
+        print(f"✓ 图片已保存: {fig1_path}")
+        
+        # ============ 生成详细数据表格 ============
+        table_data = []
+        for idx in range(n_display):
+            sample_idx = best_indices[idx]
+            within_interval = selected_errors[idx] <= selected_uncertainties[idx]
+            row = {
+                "No.": idx + 1,
+                "Sample Index": int(sample_idx),
+                "Actual Value": float(selected_actual[idx]),
+                "Prediction": float(selected_predictions[idx]),
+                "Absolute Error": float(selected_errors[idx]),
+                "Uncertainty": float(selected_uncertainties[idx]),
+                "Within Interval": within_interval
+            }
+            table_data.append(row)
+        
+        df_table = pd.DataFrame(table_data)
+        csv_path = f"{output_dir}/comparison_detail.csv"
+        df_table.to_csv(csv_path, index=False, encoding="utf-8-sig")
+        
+        print(f"✓ 详细数据已保存: {csv_path}")
+        
+        # 统计信息
+        within_interval_count = sum(1 for row in table_data if row["Within Interval"])
+        print(f"\n统计信息:")
+        print(f"  总样本数: {total_samples}")
+        print(f"  显示样本数: {n_display}")
+        print(f"  误差在不确定度区间内的样本数: {within_interval_count}/{n_display} ({within_interval_count/n_display*100:.1f}%)")
+        print(f"  平均预测误差: {errors.mean():.4f}")
+        print(f"  平均不确定度: {uncertainties.mean():.4f}")
+        
+        print(f"\n{'='*70}")
+        print("对比图生成完成!")
+        print(f"{'='*70}")
+        
+        # 返回包含结果的DataFrame
+        result_df[actual_col] = actual_values
+        result_df["绝对误差"] = errors
+        
+        return result_df
 
 
 def main():
-    """主函数 - 命令行接口"""
-    parser = argparse.ArgumentParser(
-        description="材料裂纹深度预测工具",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-使用示例:
-  # 基本预测 (使用默认路径)
-  python model_pre.py --model ../results/select_model.pth --train_data 3011916164精确材料性能数据.csv --input test.csv --output predictions.csv
-  
-  # 使用MC Dropout估计不确定度
-  python model_pre.py --model ../results/select_model.pth --train_data 3011916164精确材料性能数据.csv --input test.csv --output predictions.csv --mc_dropout --n_samples 20
-  
-  # 单样本预测
-  python model_pre.py --model ../results/select_model.pth --train_data 3011916164精确材料性能数据.csv --single --material 碳化硅 --hardness 9.5 --elastic_modulus 450 --fracture_toughness 4.5 --grain_size 0.00001 --pressure 8.5 --velocity 40
-        """
-    )
+    """主函数 - 直接配置参数运行"""
     
-    # 修改为默认参数，与debug结果一致
-    parser.add_argument("--model", default="../results/select_model.pth", help="训练好的模型文件路径")
-    parser.add_argument("--train_data", default="3011916164精确材料性能数据.csv", help="训练数据CSV文件路径")
-    parser.add_argument("--input", help="输入数据CSV文件路径")
-    parser.add_argument("--output", help="输出结果CSV文件路径")
-    parser.add_argument("--mc_dropout", action="store_true", help="使用MC Dropout估计不确定度")
-    parser.add_argument("--n_samples", type=int, default=10, help="MC Dropout采样次数")
-    parser.add_argument("--device", choices=["cuda", "cpu"], help="计算设备")
+    # ==================== 配置参数 ====================
+    # 模型和数据路径
+    MODEL_PATH = "results/run_20251229_210602/best_model.pth"  # 训练好的模型文件路径
+    TRAIN_DATA_PATH = "3011916164精确材料性能数据.csv"  # 训练数据CSV文件路径
+    INPUT_PATH = "test.csv"  # 输入数据CSV文件路径
+    OUTPUT_PATH = "predictions.csv"  # 输出结果CSV文件路径 (设为None则不保存)
     
-    # 单样本预测参数
-    parser.add_argument("--single", action="store_true", help="单样本预测模式")
-    parser.add_argument("--material", help="材料种类")
-    parser.add_argument("--hardness", type=float, help="莫氏硬度")
-    parser.add_argument("--elastic_modulus", type=float, help="弹性模量")
-    parser.add_argument("--fracture_toughness", type=float, help="断裂韧性")
-    parser.add_argument("--grain_size", type=float, help="晶粒粒径")
-    parser.add_argument("--pressure", type=float, help="压溃压力")
-    parser.add_argument("--velocity", type=float, help="磨粒速度")
+    # 运行模式: "predict" | "single" | "plot"
+    MODE = "plot"
     
-    args = parser.parse_args()
+    # 预测模式参数
+    USE_MC_DROPOUT = False  # 是否使用MC Dropout估计不确定度
+    N_SAMPLES = 10  # MC Dropout采样次数
+    
+    # 单样本预测参数 (MODE="single"时使用)
+    SINGLE_MATERIAL = "碳化硅"
+    SINGLE_HARDNESS = 9.5
+    SINGLE_ELASTIC_MODULUS = 450
+    SINGLE_FRACTURE_TOUGHNESS = 4.5
+    SINGLE_GRAIN_SIZE = 0.00001
+    SINGLE_PRESSURE = 8.5
+    SINGLE_VELOCITY = 40
+    
+    # 对比图生成参数 (MODE="plot"时使用)
+    ACTUAL_COL = "实际值"  # 实际值列名
+    OUTPUT_DIR = "results/comparison"  # 图片输出目录
+    N_POINTS = None  # 显示的样本数量 (None表示显示全部)
+    SHOW_ALL = True  # 是否显示所有样本
+    UNCERTAINTY_SCALE = 0.2  # 不确定度缩放因子 (<1缩小, >1放大, 1.0不变)
+    Y_MAX = 5  # Y轴最大值 (None表示自动设置)
+    
+    # 设备选择 (None表示自动选择, 或指定"cuda"/"cpu")
+    DEVICE = "cuda"
+    # ==================== 配置结束 ====================
     
     try:
         # 创建预测器
         predictor = CrackDepthPredictor(
-            model_path=args.model,
-            train_data_path=args.train_data,
-            device=args.device
+            model_path=MODEL_PATH,
+            train_data_path=TRAIN_DATA_PATH,
+            device=DEVICE
         )
         
-        if args.single:
-            # 单样本预测模式
-            if not all([args.material, args.hardness is not None, args.elastic_modulus is not None, 
-                       args.fracture_toughness is not None, args.grain_size is not None, 
-                       args.pressure is not None, args.velocity is not None]):
-                parser.error("单样本预测需要提供所有参数: --material, --hardness, --elastic_modulus, --fracture_toughness, --grain_size, --pressure, --velocity")
+        if MODE == "plot":
+            # 生成对比图模式
+            if not os.path.exists(INPUT_PATH):
+                raise FileNotFoundError(f"未找到输入文件: {INPUT_PATH}")
             
+            result_df = predictor.generate_comparison_plot(
+                input_data_path=INPUT_PATH,
+                output_dir=OUTPUT_DIR,
+                actual_col=ACTUAL_COL,
+                n_points=N_POINTS,
+                show_all=SHOW_ALL,
+                uncertainty_scale=UNCERTAINTY_SCALE,
+                y_max=Y_MAX
+            )
+            
+        elif MODE == "single":
+            # 单样本预测模式
             print(f"\n{'='*60}")
             print("单样本预测")
             print(f"{'='*60}")
-            print(f"材料种类: {args.material}")
-            print(f"莫氏硬度: {args.hardness}")
-            print(f"弹性模量: {args.elastic_modulus}")
-            print(f"断裂韧性: {args.fracture_toughness}")
-            print(f"晶粒粒径: {args.grain_size}")
-            print(f"压溃压力: {args.pressure}")
-            print(f"磨粒速度: {args.velocity}")
+            print(f"材料种类: {SINGLE_MATERIAL}")
+            print(f"莫氏硬度: {SINGLE_HARDNESS}")
+            print(f"弹性模量: {SINGLE_ELASTIC_MODULUS}")
+            print(f"断裂韧性: {SINGLE_FRACTURE_TOUGHNESS}")
+            print(f"晶粒粒径: {SINGLE_GRAIN_SIZE}")
+            print(f"压溃压力: {SINGLE_PRESSURE}")
+            print(f"磨粒速度: {SINGLE_VELOCITY}")
             
             pred, unc = predictor.predict_single(
-                args.material, args.hardness, args.elastic_modulus,
-                args.fracture_toughness, args.grain_size, args.pressure, args.velocity
+                SINGLE_MATERIAL, SINGLE_HARDNESS, SINGLE_ELASTIC_MODULUS,
+                SINGLE_FRACTURE_TOUGHNESS, SINGLE_GRAIN_SIZE, 
+                SINGLE_PRESSURE, SINGLE_VELOCITY
             )
             
             print(f"\n预测结果:")
@@ -660,23 +916,20 @@ def main():
             print(f"{'='*60}")
             
         else:
-            # 批量预测模式
-            if not args.input:
-                # 如果没有指定输入文件，使用默认的test.csv
-                args.input = "test.csv"
-                if not os.path.exists(args.input):
-                    parser.error("未找到默认输入文件 test.csv，请使用 --input 指定输入文件")
+            # 批量预测模式 (MODE="predict" 或其他)
+            if not os.path.exists(INPUT_PATH):
+                raise FileNotFoundError(f"未找到输入文件: {INPUT_PATH}")
             
             result_df = predictor.predict(
-                input_data_path=args.input,
-                output_path=args.output,
-                use_mc_dropout=args.mc_dropout,
-                n_samples=args.n_samples
+                input_data_path=INPUT_PATH,
+                output_path=OUTPUT_PATH,
+                use_mc_dropout=USE_MC_DROPOUT,
+                n_samples=N_SAMPLES
             )
             
             # 显示前几行结果
-            print("\n预测结果预览 (前5行):")
-            print(result_df[["材料种类", "预测裂纹深度", "不确定度"]].head())
+            print("\n预测结果预览 (前6行):")
+            print(result_df[["材料种类", "预测裂纹深度", "不确定度"]].head(6))
             
     except Exception as e:
         print(f"\n错误: {str(e)}")

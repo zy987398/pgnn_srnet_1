@@ -851,7 +851,6 @@ def generate_best_predictions_comparison(results, output_dir, n_points=20):
             break
     
     if baseline_model is None:
-        # 如果没有完整模型,使用第一个模型作为基准
         baseline_model = list(results.keys())[0]
         print(f"警告: 未找到'完整模型',使用 '{baseline_model}' 作为基准")
     
@@ -861,8 +860,7 @@ def generate_best_predictions_comparison(results, output_dir, n_points=20):
     targets = np.array(baseline_result["targets"])
     
     # 排除实际值为0.5（或接近0.5）的样本
-    # 使用容差范围来处理浮点数精度问题
-    tolerance = 0.01  # 0.49 到 0.51 之间的值都被认为是0.5
+    tolerance = 0.01
     valid_mask = np.abs(targets - 0.5) > tolerance
     valid_indices = np.where(valid_mask)[0]
     
@@ -877,10 +875,8 @@ def generate_best_predictions_comparison(results, output_dir, n_points=20):
     valid_targets = targets[valid_indices]
     errors = np.abs(valid_predictions - valid_targets)
     
-    # 选择误差最小的n_points个点（在有效样本中的索引）
+    # 选择误差最小的n_points个点
     best_valid_indices = np.argsort(errors)[:n_points]
-    
-    # 转换回原始数据的索引
     best_indices = valid_indices[best_valid_indices]
     
     # 创建图形
@@ -896,13 +892,21 @@ def generate_best_predictions_comparison(results, output_dir, n_points=20):
     }
     
     # 绘制实际值 (浅红色方形，稍大) - zorder较低，先绘制
+    # 先绘制连接线
+    ax.plot(x_positions, targets[best_indices], 
+            color="#E81B3A",  # 浅红色
+            linewidth=1.5, 
+            alpha=0.7,
+            zorder=4,
+            linestyle='-')
+    # 再绘制散点
     ax.scatter(x_positions, targets[best_indices], 
-              color='#FFB6C1',  # 浅红色 (LightPink)
-              s=180,            # 稍大的尺寸
-              marker='s',       # 方形
+              color='#FFB6C1',
+              s=180,
+              marker='s',
               label='True Value', 
-              zorder=5,         # 较低的层级
-              edgecolors='#FF6B6B',  # 深一点的红色边框
+              zorder=5,
+              edgecolors='#FF6B6B',
               linewidths=2)
     
     # 绘制每个模型的预测值
@@ -918,25 +922,25 @@ def generate_best_predictions_comparison(results, output_dir, n_points=20):
         
         # 根据模型名称设置不同的样式
         if config_name == "完整模型" or config_name == baseline_model:
-            # 完整模型: 黑色圆点
             marker = 'o'
             color = 'black'
             size = 120
             alpha = 1.0
             edgecolor = 'white'
-            zorder = 15  # 最高层级
+            zorder = 15
+            line_color = 'black'
+            line_alpha = 0.7
         elif config_name == "无物理特征基线":
-            # 无物理特征基线: 蓝色菱形
             marker = 'D'
-            color = '#3498DB'  # 蓝色
+            color = '#3498DB'
             size = 100
             alpha = 1.0
             edgecolor = 'white'
-            zorder = 10  # 中间层级
+            zorder = 10
+            line_color = '#3498DB'
+            line_alpha = 0.7
         else:
-            # 其他模型: 使用不同颜色的菱形
             marker = 'D'
-            # 为其他模型分配不同颜色
             other_colors = ['#2ECC71', '#F39C12', '#9B59B6', '#1ABC9C', '#E67E22', '#34495E']
             other_idx = list(results.keys()).index(config_name)
             color = other_colors[other_idx % len(other_colors)]
@@ -944,26 +948,27 @@ def generate_best_predictions_comparison(results, output_dir, n_points=20):
             alpha = 0.9
             edgecolor = 'white'
             zorder = 8
+            line_color = color
+            line_alpha = 0.6
         
+        # 先绘制连接线
+        ax.plot(x_positions, selected_predictions,
+                color=line_color, 
+                linewidth=1.5, 
+                alpha=line_alpha,
+                zorder=zorder - 1,
+                linestyle='-')
+        
+        # 再绘制散点
         ax.scatter(x_positions, selected_predictions,
                   color=color, s=size, marker=marker,
                   label=display_name, alpha=alpha, 
                   edgecolors=edgecolor, linewidths=1.5,
                   zorder=zorder)
     
-    # 添加连接线(可选,连接实际值和完整模型预测值)
-    if baseline_model in results:
-        baseline_predictions = np.array(results[baseline_model]["all_runs"][0]["predictions"])
-        selected_baseline = baseline_predictions[best_indices]
-        
-        for i in range(n_points):
-            ax.plot([x_positions[i], x_positions[i]], 
-                   [targets[best_indices][i], selected_baseline[i]],
-                   'k--', alpha=0.3, linewidth=0.8, zorder=1)
-    
     # 设置标签 (英文，Times New Roman字体)
-    ax.set_xlabel('Partial Test Samples', fontsize=14, fontweight='bold', fontname='Times New Roman')
-    ax.set_ylabel('Subsurface Crack Depth (μm)', fontsize=14, fontweight='bold', fontname='Times New Roman')
+    ax.set_xlabel('Partial Test Samples', fontsize=20, fontname='Times New Roman')
+    ax.set_ylabel('Subsurface Crack Depth (μm)', fontsize=20, fontname='Times New Roman')
     
     # 设置x轴刻度
     ax.set_xticks(x_positions)

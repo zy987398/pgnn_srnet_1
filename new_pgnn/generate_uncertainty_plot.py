@@ -198,42 +198,46 @@ def generate_uncertainty_plot():
     
     x_positions = np.arange(n_points)
     
-    # 绘制真实值 (黑色圆点)
+    # 绘制真实值折线
+    ax.plot(x_positions, selected_targets,
+            color="#E81B3A",  # 浅红色
+            linewidth=1.5,
+            alpha=0.7,
+            zorder=4,
+            linestyle='-')
+    
+    # 绘制真实值散点 (浅红色方形)
     ax.scatter(x_positions, selected_targets, 
               color='#FFB6C1', s=150, marker='s',
-              label='True Value', zorder=10, edgecolors='white', linewidths=1.5)
+              label='True Value', zorder=10, edgecolors='#FF6B6B', linewidths=2)
     
-    # 绘制预测值及其不确定度 (带误差条)
+    # 绘制预测值折线
+    ax.plot(x_positions, selected_predictions,
+            color='black',
+            linewidth=1.5,
+            alpha=0.7,
+            zorder=8,
+            linestyle='-')
+    
+    # 绘制预测值及其不确定度 (带误差条，无填充)
     ax.errorbar(x_positions, selected_predictions, yerr=selected_std,
                 fmt='o', color='black', markersize=10, capsize=5, capthick=2,
                 ecolor='#E74C3C', elinewidth=2, alpha=0.9,
                 label='PGNN-ASL Prediction ± Uncertainty', zorder=15,
-                markeredgecolor='black', markeredgewidth=1.5)
-    
-    # 添加不确定度区间填充
-    ax.fill_between(x_positions, 
-                    selected_predictions - selected_std,
-                    selected_predictions + selected_std,
-                    color='#E74C3C', alpha=0.2, label='Uncertainty Interval')
-    
-    # 添加连接线 (真实值和预测值)
-    for i in range(n_points):
-        ax.plot([x_positions[i], x_positions[i]], 
-               [selected_targets[i], selected_predictions[i]],
-               'k--', alpha=0.3, linewidth=0.8, zorder=1)
+                markeredgecolor='white', markeredgewidth=1.5)
     
     # 设置标签 (英文，Times New Roman字体)
-    ax.set_xlabel('Partial Test Samples', fontsize=14, fontweight='bold', fontname='Times New Roman')
-    ax.set_ylabel('Subsurface Crack Depth (μm)', fontsize=14, fontweight='bold', fontname='Times New Roman')
+    ax.set_xlabel('Partial Test Samples', fontsize=20, fontname='Times New Roman')
+    ax.set_ylabel('Subsurface Crack Depth (μm)', fontsize=20, fontname='Times New Roman')
     
     # 设置x轴刻度
     ax.set_xticks(x_positions)
-    ax.set_xticklabels([f'{i+1}' for i in range(n_points)], rotation=0, fontname='Times New Roman', fontsize=12)
+    ax.set_xticklabels([f'{i+1}' for i in range(n_points)], rotation=0, fontname='Times New Roman', fontsize=20)
     
     # 设置y轴刻度字体
     for label in ax.get_yticklabels():
         label.set_fontname('Times New Roman')
-        label.set_fontsize(12)
+        label.set_fontsize(20)
     
     # 添加网格
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
@@ -245,10 +249,12 @@ def generate_uncertainty_plot():
     
     plt.tight_layout()
     plt.savefig(f"{OUTPUT_DIR}/uncertainty_comparison.png", dpi=300, bbox_inches='tight')
+    plt.savefig(f"{OUTPUT_DIR}/uncertainty_comparison.pdf", dpi=300, bbox_inches='tight', format='pdf')
     plt.close()
     
     print(f"✓ 图1已保存: {OUTPUT_DIR}/uncertainty_comparison.png")
-    
+    print(f"✓ 图1已保存: {OUTPUT_DIR}/uncertainty_comparison.pdf")
+
     # ============ 图2: 双Y轴图 - 真实值和不确定度分别在不同坐标轴 ============
     fig, ax1 = plt.subplots(figsize=(14, 8))
     
@@ -257,18 +263,32 @@ def generate_uncertainty_plot():
     ax1.set_xlabel('Partial Test Samples', fontsize=14, fontweight='bold', fontname='Times New Roman')
     ax1.set_ylabel('Subsurface Crack Depth (μm)', fontsize=14, fontweight='bold', color=color1, fontname='Times New Roman')
     
-    # 绘制真实值 (浅红色方形)
+    # 绘制真实值折线
+    ax1.plot(x_positions, selected_targets,
+             color='#FFB6C1',
+             linewidth=1.5,
+             alpha=0.7,
+             zorder=4,
+             linestyle='-')
+    
+    # 绘制真实值散点 (浅红色方形)
     line1 = ax1.scatter(x_positions, selected_targets, 
                        color='#FFB6C1', s=150, marker='s', 
                        label='True Value', zorder=10, edgecolors='#FF6B6B', linewidths=2)
     
+    # 绘制预测值折线
+    ax1.plot(x_positions, selected_predictions,
+             color='black',
+             linewidth=1.5,
+             alpha=0.7,
+             zorder=8,
+             linestyle='-')
     
-    # 绘制预测值 (黑色圆点)
+    # 绘制预测值散点 (黑色圆点)
     line2 = ax1.scatter(x_positions, selected_predictions, 
                        color='black', s=120, marker='o', 
                        label='PGNN-ASL Prediction', zorder=15, edgecolors='white', linewidths=1.5)
 
-    
     ax1.tick_params(axis='y', labelcolor=color1)
     
     # 设置左Y轴刻度字体
@@ -281,9 +301,20 @@ def generate_uncertainty_plot():
     color2 = '#E74C3C'
     ax2.set_ylabel('Uncertainty (Std Dev)', fontsize=14, fontweight='bold', color=color2, fontname='Times New Roman')
     
-    # 绘制不确定度条形图
-    bars = ax2.bar(x_positions, selected_std, alpha=0.5, color=color2, 
-                   label='Uncertainty', width=0.4)
+    # 绘制不确定度折线
+    ax2.plot(x_positions, selected_std,
+             color=color2,
+             linewidth=1.5,
+             alpha=0.7,
+             zorder=3,
+             linestyle='-')
+    
+    # 绘制不确定度散点
+    bars = ax2.scatter(x_positions, selected_std, 
+                      color=color2, s=80, marker='D',
+                      alpha=0.8, label='Uncertainty', zorder=5,
+                      edgecolors='white', linewidths=1)
+    
     ax2.tick_params(axis='y', labelcolor=color2)
     
     # 设置右Y轴刻度字体
@@ -307,9 +338,11 @@ def generate_uncertainty_plot():
     
     plt.tight_layout()
     plt.savefig(f"{OUTPUT_DIR}/uncertainty_dual_axis.png", dpi=300, bbox_inches='tight')
+    plt.savefig(f"{OUTPUT_DIR}/uncertainty_dual_axis.pdf", dpi=300, bbox_inches='tight', format='pdf')
     plt.close()
     
     print(f"✓ 图2已保存: {OUTPUT_DIR}/uncertainty_dual_axis.png")
+    print(f"✓ 图2已保存: {OUTPUT_DIR}/uncertainty_dual_axis.pdf")
     
     # ============ 生成详细数据表格 ============
     table_data = []
