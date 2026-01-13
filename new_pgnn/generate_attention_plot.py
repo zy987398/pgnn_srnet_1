@@ -10,7 +10,10 @@ import pandas as pd
 import os
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.model_selection import train_test_split
-
+from matplotlib.patches import Rectangle, FancyBboxPatch
+from matplotlib.colors import LinearSegmentedColormap
+from matplotlib.path import Path
+import matplotlib.patches as mpatches
 # 导入自定义模块
 from models import MaterialCrackPGNN
 from utils import prepare_material_data
@@ -71,6 +74,64 @@ def extract_attention_weights(model, data_loader, device):
     return all_var_weights
 
 
+def create_gradient_bars(ax, x_positions, heights, width=0.8):
+    """
+    创建渐变柱形图
+    
+    参数:
+        ax: matplotlib axes对象
+        x_positions: 柱形的x坐标
+        heights: 柱形的高度
+        width: 柱形宽度
+    """
+    
+    # 定义渐变颜色（从上到下：深蓝 -> 浅蓝/白色）
+    colors = ["#154c6e", "#175178", "#2972a2", "#80acc9"]
+    cmap = LinearSegmentedColormap.from_list('blue_gradient', colors)
+    
+    bars = []
+    for i, (x, h) in enumerate(zip(x_positions, heights)):
+        left = x - width / 2
+        right = x + width / 2
+        bottom = 0
+        top = h
+        
+        # 检查是否是对数刻度
+        if ax.get_yscale() == 'log':
+            y_min = ax.get_ylim()[0] if ax.get_ylim()[0] > 0 else 1e-4
+            bottom = y_min
+        
+        # 创建渐变图像数据（从上到下）
+        gradient = np.linspace(0, 1, 256).reshape(-1, 1)
+        
+        # 绘制渐变
+        extent = [left, right, bottom, top]
+        im = ax.imshow(gradient, aspect='auto', cmap=cmap, 
+                      extent=extent, origin='upper', zorder=2)
+        
+        # 创建裁剪路径
+        # 定义矩形的四个角点
+        vertices = [
+            (left, bottom),
+            (left, top),
+            (right, top),
+            (right, bottom),
+            (left, bottom)
+        ]
+        codes = [Path.MOVETO, Path.LINETO, Path.LINETO, Path.LINETO, Path.CLOSEPOLY]
+        clip_path = Path(vertices, codes)
+        patch = mpatches.PathPatch(clip_path, transform=ax.transData)
+        im.set_clip_path(patch)
+        
+        # 添加边框
+        border = Rectangle((left, bottom), width, top - bottom, 
+                           fill=False, edgecolor='#1a5276', linewidth=1.5, zorder=3)
+        ax.add_patch(border)
+        bars.append(border)
+    
+    return bars
+
+
 def plot_attention_weights(weights, save_path, top_n=15):
     """
     绘制注意力权重柱状图
@@ -106,23 +167,27 @@ def plot_attention_weights(weights, save_path, top_n=15):
     feature_symbols = get_feature_symbols()
     sorted_labels = [feature_symbols[i] for i in indices]
     
-    # 绘制垂直条形图
+    # 设置纵坐标为对数刻度（先设置，再绘制渐变柱形）
+    ax.set_yscale('log')
+    
+    # 设置y轴范围
+    y_min = sorted_means.min() * 0.1
+    y_max = (sorted_means + sorted_stds).max() * 2
+    ax.set_ylim(y_min, y_max)
+    
+    # 绘制渐变柱形图
     x_positions = np.arange(len(indices))
-    bars = ax.bar(x_positions, sorted_means,
-                  color='steelblue', edgecolor='black', alpha=0.8)
+    bars = create_gradient_bars(ax, x_positions, sorted_means, width=0.7)
     
     # 绘制不确定度范围（只用误差棒线段，不填充）
     ax.errorbar(x_positions, sorted_means, yerr=sorted_stds,
                 fmt='none',  # 不绘制中心点
-                ecolor='#2C3E50',  # 深灰色
+                ecolor="black",  
                 elinewidth=2,
                 capsize=5,
                 capthick=2,
                 alpha=0.8,
                 zorder=4)
-    
-    # 设置纵坐标为对数刻度
-    ax.set_yscale('log')
     
     # 设置坐标轴（英文标签）- 横坐标标签水平显示
     ax.set_xticks(x_positions)
@@ -139,13 +204,13 @@ def plot_attention_weights(weights, save_path, top_n=15):
         label.set_fontsize(12)
     
     # 在条形上方添加数值标注（调整位置避免与误差棒重叠）
-    for i, (bar, mean_val) in enumerate(zip(bars, sorted_means)):
+    for i, mean_val in enumerate(sorted_means):
         # 对数刻度下，位置需要用乘法调整
         text_y = sorted_means[i] + sorted_stds[i]
-        text_y = text_y * 1.15  # 在误差棒上方留出空间
-        ax.text(bar.get_x() + bar.get_width()/2, 
+        text_y = text_y * 1.1 # 在误差棒上方留出空间
+        ax.text(x_positions[i], 
                 text_y,
-                f'{mean_val:.3f}', ha='center', va='bottom', fontsize=10)
+                f'{mean_val:.3f}', ha='center', va='bottom', fontsize=16)
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
@@ -272,22 +337,26 @@ def main():
     
     x_positions = np.arange(len(indices))
     
-    # 绘制柱状图
-    bars = ax.bar(x_positions, sorted_means,
-                  color='steelblue', edgecolor='black', alpha=0.8)
+    # 设置纵坐标为对数刻度（先设置，再绘制渐变柱形）
+    ax.set_yscale('log')
+    
+    # 设置y轴范围
+    y_min = sorted_means.min() * 0.1
+    y_max = (sorted_means + sorted_stds).max() * 2
+    ax.set_ylim(y_min, y_max)
+    
+    # 绘制渐变柱状图
+    bars = create_gradient_bars(ax, x_positions, sorted_means, width=0.7)
     
     # 绘制不确定度范围（只用误差棒线段）
     ax.errorbar(x_positions, sorted_means, yerr=sorted_stds,
                 fmt='none',
-                ecolor='#2C3E50',
+                ecolor='#1a5276',
                 elinewidth=2,
                 capsize=5,
                 capthick=2,
                 alpha=0.8,
                 zorder=4)
-    
-    # 设置纵坐标为对数刻度
-    ax.set_yscale('log')
     
     # 横坐标标签水平显示
     ax.set_xticks(x_positions)
@@ -301,10 +370,11 @@ def main():
     for label in ax.get_yticklabels():
         label.set_fontsize(12)
     
-    for i, (bar, mean_val) in enumerate(zip(bars, sorted_means)):
+    # 在条形上方添加数值标注
+    for i, mean_val in enumerate(sorted_means):
         text_y = sorted_means[i] + sorted_stds[i]
         text_y = text_y * 1.15
-        ax.text(bar.get_x() + bar.get_width()/2, 
+        ax.text(x_positions[i], 
                 text_y,
                 f'{mean_val:.3f}', ha='center', va='bottom', fontsize=10)
     

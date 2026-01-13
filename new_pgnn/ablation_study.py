@@ -532,6 +532,36 @@ def train_single_ablation(config_name, config, base_params, data_path=DATA_PATH,
             print(f"  测试MAPE: {mape:.2f}%")
             print(f"  训练时间: {train_time:.2f}秒")
         
+        # 保存最佳运行的模型 (第一次运行或R²更好时保存)
+        if run_idx == 0 or test_r2 > max(r["test_r2"] for r in all_runs_results if "test_r2" in r):
+            model_save_dir = "results/ablation/models"
+            os.makedirs(model_save_dir, exist_ok=True)
+            
+            # 生成安全的文件名
+            safe_config_name = config_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
+            model_save_path = f"{model_save_dir}/{safe_config_name}_best_model.pth"
+            
+            # 保存模型和配置
+            save_dict = {
+                'state_dict': best_model_wts if best_model_wts is not None else model.state_dict(),
+                'config': {
+                    'num_materials': num_materials,
+                    'material_embed_dim': base_params["material_embed_dim"],
+                    'latent_dim': base_params["latent_dim"],
+                    'dropout_rate': base_params["dropout_rate"],
+                    'symbolic_type': config["symbolic_type"],
+                    'ablation_mode': config["ablation_mode"]
+                },
+                'metrics': {
+                    'test_r2': float(test_r2),
+                    'test_rmse': float(test_rmse),
+                    'test_mae': float(test_mae),
+                    'test_mape': float(mape)
+                }
+            }
+            torch.save(save_dict, model_save_path)
+            print(f"  ✓ 模型已保存: {model_save_path}")
+        
         # 保存单次运行结果
         run_result = {
             "run_idx": run_idx,
@@ -891,7 +921,7 @@ def generate_best_predictions_comparison(results, output_dir, n_points=20):
         "实际值": "True Value"
     }
     
-    # 绘制实际值 (浅红色方形，稍大) - zorder较低，先绘制
+    # 绘制实际值 (浅红色方形) - 渐变饱满效果
     # 先绘制连接线
     ax.plot(x_positions, targets[best_indices], 
             color="#E81B3A",  # 浅红色
@@ -899,15 +929,15 @@ def generate_best_predictions_comparison(results, output_dir, n_points=20):
             alpha=0.7,
             zorder=4,
             linestyle='-')
-    # 再绘制散点
+    # 外层深色
     ax.scatter(x_positions, targets[best_indices], 
-              color='#FFB6C1',
-              s=180,
-              marker='s',
-              label='True Value', 
-              zorder=5,
-              edgecolors='#FF6B6B',
-              linewidths=2)
+              color='#D85A6A', s=200, marker='s', zorder=10)
+    # 中层
+    ax.scatter(x_positions, targets[best_indices], 
+              color='#F08090', s=140, marker='s', zorder=11)
+    # 内层高光
+    ax.scatter(x_positions, targets[best_indices], 
+              color='#FFD0D8', s=60, marker='s', zorder=12)
     
     # 绘制每个模型的预测值
     for idx, (config_name, result) in enumerate(results.items()):
@@ -922,33 +952,34 @@ def generate_best_predictions_comparison(results, output_dir, n_points=20):
         
         # 根据模型名称设置不同的样式
         if config_name == "完整模型" or config_name == baseline_model:
+            # 完整模型用蓝色圆形
             marker = 'o'
-            color = 'black'
-            size = 120
-            alpha = 1.0
-            edgecolor = 'white'
+            colors_outer = '#0D5A9E'
+            colors_mid = '#3A8FD1'
+            colors_inner = '#8FBFEA'
+            sizes = (160, 100, 35)
             zorder = 15
-            line_color = 'black'
+            line_color = '#1F78B4'
             line_alpha = 0.7
         elif config_name == "无物理特征基线":
+            # 物理基线模型用黄色菱形
             marker = 'D'
-            color = '#3498DB'
-            size = 100
-            alpha = 1.0
-            edgecolor = 'white'
+            colors_outer = '#B8860B'
+            colors_mid = '#DAA520'
+            colors_inner = '#FFD700'
+            sizes = (120, 80, 30)
             zorder = 10
-            line_color = '#3498DB'
+            line_color = '#DAA520'
             line_alpha = 0.7
         else:
+            # 其他模型用绿色菱形
             marker = 'D'
-            other_colors = ['#2ECC71', '#F39C12', '#9B59B6', '#1ABC9C', '#E67E22', '#34495E']
-            other_idx = list(results.keys()).index(config_name)
-            color = other_colors[other_idx % len(other_colors)]
-            size = 80
-            alpha = 0.9
-            edgecolor = 'white'
+            colors_outer = '#1D6B3A'
+            colors_mid = '#2ECC71'
+            colors_inner = '#7DCEA0'
+            sizes = (100, 65, 25)
             zorder = 8
-            line_color = color
+            line_color = '#2ECC71'
             line_alpha = 0.6
         
         # 先绘制连接线
@@ -956,15 +987,19 @@ def generate_best_predictions_comparison(results, output_dir, n_points=20):
                 color=line_color, 
                 linewidth=1.5, 
                 alpha=line_alpha,
-                zorder=zorder - 1,
+                zorder=zorder - 3,
                 linestyle='-')
         
-        # 再绘制散点
+        # 绘制渐变饱满效果散点
+        # 外层深色
         ax.scatter(x_positions, selected_predictions,
-                  color=color, s=size, marker=marker,
-                  label=display_name, alpha=alpha, 
-                  edgecolors=edgecolor, linewidths=1.5,
-                  zorder=zorder)
+                  color=colors_outer, s=sizes[0], marker=marker, zorder=zorder)
+        # 中层
+        ax.scatter(x_positions, selected_predictions,
+                  color=colors_mid, s=sizes[1], marker=marker, zorder=zorder + 1)
+        # 内层高光
+        ax.scatter(x_positions, selected_predictions,
+                  color=colors_inner, s=sizes[2], marker=marker, zorder=zorder + 2)
     
     # 设置标签 (英文，Times New Roman字体)
     ax.set_xlabel('Partial Test Samples', fontsize=20, fontname='Times New Roman')
@@ -982,8 +1017,19 @@ def generate_best_predictions_comparison(results, output_dir, n_points=20):
     # 添加网格
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     
+    # 创建自定义图例
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], marker='s', color='w', markerfacecolor='#F08090', 
+               markeredgecolor='#D85A6A', markersize=12, label='True Value'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='#3A8FD1', 
+               markeredgecolor='#0D5A9E', markersize=12, label='PGNN-ASL'),
+        Line2D([0], [0], marker='D', color='w', markerfacecolor='#DAA520', 
+               markeredgecolor='#B8860B', markersize=10, label='PGNN-w/o ASL')
+    ]
+    
     # 添加图例 (Times New Roman字体)
-    legend = ax.legend(loc='best', framealpha=0.9, fontsize=12, ncol=1)
+    legend = ax.legend(handles=legend_elements, loc='best', framealpha=0.9, fontsize=12, ncol=1)
     for text in legend.get_texts():
         text.set_fontname('Times New Roman')
     

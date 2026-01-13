@@ -206,25 +206,47 @@ def generate_uncertainty_plot():
             zorder=4,
             linestyle='-')
     
-    # 绘制真实值散点 (浅红色方形)
+    # 绘制真实值散点 (浅红色方形) - 渐变饱满效果
+    # 外层深色
     ax.scatter(x_positions, selected_targets, 
-              color='#FFB6C1', s=150, marker='s',
-              label='True Value', zorder=10, edgecolors='#FF6B6B', linewidths=2)
+              color='#D85A6A', s=180, marker='s', zorder=10)
+    # 中层
+    ax.scatter(x_positions, selected_targets, 
+              color='#F08090', s=130, marker='s', zorder=11)
+    # 内层高光
+    ax.scatter(x_positions, selected_targets, 
+              color='#FFD0D8', s=60, marker='s', zorder=12)
     
     # 绘制预测值折线
     ax.plot(x_positions, selected_predictions,
-            color='black',
+            color='#1F78B4',
             linewidth=1.5,
             alpha=0.7,
             zorder=8,
             linestyle='-')
     
-    # 绘制预测值及其不确定度 (带误差条，无填充)
+    # 绘制预测值及其不确定度 (带误差条) - 渐变饱满效果
     ax.errorbar(x_positions, selected_predictions, yerr=selected_std,
-                fmt='o', color='black', markersize=10, capsize=5, capthick=2,
-                ecolor='#E74C3C', elinewidth=2, alpha=0.9,
-                label='PGNN-ASL Prediction ± Uncertainty', zorder=15,
-                markeredgecolor='white', markeredgewidth=1.5)
+                fmt='none', capsize=5, capthick=2,
+                ecolor='#1F77B4', elinewidth=2, alpha=0.9, zorder=13)
+    # 外层深色
+    ax.scatter(x_positions, selected_predictions, 
+              color='#0D5A9E', s=160, marker='o', zorder=14)
+    # 中层
+    ax.scatter(x_positions, selected_predictions, 
+              color='#3A8FD1', s=100, marker='o', zorder=15)
+    # 内层高光
+    ax.scatter(x_positions, selected_predictions, 
+              color='#8FBFEA', s=35, marker='o', zorder=16)
+    
+    # 创建自定义图例
+    from matplotlib.lines import Line2D
+    legend_elements = [
+        Line2D([0], [0], marker='s', color='w', markerfacecolor='#F08090', 
+               markeredgecolor='#D85A6A', markersize=12, label='True Value'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='#3A8FD1', 
+               markeredgecolor='#0D5A9E', markersize=12, label='PGNN-ASL Prediction ± Uncertainty')
+    ]
     
     # 设置标签 (英文，Times New Roman字体)
     ax.set_xlabel('Partial Test Samples', fontsize=20, fontname='Times New Roman')
@@ -243,7 +265,7 @@ def generate_uncertainty_plot():
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     
     # 添加图例 (Times New Roman字体)
-    legend = ax.legend(loc='best', framealpha=0.9, fontsize=12, ncol=1)
+    legend = ax.legend(handles=legend_elements, loc='best', framealpha=0.9, fontsize=12, ncol=1)
     for text in legend.get_texts():
         text.set_fontname('Times New Roman')
     
@@ -271,10 +293,16 @@ def generate_uncertainty_plot():
              zorder=4,
              linestyle='-')
     
-    # 绘制真实值散点 (浅红色方形)
-    line1 = ax1.scatter(x_positions, selected_targets, 
-                       color='#FFB6C1', s=150, marker='s', 
-                       label='True Value', zorder=10, edgecolors='#FF6B6B', linewidths=2)
+    # 绘制真实值散点 (浅红色方形) - 渐变饱满效果
+    # 外层深色
+    ax1.scatter(x_positions, selected_targets, 
+               color='#D85A6A', s=180, marker='s', zorder=10)
+    # 中层
+    ax1.scatter(x_positions, selected_targets, 
+               color='#F08090', s=130, marker='s', zorder=11)
+    # 内层高光
+    ax1.scatter(x_positions, selected_targets, 
+               color='#FFD0D8', s=60, marker='s', zorder=12)
     
     # 绘制预测值折线
     ax1.plot(x_positions, selected_predictions,
@@ -284,10 +312,16 @@ def generate_uncertainty_plot():
              zorder=8,
              linestyle='-')
     
-    # 绘制预测值散点 (黑色圆点)
-    line2 = ax1.scatter(x_positions, selected_predictions, 
-                       color='black', s=120, marker='o', 
-                       label='PGNN-ASL Prediction', zorder=15, edgecolors='white', linewidths=1.5)
+    # 绘制预测值散点 (黑色圆点) - 渐变饱满效果
+    # 外层深色
+    ax1.scatter(x_positions, selected_predictions, 
+               color='#1a1a1a', s=150, marker='o', zorder=14)
+    # 中层
+    ax1.scatter(x_positions, selected_predictions, 
+               color='#4a4a4a', s=100, marker='o', zorder=15)
+    # 内层高光
+    ax1.scatter(x_positions, selected_predictions, 
+               color='#8a8a8a', s=40, marker='o', zorder=16)
 
     ax1.tick_params(axis='y', labelcolor=color1)
     
@@ -309,11 +343,16 @@ def generate_uncertainty_plot():
              zorder=3,
              linestyle='-')
     
-    # 绘制不确定度散点
-    bars = ax2.scatter(x_positions, selected_std, 
-                      color=color2, s=80, marker='D',
-                      alpha=0.8, label='Uncertainty', zorder=5,
-                      edgecolors='white', linewidths=1)
+    # 绘制不确定度散点 (菱形) - 渐变饱满效果
+    # 外层深色
+    ax2.scatter(x_positions, selected_std, 
+               color='#A93226', s=100, marker='D', zorder=5)
+    # 中层
+    ax2.scatter(x_positions, selected_std, 
+               color='#E74C3C', s=65, marker='D', zorder=6)
+    # 内层高光
+    ax2.scatter(x_positions, selected_std, 
+               color='#F5A89A', s=25, marker='D', zorder=7)
     
     ax2.tick_params(axis='y', labelcolor=color2)
     
@@ -329,10 +368,16 @@ def generate_uncertainty_plot():
     # 添加网格
     ax1.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     
-    # 合并图例
-    lines1, labels1 = ax1.get_legend_handles_labels()
-    lines2, labels2 = ax2.get_legend_handles_labels()
-    legend = ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper left', framealpha=0.9, fontsize=12)
+    # 创建自定义图例
+    legend_elements2 = [
+        Line2D([0], [0], marker='s', color='w', markerfacecolor='#F08090', 
+               markeredgecolor='#D85A6A', markersize=10, label='True Value'),
+        Line2D([0], [0], marker='o', color='w', markerfacecolor='#4a4a4a', 
+               markeredgecolor='#1a1a1a', markersize=10, label='PGNN-ASL Prediction'),
+        Line2D([0], [0], marker='D', color='w', markerfacecolor='#E74C3C', 
+               markeredgecolor='#A93226', markersize=8, label='Uncertainty')
+    ]
+    legend = ax1.legend(handles=legend_elements2, loc='upper left', framealpha=0.9, fontsize=12)
     for text in legend.get_texts():
         text.set_fontname('Times New Roman')
     

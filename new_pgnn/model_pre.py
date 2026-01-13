@@ -727,25 +727,47 @@ class CrackDepthPredictor:
                 zorder=4,
                 linestyle='-')
         
-        # 绘制实际值散点 (浅红色方形)
+        # 绘制实际值散点 (浅红色方形) - 渐变饱满效果
+        # 外层深色
         ax.scatter(x_positions, selected_actual, 
-                  color='#FFB6C1', s=150, marker='s',
-                  label='Actual Value', zorder=10, edgecolors='#FF6B6B', linewidths=2)
+                  color='#D85A6A', s=180, marker='s', zorder=10)
+        # 中层
+        ax.scatter(x_positions, selected_actual, 
+                  color='#F08090', s=130, marker='s', zorder=11)
+        # 内层高光
+        ax.scatter(x_positions, selected_actual, 
+                  color='#FFD0D8', s=60, marker='s', zorder=12)
         
         # 绘制预测值折线
         ax.plot(x_positions, selected_predictions,
-                color='black',
+                color='#1F78B4',
                 linewidth=1.5,
                 alpha=0.7,
                 zorder=8,
                 linestyle='-')
         
-        # 绘制预测值及其不确定度 (带误差条，无填充)
+        # 绘制预测值及其不确定度 (带误差条) - 渐变饱满效果
         ax.errorbar(x_positions, selected_predictions, yerr=selected_uncertainties,
-                    fmt='o', color='black', markersize=10, capsize=5, capthick=2,
-                    ecolor='#3498DB', elinewidth=2, alpha=0.9,
-                    label='Prediction ± Uncertainty', zorder=15,
-                    markeredgecolor='white', markeredgewidth=1.5)
+                    fmt='none', capsize=5, capthick=2,
+                    ecolor='#1F77B4', elinewidth=2, alpha=0.9, zorder=13)
+        # 外层深色
+        ax.scatter(x_positions, selected_predictions, 
+                  color='#0D5A9E', s=160, marker='o', zorder=14)
+        # 中层
+        ax.scatter(x_positions, selected_predictions, 
+                  color='#3A8FD1', s=100, marker='o', zorder=15)
+        # 内层高光
+        ax.scatter(x_positions, selected_predictions, 
+                  color='#8FBFEA', s=35, marker='o', zorder=16)
+        
+        # 创建自定义图例
+        from matplotlib.lines import Line2D
+        legend_elements = [
+            Line2D([0], [0], marker='s', color='w', markerfacecolor='#F08090', 
+                   markeredgecolor='#D85A6A', markersize=12, label='Actual Value'),
+            Line2D([0], [0], marker='o', color='w', markerfacecolor='#3A8FD1', 
+                   markeredgecolor='#0D5A9E', markersize=12, label='Prediction ± Uncertainty')
+        ]
         
         # 设置标签
         ax.set_xlabel('Sample Index', fontsize=20, fontname='Times New Roman')
@@ -776,7 +798,7 @@ class CrackDepthPredictor:
         ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
         
         # 添加图例
-        legend = ax.legend(loc='upper left', framealpha=0.9, fontsize=12)
+        legend = ax.legend(handles=legend_elements, loc='upper left', framealpha=0.9, fontsize=12)
         for text in legend.get_texts():
             text.set_fontname('Times New Roman')
         
