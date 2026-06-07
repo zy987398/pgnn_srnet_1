@@ -205,6 +205,11 @@ def generate_comparison_plot():
     selected_baseline_predictions = baseline_predictions[best_indices]
     selected_full_uncertainties = full_uncertainties[best_indices]
     
+    # 交换第2个和第6个点的位置（索引1和6），使左上角有空间放图例
+    for arr in [selected_targets, selected_full_predictions, selected_baseline_predictions, selected_full_uncertainties]:
+        arr[1], arr[6] = arr[6], arr[1]
+    best_indices[1], best_indices[6] = best_indices[6], best_indices[1]
+    
     # 将不确定度转换为标准差
     selected_full_std = np.sqrt(selected_full_uncertainties) * UNCERTAINTY_SCALE
     
@@ -263,18 +268,18 @@ def generate_comparison_plot():
     
     # 设置x轴刻度
     ax.set_xticks(x_positions)
-    ax.set_xticklabels([f'{i+1}' for i in range(n_points)], rotation=0, fontname='Times New Roman', fontsize=12)
+    ax.set_xticklabels([f'{i+1}' for i in range(n_points)], rotation=0, fontname='Times New Roman', fontsize=20)
     
     # 设置y轴刻度字体
     for label in ax.get_yticklabels():
         label.set_fontname('Times New Roman')
-        label.set_fontsize(12)
+        label.set_fontsize(20)
     
     # 添加网格
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     
     # 添加图例
-    legend = ax.legend(handles=legend_elements, loc='best', framealpha=0.9, fontsize=12, ncol=1)
+    legend = ax.legend(handles=legend_elements, loc='upper left', framealpha=0.9, fontsize=20, ncol=1)
     for text in legend.get_texts():
         text.set_fontname('Times New Roman')
     
@@ -326,18 +331,18 @@ def generate_comparison_plot():
     
     # 设置x轴刻度
     ax.set_xticks(x_positions)
-    ax.set_xticklabels([f'{i+1}' for i in range(n_points)], rotation=0, fontname='Times New Roman', fontsize=12)
+    ax.set_xticklabels([f'{i+1}' for i in range(n_points)], rotation=0, fontname='Times New Roman', fontsize=20)
     
     # 设置y轴刻度字体
     for label in ax.get_yticklabels():
         label.set_fontname('Times New Roman')
-        label.set_fontsize(12)
+        label.set_fontsize(20)
     
     # 添加网格
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     
     # 添加图例
-    legend = ax.legend(handles=legend_elements2, loc='best', framealpha=0.9, fontsize=12, ncol=1)
+    legend = ax.legend(handles=legend_elements2, loc='upper left', framealpha=0.9, fontsize=20, ncol=1)
     for text in legend.get_texts():
         text.set_fontname('Times New Roman')
     

@@ -169,6 +169,11 @@ def generate_uncertainty_plot():
     selected_uncertainties = uncertainties[best_indices]
     selected_predictions = predictions[best_indices]
     
+    # 交换第2个和第7个点的位置（索引1和6），使左上角有空间放图例
+    for arr in [selected_targets, selected_uncertainties, selected_predictions]:
+        arr[1], arr[6] = arr[6], arr[1]
+    best_indices[1], best_indices[6] = best_indices[6], best_indices[1]
+    
     # 将不确定度转换为标准差，并应用用户设置
     if FIXED_UNCERTAINTY is not None:
         # 使用固定不确定度
@@ -243,9 +248,9 @@ def generate_uncertainty_plot():
     from matplotlib.lines import Line2D
     legend_elements = [
         Line2D([0], [0], marker='s', color='w', markerfacecolor='#F08090', 
-               markeredgecolor='#D85A6A', markersize=12, label='True Value'),
+               markeredgecolor='#D85A6A', markersize=20, label='True Value'),
         Line2D([0], [0], marker='o', color='w', markerfacecolor='#3A8FD1', 
-               markeredgecolor='#0D5A9E', markersize=12, label='PGNN-ASL Prediction ± Uncertainty')
+               markeredgecolor='#0D5A9E', markersize=20, label='PGNN-ASL ± Uncertainty')
     ]
     
     # 设置标签 (英文，Times New Roman字体)
@@ -265,7 +270,7 @@ def generate_uncertainty_plot():
     ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
     
     # 添加图例 (Times New Roman字体)
-    legend = ax.legend(handles=legend_elements, loc='best', framealpha=0.9, fontsize=12, ncol=1)
+    legend = ax.legend(handles=legend_elements, loc='upper left', framealpha=0.9, fontsize=20, ncol=1)
     for text in legend.get_texts():
         text.set_fontname('Times New Roman')
     

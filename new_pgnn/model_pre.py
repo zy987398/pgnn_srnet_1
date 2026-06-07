@@ -764,9 +764,9 @@ class CrackDepthPredictor:
         from matplotlib.lines import Line2D
         legend_elements = [
             Line2D([0], [0], marker='s', color='w', markerfacecolor='#F08090', 
-                   markeredgecolor='#D85A6A', markersize=12, label='Actual Value'),
+                   markeredgecolor='#D85A6A', markersize=14, label='Actual Value'),
             Line2D([0], [0], marker='o', color='w', markerfacecolor='#3A8FD1', 
-                   markeredgecolor='#0D5A9E', markersize=12, label='Prediction ± Uncertainty')
+                   markeredgecolor='#0D5A9E', markersize=14, label='Prediction ± Uncertainty')
         ]
         
         # 设置标签
@@ -777,18 +777,18 @@ class CrackDepthPredictor:
         if n_display <= 30:
             ax.set_xticks(x_positions)
             ax.set_xticklabels([f'{i+1}' for i in range(n_display)], rotation=0, 
-                              fontname='Times New Roman', fontsize=14)
+                              fontname='Times New Roman', fontsize=20)
         else:
             # 样本过多时只显示部分刻度
             step = max(1, n_display // 20)
             ax.set_xticks(x_positions[::step])
             ax.set_xticklabels([f'{i+1}' for i in range(0, n_display, step)], 
-                              rotation=45, fontname='Times New Roman', fontsize=12)
+                              rotation=45, fontname='Times New Roman', fontsize=20)
         
         # 设置y轴刻度字体
         for label in ax.get_yticklabels():
             label.set_fontname('Times New Roman')
-            label.set_fontsize(14)
+            label.set_fontsize(20)
         
         # 设置Y轴范围
         if y_max is not None:
@@ -798,7 +798,7 @@ class CrackDepthPredictor:
         ax.grid(True, alpha=0.3, linestyle='--', linewidth=0.5)
         
         # 添加图例
-        legend = ax.legend(handles=legend_elements, loc='upper left', framealpha=0.9, fontsize=12)
+        legend = ax.legend(handles=legend_elements, loc='upper left', framealpha=0.9, fontsize=18)
         for text in legend.get_texts():
             text.set_fontname('Times New Roman')
         

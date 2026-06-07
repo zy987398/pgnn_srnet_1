@@ -1501,7 +1501,7 @@ if __name__ == "__main__":
         # "固定门控0.5": ABLATION_CONFIGS["固定门控0.5"],
         # "固定门控0.0": ABLATION_CONFIGS["固定门控0.0"],
         # "固定门控1.0": ABLATION_CONFIGS["固定门控1.0"],
-        # "无物理特征": ABLATION_CONFIGS["无物理特征"],
+        "无物理特征": ABLATION_CONFIGS["无物理特征"],
         # "无残差网络": ABLATION_CONFIGS["无残差网络"],
         "无物理特征基线": ABLATION_CONFIGS["无物理特征基线"]
     }

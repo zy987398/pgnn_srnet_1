@@ -191,7 +191,7 @@ def plot_attention_weights(weights, save_path, top_n=15):
     
     # 设置坐标轴（英文标签）- 横坐标标签水平显示
     ax.set_xticks(x_positions)
-    ax.set_xticklabels(sorted_labels, rotation=0, ha='center', fontsize=20)
+    ax.set_xticklabels(sorted_labels, rotation=0, ha='center', fontsize=22)
     ax.set_xlabel('Physical Features', fontsize=20)
     ax.set_ylabel('Mean Attention Weight (log scale)', fontsize=20)
     
@@ -201,7 +201,7 @@ def plot_attention_weights(weights, save_path, top_n=15):
     
     # 设置刻度标签字体大小
     for label in ax.get_yticklabels():
-        label.set_fontsize(12)
+        label.set_fontsize(20)
     
     # 在条形上方添加数值标注（调整位置避免与误差棒重叠）
     for i, mean_val in enumerate(sorted_means):
@@ -210,7 +210,7 @@ def plot_attention_weights(weights, save_path, top_n=15):
         text_y = text_y * 1.1 # 在误差棒上方留出空间
         ax.text(x_positions[i], 
                 text_y,
-                f'{mean_val:.3f}', ha='center', va='bottom', fontsize=16)
+                f'{mean_val:.3f}', ha='center', va='bottom', fontsize=18)
     
     plt.tight_layout()
     plt.savefig(save_path, dpi=300, bbox_inches='tight')
